@@ -36,28 +36,6 @@ This design mirrors how researchers open new tabs for deep dives, maintaining fo
 
 ---
 
-## 🗺️ Architecture
-
-```mermaid
-flowchart TD
-  subgraph Frontend
-    A[React App] --> B[React Flow Canvas]
-    A --> C[Sidebar Navigator]
-  end
-
-  subgraph Backend API
-    D[GET /conversations/{id}] --> E[Main Nodes + SubgraphRefs]
-    F[GET /branches/{branchId}] --> G[Branch Nodes]
-    H[GET /conversations/{id}/context] --> I[Packed Context]
-  end
-
-  B --> D
-  B --> F
-  B --> H
-Figure: High‑level data flow between UI and API.
-
-📸 UI Screenshots
-Main Conversation View
 
 Subgraph Pointer
 
