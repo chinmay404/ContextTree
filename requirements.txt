@@ -1,0 +1,26 @@
+# FastAPI dependencies
+fastapi>=0.95.0
+uvicorn>=0.22.0
+pydantic>=1.10.7
+
+# Utility packages
+python-dotenv>=1.0.0
+email-validator>=2.0.0
+pydantic-settings
+# For production
+gunicorn>=20.1.0
+
+# For testing
+pytest>=7.3.1
+httpx>=0.24.0
+pytest-cov>=4.1.0
+
+# Optional database
+# sqlalchemy>=2.0.0
+# alembic>=1.10.3
+# asyncpg>=0.27.0  # for PostgreSQL
+
+
+
+# Langgraph
+langgraph
