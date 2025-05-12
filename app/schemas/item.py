@@ -32,3 +32,7 @@ class ChatMessage(BaseModel):
     """Schema for chat messages."""
     message: str = Field(..., description="The user's message")
     conversation_id: Optional[str] = Field(None, description="Conversation identifier")
+    model_name: Optional[str] = Field(None, description="Name of the model used for the response")
+    temperature: Optional[float] = Field(None, description="Temperature setting for the model")
+    context: Optional[str] = Field(None, description="Context for the conversation")
+    user_id: Optional[str] = Field(None, description="User identifier")

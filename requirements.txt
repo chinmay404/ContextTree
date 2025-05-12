@@ -24,3 +24,14 @@ pytest-cov>=4.1.0
 
 # Langgraph
 langgraph
+langgraph-checkpoint-redis
+redis 
+redisvl
+
+
+
+
+
+
+
+

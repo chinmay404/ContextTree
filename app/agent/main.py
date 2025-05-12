@@ -1,107 +1,99 @@
 
-from Agents.helpers.get_llm import LLM
-from Agents.tools.tools import tools_list
-from Agents.helpers.load_prompt import load_prompt_from_yaml
+from app.Agent.helpers.load_prompt import load_prompt_from_yaml
 from langchain_core.messages import HumanMessage
 from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import tool_node, tools_condition, ToolNode
 from langgraph.checkpoint.memory import MemorySaver
-from Agents.helpers.load_prompt import load_prompt_from_yaml
-from Agents.DB_ops.main import MongoCRUD
-from Agents.helpers.get_state_data import get_next_state, get_ideal_states
+from app.Agent.helpers.load_prompt import load_prompt_from_yaml
 from datetime import datetime
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from Agents.utils.graph_state import State
-from Agents.utils.nodes import BaseAgentNodes
-from Agents.utils.logger import logger
-# asd
+from langgraph.checkpoint.memory import InMemorySaver
+from app.Agent.nodes.assistant_node import AgentNodes
+from app.Agent.state import State
+from app.Agent.prompts.prompt_formation import get_formated_prompt
+from langchain.schema import AIMessage, HumanMessage
+from datetime import datetime
+from uuid import uuid4
+from app.Agent.utils.saver import redis_saver
+from app.Agent.store.MongoStore import MongoConversationStore
+from app.Agent.utils.embeddings import get_embedding
 
-db = MongoCRUD()
-Nodes = BaseAgentNodes()
+Nodes = AgentNodes()
 
 
 class getGraphResponse():
     def __init__(self):
-        logger.info("Initializing getGraphResponse..")
-        self.llm = LLM.get_groq_llm()
-        self.memory = MongoDBSaver(db.client)
-        self.llm_with_tools = self.llm.bind_tools(tools_list)
-        self.state = State
+        self.memory = redis_saver()
+        if self.memory is None:
+            raise MemoryError(
+                "Failed to initialize RedisSaver: memory is None")
+        # self.memory = InMemorySaver()   
+        self.mongo_store = MongoConversationStore()
         self.nodes = Nodes.get_nodes()
-        self.routes = Nodes.get_routes()
         self.graph = self.build_graph()
         self.sys_msg = load_prompt_from_yaml("REACT_LANGGRAPH_PROMPT")
-        self.complex_querry_decison_prompt = load_prompt_from_yaml(
-            "complex_querry_decison")
-        self.simple_assistant_prompt = load_prompt_from_yaml(
-            "simple_assistant")
-        logger.info("getGraphResponse initialized.")
 
     def build_graph(self):
-        logger.info("Building LangGraph..")
-        builder = StateGraph(self.state)
-        builder.add_node("complex_assistant", self.nodes["assistant"])
-        builder.add_node("tools", ToolNode(tools_list))
-        builder.add_node("simple_assistant", self.nodes["simple_assistant"])
+        builder = StateGraph(State)
+        builder.add_node("assistant", self.nodes["assistant"])
 
-        # Add edges
-        builder.add_conditional_edges(
-            START,
-            self.nodes["complex_querry_decison"],
-            {"True": "complex_assistant", "False": "simple_assistant"}
-        )
-        builder.add_edge("simple_assistant", END)
-
-        builder.add_conditional_edges("complex_assistant", tools_condition)
-        builder.add_edge("tools", "complex_assistant")
-        builder.add_edge("complex_assistant", END)
+        builder.add_edge(START, "assistant")
+        builder.add_edge("assistant", END)
 
         graph = builder.compile(checkpointer=self.memory)
-        # draw_graph(graph)
-        logger.info("LangGraph built successfully.")
         return graph
 
-    def get_response(self, query: str, config: dict, user_id: str):
-        now = datetime.now()
-        formatted_datetime = now.strftime("%Y-%m-%d %H:%M:%S %A")
-        try:
-            logger.info(f"Received query: {query} | User ID: {user_id} | thread ID: {config['configurable']['thread_id']}")
-            user_current_state = db.get_user_state(user_id)
-            logger.info(f"User current state: {user_current_state}")
-            current = user_current_state.get("current") if user_current_state else None
+    def get_response(self, query: str, config: dict, user_id: str, thread_id: str):
+        # 1) Format prompt, attach metadata
+        prompt = get_formated_prompt(query, user_id)
+        timestamp = datetime.utcnow().isoformat()
+        msg_id = f"{timestamp}-{uuid4().hex}"
+        user_msg = HumanMessage(
+            content=prompt,
+            metadata={"user_id": user_id,
+                      "msg_id": msg_id, "thread_id": thread_id}
+        )
 
-            next_state, next_state_details = get_next_state(country_id="Germany", current_state=current)
-            logger.info(
-                f"Next state: {next_state}, Details: {next_state_details}")
+        # 2) Step the graph (writes to Redis)
+        result = self.graph.invoke(
+            {"messages": [user_msg], "system_message": self.sys_msg},
+            config
+        )
+        ai_messages = result.get("messages", [])
 
-        except Exception as e:
-            logger.error(f"Error fetching state: {e}", exc_info=True)
-            current = None
-            next_state, next_state_details = None, None
-        # TODO :  Add Prper Formatting of message
-        human_message = [HumanMessage(content="" + " USER ID : " + user_id + " User Current State : " + str(current)
-                                      + " Next State and Details : " +
-                                      str(next_state) +
-                                      str(next_state_details) +
-                                      " current date " +
-                                      str(formatted_datetime)
-                                      + "\n User query : " + query)]
-
-        try:
-            res = self.graph.invoke({"messages": human_message}, config)
-        except Exception as e:
-            logger.error(f"Error invoking graph: {e}", exc_info=True)
-            return "Something went wrong during graph execution."
-
-        messages = res.get("messages", [])
-        for msg in reversed(messages):
-            print("Message: ", msg)
-            if hasattr(msg, 'content') and msg.content:
-                # print("Message content: ", msg.content)
+        # 3) Extract the first non-empty AI response
+        final_message = None
+        for msg in reversed(ai_messages):
+            if getattr(msg, "content", None):
                 final_message = msg.content
-                # logger.info(f"Final message: {final_message}")
-                return final_message
+                break
 
-        logger.warning("No message content returned from graph.")
-        return None
+        if final_message is None:
+            raise RuntimeError("Agent produced no output")
+
+        # 4) Persist the user turn to Mongo
+        self.mongo_store.add_message(
+            user_id=user_id,
+            thread_id=thread_id,
+            role="user",
+            text=query,
+            embedding=get_embedding(query),
+            summarize_fn="None",
+            embed_summary_fn=get_embedding,
+            context_fn=[]
+        )
+
+        # 5) Persist the assistant turn to Mongo
+        self.mongo_store.add_message(
+            user_id=user_id,
+            thread_id=thread_id,
+            role="assistant",
+            text=final_message,
+            embedding=get_embedding(final_message),
+            summarize_fn="None",
+            embed_summary_fn=get_embedding,
+            context_fn=[]
+        )
+
+        # 6) Return the AI’s response
+        return final_message
