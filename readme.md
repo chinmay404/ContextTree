@@ -7,6 +7,7 @@ is a React-based, interactive canvas application designed to enhance chatbot con
 BASE URL : https://v0-context-tree.vercel.app/
 ---
 ![alt text](image.png)
+![image](https://github.com/user-attachments/assets/7d100b21-f053-409b-9b8e-4448c3aa5423)
 
 
 ## 🚀 Project Overview
@@ -33,7 +34,8 @@ This design mirrors how researchers open new tabs for deep dives, maintaining fo
 
 - **Node-based UI**: Every message (or subgraph pointer) is a distinct node.  
 - **Subgraph Expansion**: Click a Subgraph Node to expand its branch in a focused view.  
-- **Context Isolation**: Main thread and subgraphs do not share context, preventing cross-talk.  
+- **Context Isolation**: Main thread and subgraphs do not share context, preventing cross-talk.
+- **Try Each Response Diffrent LLM Model**: try out at conetxt stage what other LLMs will response and Continue with that. 
 - **API-driven**: Frontend fetches only necessary data via RESTful endpoints.  
 - **Responsive Canvas**: Pan, zoom, and minimap support for easy navigation.  
 
@@ -49,6 +51,3 @@ Contributions are welcome! Please open issues or pull requests to discuss improv
 
 📄 License
 This project is released under the MIT License.
-
-Copy
-Edit
