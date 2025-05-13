@@ -15,8 +15,8 @@ class MongoConversationStore:
         """
         self.username = urllib.parse.quote_plus(os.getenv("MONGO_USERNAME"))
         self.password = urllib.parse.quote_plus(os.getenv("MONGO_PASSWORD"))
-        # self.client = MongoClient(f"mongodb+srv://{self.username}:{self.password}@contexttree.wdfl6rh.mongodb.net/"
-        #                           "?retryWrites=true&w=majority&appName=ContextTree")
+        self.client = MongoClient(f"mongodb+srv://{self.username}:{self.password}@contexttree.wdfl6rh.mongodb.net/"
+                                  "?retryWrites=true&w=majority&appName=ContextTree")
         # self.client = MongoClient("mongodb://localhost:27017/")
         
         self.col = self.client[db_name][coll_name]
