@@ -27,7 +27,7 @@ langgraph
 langgraph-checkpoint-redis
 redis 
 redisvl
-
+IPython
 
 
 
