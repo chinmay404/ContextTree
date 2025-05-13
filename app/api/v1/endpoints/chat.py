@@ -7,7 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, status
 
 from app.schemas.item import ChatMessage
-from app.Agent.main import getGraphResponse
+from app.agent.main import getGraphResponse
 
 
 router = APIRouter()

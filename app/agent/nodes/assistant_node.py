@@ -3,11 +3,11 @@ from langgraph.graph import StateGraph, START, END
 import re
 import json
 
-from app.Agent.state import State
-from app.Agent.helpers.load_prompt import load_prompt_from_yaml
-from app.Agent.helpers.get_llm import get_groq_llm
+from app.agent.state import State
+from app.agent.helpers.load_prompt import load_prompt_from_yaml
+from app.agent.helpers.get_llm import get_groq_llm
 from langchain_core.messages import HumanMessage, AIMessage
-from app.Agent.prompts.prompt_formation import get_formated_prompt
+from app.agent.prompts.prompt_formation import get_formated_prompt
 
 
 class AgentNodes:
