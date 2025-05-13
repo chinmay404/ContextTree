@@ -12,6 +12,13 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
 
+
+    - name: Debug Key Format
+      run: |
+        echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+        chmod 600 key.pem
+        ssh -i key.pem -o StrictHostKeyChecking=no ubuntu@${{ secrets.EC2_HOST }} hostname
+
     - name: Copy code to EC2
       uses: appleboy/scp-action@v0.1.2
       with:
