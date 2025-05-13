@@ -28,8 +28,7 @@ langgraph-checkpoint-redis
 redis 
 redisvl
 IPython
-
-
+langchain_google_genai
 
 
 
