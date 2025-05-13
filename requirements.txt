@@ -31,5 +31,5 @@ IPython
 langchain_google_genai
 langchain_groq
 langchain
-
+pymongo
 
