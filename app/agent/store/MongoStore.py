@@ -1,7 +1,10 @@
 from pymongo import MongoClient, UpdateOne
 from datetime import datetime
 import urllib.parse
+from dotenv import load_dotenv
+import os
 
+load_dotenv()
 
 class MongoConversationStore:
     def __init__(self, db_name: str = "Conversationstore", coll_name: str = "users"):
@@ -10,11 +13,11 @@ class MongoConversationStore:
              "mongodb+srv://<user>:<pass>@cluster0.mongodb.net/?retryWrites=true&w=majority"
         This store now has one document per user, with multiple threads each.
         """
-        self.username = urllib.parse.quote_plus("jexifiy118")
-        self.password = urllib.parse.quote_plus("JOY.@.1718")
+        self.username = urllib.parse.quote_plus(os.getenv("MONGO_USERNAME"))
+        self.password = urllib.parse.quote_plus(os.getenv("MONGO_PASSWORD"))
         # self.client = MongoClient(f"mongodb+srv://{self.username}:{self.password}@contexttree.wdfl6rh.mongodb.net/"
         #                           "?retryWrites=true&w=majority&appName=ContextTree")
-        self.client = MongoClient("mongodb://localhost:27017/")
+        # self.client = MongoClient("mongodb://localhost:27017/")
         
         self.col = self.client[db_name][coll_name]
 
