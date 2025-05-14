@@ -7,7 +7,7 @@ load_dotenv()
 def get_embedding(querry :str):
     
     try:
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001",google_api_key=os.getenv("MY_SECRET"))
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001",google_api_key=os.getenv("GOOGLE_API_KEY"))
         result = embeddings.embed_query(querry)
         return result
     except Exception as e:
