@@ -1,8 +1,5 @@
 # 🧠 ContextTree
-#### (UNDER DEVLOPMENT)
-
-
-### **ContextTree** 
+### (UNDER DEVLOPMENT)
 BASE URL : https://v0-context-tree.vercel.app/
 Link : https://chinmaypisal.notion.site/
 
