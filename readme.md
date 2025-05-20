@@ -2,10 +2,14 @@
 #### (UNDER DEVLOPMENT)
 
 
-**ContextTree** - 
-is a React-based, interactive canvas application designed to enhance chatbot conversations by allowing users to create and navigate sub-conversations (branches) without losing context in the main discussion.
+### **ContextTree** 
 BASE URL : https://v0-context-tree.vercel.app/
----
+Link : https://chinmaypisal.notion.site/
+
+
+is a React-based, interactive canvas application designed to enhance chatbot conversations by allowing users to create and navigate sub-conversations (branches) without losing context in the main discussion.
+
+
 ![alt text](image.png)
 ![image](https://github.com/user-attachments/assets/7d100b21-f053-409b-9b8e-4448c3aa5423)
 
