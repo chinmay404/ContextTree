@@ -31,7 +31,7 @@ def get_Gemini(name: str = "deepseek-r1-distill-llama-70b"):
 def get_groq_llm(name: str = "deepseek-r1-distill-llama-70b"):
     """qwen-qwq-32b	15	1,000,000	1,500"""
     try:
-        api_key = "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"
+        api_key = os.getenv("GROQ_API_KEY")
     except Exception as e:
         print(f"Error get api key Add Groq API Key {e}")
         return None
