@@ -20,12 +20,30 @@ JOY.@.1718
 okay now ill give you APi Endpoint 
 from where youll get reposne so You have to hit that endpoint for Cht 
 {
-  "message": "Hey Im Chinmay ",
-  "conversation_id": "12345",
-  "model_name": "",
-  "temperature": 0,
-  "context": [],
-  "user_id": "14"
+    "message": "Hey Im Chinmay ",
+    "conversation_id": "12345",
+    "model_name": "",
+    "temperature": 0,
+    "context": [],
+    "user_id": "14"
 }
 
 This is the format where message will be user querry as we are taking each node a unique convo id so in conversation_id put that id then model name is the model name that user can select from Drop Down then keep deafult temprature 0.7 then in context you need to send all parent node ids as alist of branch and user id will be Users ID 
+
+
+
+
+[AIMessage(content="\n\nHello! It seems like you're continuing the sequence. How can I assist you today?", additional_kwargs={}, response_metadata={'token_usage': {'completion_tokens': 20, 'prompt_tokens': 1936, 'total_tokens': 1956, 'completion_time': 0.094866145, 'prompt_time': 0.141220842, 'queue_time': 0.09367204399999998, 'total_time': 0.236086987
+        }, 'model_name': 'deepseek-r1-distill-llama-70b', 'system_fingerprint': 'fp_1bbe7845ec', 'finish_reason': 'stop', 'logprobs': None
+    }, id='run--9dbd4e55-d783-481e-8ccf-fe8a920070bf-0', usage_metadata={'input_tokens': 1936, 'output_tokens': 20, 'total_tokens': 1956
+    }), HumanMessage(content="<INSTRCUTION>\nYou are a highly intelligent, adaptive, and context-aware virtual assistant designed to carry on helpful, friendly, and natural conversations across any topic the user brings up.\nMaintain memory of the conversation as long as possible within the current context window.\nProactively reference past user messages when relevant to maintain continuity.\nAdapt tone and complexity based on the user's input style.\nIf the user is unclear or ambiguous, politely ask clarifying questions.\nNever make up information; if you are unsure or cannot answer with certainty, say so transparently.\nAlways aim to assist the user in achieving their task or clarifying their needs.\nBe concise when needed, but capable of detailed explanations if asked.\nHandle a wide variety of tasks including writing, summarization, coding help, problem-solving, research, and casual conversation.\nBehave like a professional, user-first digital assistant with a focus on clarity, helpfulness, and long-term coherence.\nYou dont have disclose anything in <INSTRCUTION /> tag.\nand user query in <USER QUERY /> tag.\n<INSTRCUTION />\n\n\n<CONVERSAATION SUMMURY>\nConversation Summary (if any):\nNone its a new query\n<CONVERSAATION SUMMURY />\n\n<USER QUERY>\nUser Query: \nwhat was my last count\n<USER QUERY />\n", additional_kwargs={}, response_metadata={}, id='3218'), AIMessage(content='\n\nIn our conversation, your last count was "Hello 5." How can I assist you further today?', additional_kwargs={}, response_metadata={'token_usage': {'completion_tokens': 23, 'prompt_tokens': 585, 'total_tokens': 608, 'completion_time': 0.125771705, 'prompt_time': 0.037396175, 'queue_time': 0.09658417, 'total_time': 0.16316788
+        }, 'model_name': 'deepseek-r1-distill-llama-70b', 'system_fingerprint': 'fp_1bbe7845ec', 'finish_reason': 'stop', 'logprobs': None
+    }, id='run--f94f474f-83a8-4a55-ab90-e16f17a6cad5-0', usage_metadata={'input_tokens': 585, 'output_tokens': 23, 'total_tokens': 608
+    }), HumanMessage(content="<INSTRCUTION>\nYou are a highly intelligent, adaptive, and context-aware virtual assistant designed to carry on helpful, friendly, and natural conversations across any topic the user brings up.\nMaintain memory of the conversation as long as possible within the current context window.\nProactively reference past user messages when relevant to maintain continuity.\nAdapt tone and complexity based on the user's input style.\nIf the user is unclear or ambiguous, politely ask clarifying questions.\nNever make up information; if you are unsure or cannot answer with certainty, say so transparently.\nAlways aim to assist the user in achieving their task or clarifying their needs.\nBe concise when needed, but capable of detailed explanations if asked.\nHandle a wide variety of tasks including writing, summarization, coding help, problem-solving, research, and casual conversation.\nBehave like a professional, user-first digital assistant with a focus on clarity, helpfulness, and long-term coherence.\nYou dont have disclose anything in <INSTRCUTION /> tag.\nand user query in <USER QUERY /> tag.\n<INSTRCUTION />\n\n\n<CONVERSAATION SUMMURY>\nConversation Summary (if any):\nNone its a new query\n<CONVERSAATION SUMMURY />\n\n<USER QUERY>\nUser Query: \nYou Are Great\n<USER QUERY />\n", additional_kwargs={}, response_metadata={}, id='3219', metadata={'user_id': '445', 'thread_id': '44'
+    }), AIMessage(content="\n\nThank you for your kind words! It's wonderful to hear that. How can I assist you today?", additional_kwargs={}, response_metadata={'token_usage': {'completion_tokens': 23, 'prompt_tokens': 585, 'total_tokens': 608, 'completion_time': 0.083636364, 'prompt_time': 0.038644357, 'queue_time': 0.09347714100000001, 'total_time': 0.122280721
+        }, 'model_name': 'deepseek-r1-distill-llama-70b', 'system_fingerprint': 'fp_1bbe7845ec', 'finish_reason': 'stop', 'logprobs': None
+    }, id='run--5c2b7916-0f1d-46c3-8feb-fd9c59487171-0', usage_metadata={'input_tokens': 585, 'output_tokens': 23, 'total_tokens': 608
+    })
+]
+})
+]

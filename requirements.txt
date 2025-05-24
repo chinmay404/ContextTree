@@ -32,4 +32,6 @@ langchain_google_genai
 langchain_groq
 langchain
 pymongo
+slowapi
 
+pyppeteer

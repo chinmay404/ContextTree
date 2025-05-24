@@ -17,7 +17,7 @@ from uuid import uuid4
 from app.agent.utils.saver import redis_saver
 from app.agent.store.MongoStore import MongoConversationStore
 from app.agent.utils.embeddings import get_embedding
-
+from app.agent.helpers.draw_graph import draw_graph
 Nodes = AgentNodes()
 
 
@@ -27,7 +27,7 @@ class getGraphResponse():
         if self.memory is None:
             raise MemoryError(
                 "Failed to initialize RedisSaver: memory is None")
-        # self.memory = InMemorySaver()   
+        # self.memory = InMemorySaver()
         self.mongo_store = MongoConversationStore()
         self.nodes = Nodes.get_nodes()
         self.graph = self.build_graph()
@@ -36,22 +36,33 @@ class getGraphResponse():
     def build_graph(self):
         builder = StateGraph(State)
         builder.add_node("assistant", self.nodes["assistant"])
+        builder.add_node("summurize",
+                         self.nodes["summurize"])
 
         builder.add_edge(START, "assistant")
+        builder.add_conditional_edges(
+            "assistant", self.nodes["summury_decision"],
+            {
+                True: "summurize",
+                False: END
+            })
+        builder.add_edge("summurize", END)
         builder.add_edge("assistant", END)
 
         graph = builder.compile(checkpointer=self.memory)
+        # draw_graph(graph)
         return graph
 
-    def get_response(self, query: str, config: dict, user_id: str, thread_id: str):
+    def get_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         # 1) Format prompt, attach metadata
-        prompt = get_formated_prompt(query, user_id)
+        prompt = get_formated_prompt(
+            query, user_id)
         timestamp = datetime.utcnow().isoformat()
-        msg_id = f"{timestamp}-{uuid4().hex}"
         user_msg = HumanMessage(
             content=prompt,
+            id=msg_id,
             metadata={"user_id": user_id,
-                      "msg_id": msg_id, "thread_id": thread_id}
+                      "thread_id": thread_id}
         )
 
         # 2) Step the graph (writes to Redis)
@@ -64,6 +75,7 @@ class getGraphResponse():
         # 3) Extract the first non-empty AI response
         final_message = None
         for msg in reversed(ai_messages):
+            print("AI Message:", msg)
             if getattr(msg, "content", None):
                 final_message = msg.content
                 break
@@ -77,6 +89,7 @@ class getGraphResponse():
             thread_id=thread_id,
             role="user",
             text=query,
+            message_id=msg_id,
             embedding=get_embedding(query),
             summarize_fn="None",
             embed_summary_fn=get_embedding,
@@ -88,6 +101,7 @@ class getGraphResponse():
             user_id=user_id,
             thread_id=thread_id,
             role="assistant",
+            message_id=msg_id,
             text=final_message,
             embedding=get_embedding(final_message),
             summarize_fn="None",
