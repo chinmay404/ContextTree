@@ -32,6 +32,7 @@ def get_groq_llm(name: str = "deepseek-r1-distill-llama-70b"):
     """qwen-qwq-32b	15	1,000,000	1,500"""
     try:
         api_key = os.getenv("GROQ_API_KEY")
+
     except Exception as e:
         print(f"Error get api key Add Groq API Key {e}")
         return None

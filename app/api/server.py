@@ -14,6 +14,8 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi import _rate_limit_exceeded_handler
 
 
+from app.core.logger import logger
+
 # TODO : add_event_handler for Checking Dbs Connections
 
 
@@ -44,6 +46,7 @@ def create_application() -> FastAPI:
 
     @application.get("/")
     async def root():
+        logger.info("API health Check Call.")
         """Health check endpoint."""
         return {
             "message": f"Welcome to {settings.PROJECT_NAME}",

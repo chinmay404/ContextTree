@@ -11,6 +11,8 @@ from app.agent.prompts.prompt_formation import get_formated_prompt
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from langchain_core.messages import RemoveMessage
 
+from app.core.logger import logger
+
 
 class AgentNodes:
     def __init__(self):
@@ -39,6 +41,7 @@ class AgentNodes:
             model = state.get("model", "default-model-name")
             temperature = state.get("temperature", 0.9)
             history = state.get("messages", [])
+            print("Message History:", history)
             ai_response: AIMessage = self.groq_llm.invoke(input=history)
 
             print("Message Current Count:", current_count)
@@ -54,6 +57,7 @@ class AgentNodes:
             }
         except Exception as e:
             print("Assistant Node error:", e)
+            logger.error("Assistant Node error:", e)
 
     def summury_decision(self, state: State) -> bool:
         try:
@@ -61,6 +65,7 @@ class AgentNodes:
             return count > 5
         except (KeyError, TypeError, ValueError) as e:
             print("Error in summary decision:", e)
+            logger.error("Error in summary decision:", e)
             return False
 
     def summurize(self, state: State):
