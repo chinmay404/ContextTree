@@ -70,6 +70,7 @@ class MongoConversationStore:
         role: str,
         text: str,
         embedding: list[float],
+        summary: str = None,
         summarize_fn=None,
         embed_summary_fn=None,
         context_fn=None
@@ -94,7 +95,7 @@ class MongoConversationStore:
             new_thread = {
                 "_id": thread_id,
                 "started_at": now,
-                "clear": "",
+                "summary": summary or "",
                 "summary_embedding": [],
                 "context": [],
                 "message_ids": [message_id],
@@ -195,6 +196,91 @@ class MongoConversationStore:
             }
         ]
         return list(self.msg_coll.aggregate(pipeline))
+
+    def update_thread_summary(self, user_id: str, thread_id: str, summary: str):
+        """
+        Update the summary for a specific thread.
+        """
+        result = self.user_col.update_one(
+            {"user_id": user_id, "threads._id": thread_id},
+            {"$set": {"threads.$.summary": summary}}
+        )
+        return result.modified_count > 0
+
+    def get_thread_summary(self, user_id: str, thread_id: str) -> str:
+        """
+        Retrieve the summary for a specific thread.
+        Returns empty string if thread not found or has no summary.
+        """
+        doc = self.user_col.find_one(
+            {"user_id": user_id, "threads._id": thread_id},
+            {"threads.$": 1}
+        )
+        if doc and "threads" in doc and len(doc["threads"]) > 0:
+            return doc["threads"][0].get("summary", "")
+        return ""
+
+    def fork_thread(
+        self,
+        user_id: str,
+        source_thread_id: str,
+        new_thread_id: str,
+        fork_at_message_id: str
+    ) -> bool:
+        """
+        Fork a thread at a specific message:
+        1. Find all messages up to and including fork_at_message_id
+        2. Create new thread with those messages
+        3. Copy summary from source thread
+        4. Update parent/child relationships
+        """
+        # Get source thread
+        source_doc = self.user_col.find_one(
+            {"user_id": user_id, "threads._id": source_thread_id},
+            {"threads.$": 1}
+        )
+        
+        if not source_doc or "threads" not in source_doc:
+            return False
+        
+        source_thread = source_doc["threads"][0]
+        message_ids = source_thread.get("message_ids", [])
+        
+        # Find fork point
+        if fork_at_message_id not in message_ids:
+            return False
+        
+        fork_index = message_ids.index(fork_at_message_id)
+        forked_message_ids = message_ids[:fork_index + 1]
+        
+        # Create new thread
+        now = datetime.utcnow()
+        new_thread = {
+            "_id": new_thread_id,
+            "started_at": now,
+            "summary": source_thread.get("summary", ""),
+            "summary_embedding": source_thread.get("summary_embedding", []),
+            "context": source_thread.get("context", []),
+            "message_ids": forked_message_ids,
+            "parent_thread": [source_thread_id],
+            "child_thread": [],
+        }
+        
+        # Add new thread to user
+        result = self.user_col.update_one(
+            {"user_id": user_id},
+            {"$push": {"threads": new_thread}}
+        )
+        
+        # Update parent thread's child_thread list
+        if result.modified_count > 0:
+            self.user_col.update_one(
+                {"user_id": user_id, "threads._id": source_thread_id},
+                {"$push": {"threads.$.child_thread": new_thread_id}}
+            )
+            return True
+        
+        return False
 
 
 def main():

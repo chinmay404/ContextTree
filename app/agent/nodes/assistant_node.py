@@ -15,11 +15,12 @@ from app.core.logger import logger
 
 
 class AgentNodes:
-    def __init__(self):
+    def __init__(self, mongo_store=None):
         self.state = State()
         self.groq_llm = get_groq_llm()
         self.sys_msg = load_prompt_from_yaml("REACT_LANGGRAPH_PROMPT")
         self.summury_prompt = load_prompt_from_yaml("SUMMARY_PROMPT")
+        self.mongo_store = mongo_store
 
     # def assistant(self, state: State):
     #     try:
@@ -73,12 +74,37 @@ class AgentNodes:
             prompt = get_formated_summury_prompt(
                 state["messages"], state["summary"])
             summary_msg = self.groq_llm.invoke(prompt)
-            state["summary"] = summary_msg.content
+            new_summary = summary_msg.content
+            
+            # Save summary to MongoDB if mongo_store is available
+            if self.mongo_store:
+                thread_id = state.get("thread_id")
+                # Extract user_id from the last message metadata
+                messages = state.get("messages", [])
+                user_id = None
+                for msg in reversed(messages):
+                    if hasattr(msg, 'metadata') and msg.metadata:
+                        user_id = msg.metadata.get('user_id')
+                        if user_id:
+                            break
+                
+                if user_id and thread_id:
+                    try:
+                        self.mongo_store.update_thread_summary(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            summary=new_summary
+                        )
+                        logger.info(f"Summary saved to MongoDB for thread {thread_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to save summary to MongoDB: {e}")
+            
             messages_to_delete = [RemoveMessage(
                 id=m.id) for m in state["messages"][:-3]]
-            return {"messages": messages_to_delete, "summary": summary_msg.content}
+            return {"messages": messages_to_delete, "summary": new_summary}
         except Exception as e:
             print("Error in summarization node:", e)
+            logger.error(f"Error in summarization node: {e}")
             return {"messages": state["messages"], "summary": None}
 
     def get_nodes(self) -> dict:

@@ -9,7 +9,7 @@ from langchain_core.prompts import PromptTemplate
 def get_formated_prompt(user_query: str, user_id: str):
     template = load_prompt_from_yaml("SYSTEM_PROMPT")
     prompt_template = PromptTemplate(
-        input_variables=["user_query", "summary", "previous_conversation"],
+        input_variables=["user_query", "summary"],
         template=template
     )
     final_prompt = prompt_template.format(

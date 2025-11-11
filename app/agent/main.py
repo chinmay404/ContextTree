@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from app.agent.nodes.assistant_node import AgentNodes
 from app.agent.state import State
 from app.agent.prompts.prompt_formation import get_formated_prompt
-from langchain.schema import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from datetime import datetime
 from uuid import uuid4
 from app.agent.utils.saver import redis_saver
@@ -24,9 +24,6 @@ from app.core.logger import logger
 from fastapi import APIRouter, HTTPException, status
 
 
-Nodes = AgentNodes()
-
-
 class getGraphResponse():
     def __init__(self):
         self.memory = redis_saver()
@@ -35,6 +32,7 @@ class getGraphResponse():
                 "Failed to initialize RedisSaver: memory is None")
         # self.memory = InMemorySaver()
         self.mongo_store = MongoConversationStore()
+        Nodes = AgentNodes(mongo_store=self.mongo_store)
         self.nodes = Nodes.get_nodes()
         self.graph = self.build_graph()
         if self.graph is None:
@@ -68,6 +66,9 @@ class getGraphResponse():
 
     def get_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         try:
+            # Get existing summary from MongoDB for this thread
+            existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+            
             prompt = get_formated_prompt(query, user_id)
             timestamp = datetime.utcnow().isoformat()
             user_msg = HumanMessage(
@@ -91,6 +92,9 @@ class getGraphResponse():
                         logger.error(f"No AI Response Found In State")
                         raise HTTPException(
                             status_code=500, detail="No AI Message")
+                    
+                    # Get updated summary from result
+                    updated_summary = result.get("summary", existing_summary)
                 else:
                     logger.error(f"No AI Response Found In State")
                     raise HTTPException(
@@ -113,7 +117,8 @@ class getGraphResponse():
                     role="user",
                     text=query,
                     message_id=msg_id,
-                    embedding=get_embedding(query),
+                    embedding=get_embedding(query) or [],
+                    summary=updated_summary,
                     summarize_fn="None",
                     embed_summary_fn=get_embedding,
                     context_fn=[]
@@ -124,8 +129,9 @@ class getGraphResponse():
                     thread_id=thread_id,
                     role="assistant",
                     message_id=msg_id,
-                    text=final_message,
-                    embedding=get_embedding(final_message),
+                    text=str(final_message) if not isinstance(final_message, str) else final_message,
+                    embedding=get_embedding(str(final_message)) or [],
+                    summary=updated_summary,
                     summarize_fn="None",
                     embed_summary_fn=get_embedding,
                     context_fn=[]
