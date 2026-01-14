@@ -12,6 +12,15 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
 
+    - name: Debug SSH Connection
+      run: |
+        mkdir -p ~/.ssh
+        echo "Registering private key..."
+        echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        echo "Testing connection to ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}..."
+        ssh -vvv -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "uptime"
+
     - name: Copy code to EC2
       uses: appleboy/scp-action@v0.1.2
       with:
