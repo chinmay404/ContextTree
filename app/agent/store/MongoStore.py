@@ -22,12 +22,18 @@ class MongoConversationStore:
         - `users`: stores per-user threads referencing message_ids.
         - `messages`: flat collection for full messages and vector search.
         """
-        # self.client = MongoClient("mongodb://localhost:27017/")
-        self.username = urllib.parse.quote_plus(os.getenv("MONGO_USERNAME"))
-        self.password = urllib.parse.quote_plus(os.getenv("MONGO_PASSWORD"))
-        self.client = MongoClient(
-            f"mongodb+srv://{self.username}:{self.password}@contexttree.4g4brxh.mongodb.net/?retryWrites=true&w=majority&tls=true&appName=ContextTree"
-        )
+        mongo_username = os.getenv("MONGO_USERNAME")
+        mongo_password = os.getenv("MONGO_PASSWORD")
+
+        if mongo_username and mongo_password:
+            self.username = urllib.parse.quote_plus(mongo_username)
+            self.password = urllib.parse.quote_plus(mongo_password)
+            self.client = MongoClient(
+                f"mongodb+srv://{self.username}:{self.password}@contexttree.4g4brxh.mongodb.net/?retryWrites=true&w=majority&tls=true&appName=ContextTree"
+            )
+        else:
+            print("MONGO_USERNAME/MONGO_PASSWORD not found. Using localhost.")
+            self.client = MongoClient("mongodb://localhost:27017/")
         self.user_col = self.client[db_name][user_coll]
         self.msg_coll = self.client[db_name][msg_coll_name]
 

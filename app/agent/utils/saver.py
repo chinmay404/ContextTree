@@ -13,7 +13,8 @@ def redis_saver():
     try:
         redis_url = (
             os.getenv("REDIS_URL") or
-            os.getenv("REDIS_HOST")
+            os.getenv("REDIS_HOST") or
+            "redis://localhost:6379"
         )
         saver_cm = RedisSaver.from_conn_string(redis_url)
         saver = saver_cm.__enter__()
