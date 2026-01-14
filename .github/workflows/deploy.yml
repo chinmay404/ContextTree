@@ -12,32 +12,17 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v3
 
-    - name: Debug SSH Connection
+    - name: Deploy to EC2
       run: |
         mkdir -p ~/.ssh
-        echo "Registering private key..."
         echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
-        echo "Testing connection to ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}..."
-        ssh -vvv -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "uptime"
+        
+        # Add host key to known_hosts to avoid interactive prompt
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-    - name: Copy code to EC2
-      uses: appleboy/scp-action@v0.1.2
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USER }}
-        key: ${{ secrets.EC2_SSH_KEY }}
-        source: "."
-        target: "/opt/api-service/current"
+        echo "Syncing files..."
+        rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current
 
-    - name: Restart Uvicorn service
-      uses: appleboy/ssh-action@v0.1.7 
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USER }}
-        key: ${{ secrets.EC2_SSH_KEY }}
-        script: |
-          cd /opt/api-service/current
-          source venv/bin/activate
-          pip install -r requirements.txt
-          sudo systemctl restart uvicorn
+        echo "Restarting service..."
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "cd /opt/api-service/current && source venv/bin/activate && pip install -r requirements.txt && sudo systemctl restart uvicorn"
