@@ -24,16 +24,18 @@ class MongoConversationStore:
         """
         mongo_username = os.getenv("MONGO_USERNAME")
         mongo_password = os.getenv("MONGO_PASSWORD")
+        mongo_uri = os.getenv("MONGODB_URI")
 
-        if mongo_username and mongo_password:
+        if mongo_uri:
+             self.client = MongoClient(mongo_uri)
+        elif mongo_username and mongo_password:
             self.username = urllib.parse.quote_plus(mongo_username)
             self.password = urllib.parse.quote_plus(mongo_password)
             self.client = MongoClient(
                 f"mongodb+srv://{self.username}:{self.password}@contexttree.4g4brxh.mongodb.net/?retryWrites=true&w=majority&tls=true&appName=ContextTree"
             )
         else:
-            print("MONGO_USERNAME/MONGO_PASSWORD not found. Using localhost.")
-            self.client = MongoClient("mongodb://localhost:27017/")
+            raise ValueError("MONGO_USERNAME/MONGO_PASSWORD or MONGODB_URI not found.")
         self.user_col = self.client[db_name][user_coll]
         self.msg_coll = self.client[db_name][msg_coll_name]
 
@@ -93,16 +95,31 @@ class MongoConversationStore:
             {"$setOnInsert": {"user_id": user_id, "threads": []}},
             upsert=True
         )
+        # Compute summary embedding if possible
+        summary_embedding = []
+        if summary and embed_summary_fn and callable(embed_summary_fn):
+            try:
+                summary_embedding = embed_summary_fn(summary) or []
+            except Exception:
+                summary_embedding = []
+
+        update_query = {"$push": {"threads.$.message_ids": message_id}}
+        if summary:
+            set_fields = {"threads.$.summary": summary}
+            if summary_embedding:
+                set_fields["threads.$.summary_embedding"] = summary_embedding
+            update_query["$set"] = set_fields
+            
         result = self.user_col.update_one(
             {"user_id": user_id, "threads._id": thread_id},
-            {"$push": {"threads.$.message_ids": message_id}}
+            update_query
         )
         if result.matched_count == 0:
             new_thread = {
                 "_id": thread_id,
                 "started_at": now,
                 "summary": summary or "",
-                "summary_embedding": [],
+                "summary_embedding": summary_embedding,
                 "context": [],
                 "message_ids": [message_id],
                 "parent_thread": [],
@@ -226,18 +243,54 @@ class MongoConversationStore:
             return doc["threads"][0].get("summary", "")
         return ""
 
+    def get_messages_until(self, user_id: str, thread_id: str, message_id: str) -> tuple[str, list[dict]]:
+        """
+        Get the summary and all messages in a thread up to a specific message_id.
+        Returns: (summary, list_of_message_dicts)
+        """
+        doc = self.user_col.find_one(
+            {"user_id": user_id, "threads._id": thread_id},
+            {"threads.$": 1}
+        )
+        if not doc or "threads" not in doc:
+            return "", []
+            
+        thread = doc["threads"][0]
+        summary = thread.get("summary", "")
+        message_ids = thread.get("message_ids", [])
+        
+        if message_id not in message_ids:
+            return summary, [] # Or verify if we should return all?
+            
+        target_index = message_ids.index(message_id)
+        target_ids = message_ids[:target_index + 1]
+        
+        msgs = list(self.msg_coll.find(
+            {"message_id": {"$in": target_ids}},
+            {"_id": 0, "message_id": 1, "role": 1, "text": 1, "timestamp": 1}
+        ))
+        
+        # Sort by order in message_ids
+        id_to_msg = {m["message_id"]: m for m in msgs}
+        ordered_msgs = [id_to_msg[mid] for mid in target_ids if mid in id_to_msg]
+        
+        return summary, ordered_msgs
+
+
     def fork_thread(
         self,
         user_id: str,
         source_thread_id: str,
         new_thread_id: str,
-        fork_at_message_id: str
+        fork_at_message_id: str,
+        summary: str = None,
+        summary_embedding: list[float] = None
     ) -> bool:
         """
         Fork a thread at a specific message:
         1. Find all messages up to and including fork_at_message_id
         2. Create new thread with those messages
-        3. Copy summary from source thread
+        3. Copy summary from source thread (or use provided one)
         4. Update parent/child relationships
         """
         # Get source thread
@@ -259,13 +312,17 @@ class MongoConversationStore:
         fork_index = message_ids.index(fork_at_message_id)
         forked_message_ids = message_ids[:fork_index + 1]
         
+        # Use provided summary or fallback to source thread's summary
+        final_summary = summary if summary is not None else source_thread.get("summary", "")
+        final_summary_embedding = summary_embedding if summary_embedding is not None else source_thread.get("summary_embedding", [])
+
         # Create new thread
         now = datetime.utcnow()
         new_thread = {
             "_id": new_thread_id,
             "started_at": now,
-            "summary": source_thread.get("summary", ""),
-            "summary_embedding": source_thread.get("summary_embedding", []),
+            "summary": final_summary,
+            "summary_embedding": final_summary_embedding,
             "context": source_thread.get("context", []),
             "message_ids": forked_message_ids,
             "parent_thread": [source_thread_id],

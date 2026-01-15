@@ -5,6 +5,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from app.schemas.item import ChatMessage
 from app.agent.main import getGraphResponse
@@ -59,6 +60,39 @@ async def get_response(chat_message: ChatMessage,
     else:
         logger.error(
             f"Error : Get Response Endpoint : Graph Not init : {graph_error}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service unavailable: Graph failed to initialize - {graph_error}"
+        )
+
+
+@router.post("/stream")
+@limiter.limit("5/minute")
+async def stream_response(chat_message: ChatMessage, request: Request):
+    if graph and graph_init:
+        try:
+            config = {
+                "model": chat_message.model_name,
+                "temperature": chat_message.temperature,
+                "thread_id": chat_message.conversation_id,
+            }
+            logger.info(f"STREAM REQUEST {chat_message.conversation_id}: {config}")
+
+            return StreamingResponse(
+                graph.get_stream_response(
+                    query=chat_message.message,
+                    msg_id=chat_message.message_id,
+                    config=config,
+                    thread_id=chat_message.conversation_id,
+                    user_id=chat_message.user_id
+                ),
+                media_type="text/event-stream"
+            )
+        except Exception as e:
+            logger.error(f"Error : Stream Response Endpoint : {e}")
+            raise HTTPException(500, detail=str(e))
+    else:
+        logger.error(f"Error : Stream Response Endpoint : Graph Not init : {graph_error}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Service unavailable: Graph failed to initialize - {graph_error}"

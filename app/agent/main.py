@@ -66,6 +66,21 @@ class getGraphResponse():
 
     def get_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         try:
+            # Check for existing state in LangGraph
+            current_state = self.graph.get_state(config)
+            initial_messages = []
+            
+            # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
+            # This handles the "fork" scenario where Mongo has history but Redis matches a new thread ID
+            if not current_state.values or not current_state.values.get("messages"):
+                logger.info(f"Hydrating state from Mongo for thread {thread_id}")
+                mongo_msgs = self.mongo_store.get_thread_messages(user_id, thread_id)
+                for m in mongo_msgs:
+                    if m['role'] == 'user':
+                        initial_messages.append(HumanMessage(content=m['text'], id=m['message_id']))
+                    elif m['role'] in ['assistant', 'ai']:
+                        initial_messages.append(AIMessage(content=m['text'], id=m['message_id']))
+
             # Get existing summary from MongoDB for this thread
             existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
             
@@ -75,12 +90,16 @@ class getGraphResponse():
                 content=prompt,
                 id=msg_id,
                 metadata={"user_id": user_id,
-                          "thread_id": thread_id}
+                          "thread_id": thread_id,
+                          "timestamp": timestamp}
             )
+
+            # Combine hydrated history with new message
+            messages_input = initial_messages + [user_msg]
 
             try:
                 result = self.graph.invoke(
-                    {"messages": [user_msg], "system_message": self.sys_msg}, config)
+                    {"messages": messages_input, "system_message": self.sys_msg}, config)
                 if result:
                     ai_messages = result.get("messages", [])
                     final_message = None
@@ -144,3 +163,100 @@ class getGraphResponse():
         except Exception as e:
             logger.error(f"get_graph_res : {e}")
             return False
+
+    async def get_stream_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
+        try:
+            # Check for existing state in LangGraph
+            current_state = await self.graph.aget_state(config)
+            initial_messages = []
+            
+            # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
+            if not current_state.values or not current_state.values.get("messages"):
+                # logger.info(f"Hydrating state from Mongo for thread {thread_id}")
+                mongo_msgs = self.mongo_store.get_thread_messages(user_id, thread_id)
+                for m in mongo_msgs:
+                    if m['role'] == 'user':
+                        initial_messages.append(HumanMessage(content=m['text'], id=m['message_id']))
+                    elif m['role'] in ['assistant', 'ai']:
+                        initial_messages.append(AIMessage(content=m['text'], id=m['message_id']))
+
+            # Get existing summary from MongoDB for this thread
+            existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+            
+            prompt = get_formated_prompt(query, user_id)
+            timestamp = datetime.utcnow().isoformat()
+            user_msg = HumanMessage(
+                content=prompt,
+                id=msg_id,
+                metadata={"user_id": user_id,
+                          "thread_id": thread_id,
+                          "timestamp": timestamp}
+            )
+
+            # Combine hydrated history with new message
+            messages_input = initial_messages + [user_msg]
+            
+            full_response = ""
+            updated_summary = existing_summary
+            
+            async for event in self.graph.astream_events(
+                {"messages": messages_input, "system_message": self.sys_msg}, 
+                config, 
+                version="v1"
+            ):
+                kind = event["event"]
+                
+                # Yield tokens from the assistant's LLM
+                if kind == "on_chat_model_stream":
+                    content = event["data"]["chunk"].content
+                    if content:
+                        full_response += content
+                        yield content
+                
+                # Check for summary updates in output of stream if possible, 
+                # but usually summary is a separate node. 
+                # If 'summurize' node runs, we might see its output in 'on_chain_end' or similar, 
+                # but extracting it from stream events is tricky.
+                # For now, we'll try to get state after stream to see if summary updated, 
+                # OR just rely on the fact that summarize node updates the DB itself in the current implementation.
+            
+            # The 'summurize' node in existing code does: self.mongo_store.update_thread_summary(...)
+            # So we don't need to manually save summary here if the node ran.
+            # But we DO need to save the user message and the final assistant message.
+
+            if not full_response:
+                 logger.error("Agent produced no output in stream")
+                 return
+
+            try:
+                self.mongo_store.add_message(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    role="user",
+                    text=query,
+                    message_id=msg_id,
+                    embedding=get_embedding(query) or [],
+                    summary=updated_summary,
+                    summarize_fn="None",
+                    embed_summary_fn=get_embedding,
+                    context_fn=[]
+                )
+
+                self.mongo_store.add_message(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    role="assistant",
+                    message_id=msg_id,
+                    text=full_response,
+                    embedding=get_embedding(full_response) or [],
+                    summary=updated_summary,
+                    summarize_fn="None",
+                    embed_summary_fn=get_embedding,
+                    context_fn=[]
+                )
+            except Exception as e:
+                logger.error(f"getStreamResponse Convo save : {e}")
+
+        except Exception as e:
+            logger.error(f"get_stream_response : {e}")
+            yield f"Error: {str(e)}"
