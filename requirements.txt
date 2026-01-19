@@ -24,10 +24,8 @@ pytest-cov>=4.1.0
 
 # Langgraph
 langgraph
-langgraph-checkpoint-redis
-redis 
-redisvl
-IPython
+langgraph-checkpoint-postgres
+psycopg-pool
 langchain_google_genai
 langchain_groq
 langchain
@@ -35,3 +33,5 @@ pymongo
 slowapi
 
 pyppeteer
+psycopg2-binary
+pgvector

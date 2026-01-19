@@ -6,10 +6,12 @@ import json
 from app.agent.state import State
 from app.agent.helpers.load_prompt import load_prompt_from_yaml
 from app.agent.helpers.get_llm import get_groq_llm
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.agent.prompts.prompt_formation import get_formated_prompt
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from langchain_core.messages import RemoveMessage
+from langchain_core.prompts import PromptTemplate
+from datetime import datetime
 
 from app.core.logger import logger
 
@@ -43,7 +45,33 @@ class AgentNodes:
             temperature = state.get("temperature", 0.9)
             history = state.get("messages", [])
             print("Message History:", history)
-            ai_response: AIMessage = self.groq_llm.invoke(input=history)
+
+            # Load SYSTEM_PROMPT and format using LangChain PromptTemplate
+            template = load_prompt_from_yaml("SYSTEM_PROMPT")
+            current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+            
+            prompt_template = PromptTemplate(
+                input_variables=["summary", "current_time"],
+                template=template
+            )
+            
+            system_content = prompt_template.format(
+                summary=summary if summary else "None",
+                current_time=current_time
+            )
+
+            # Append additional context if present (RAG/External)
+            if context:
+                context_str = "\n".join(context) if isinstance(context, list) else str(context)
+                system_content += f"\n\n<RELEVANT CONTEXT>\n{context_str}\n</RELEVANT CONTEXT>"
+
+            if external_context:
+                 system_content += f"\n\n<EXTERNAL CONTEXT>\n{external_context}\n</EXTERNAL CONTEXT>"
+            
+            # Create messages list: System Message + History
+            messages = [SystemMessage(content=system_content)] + history
+
+            ai_response: AIMessage = self.groq_llm.invoke(input=messages)
 
             print("Message Current Count:", current_count)
             return {
@@ -62,8 +90,11 @@ class AgentNodes:
 
     def summury_decision(self, state: State) -> bool:
         try:
+            from app.core.config import settings
             count = int(state.get("count", 0))
-            return count > 5
+            # Use configured limit or default to 10
+            limit = getattr(settings, "MAX_MESSAGES_BEFORE_SUMMARY", 10)
+            return count > limit
         except (KeyError, TypeError, ValueError) as e:
             print("Error in summary decision:", e)
             logger.error("Error in summary decision:", e)

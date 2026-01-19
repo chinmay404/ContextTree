@@ -4,7 +4,7 @@ Fork thread endpoint.
 from typing import Optional
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
-from app.agent.store.MongoStore import MongoConversationStore
+from app.agent.store.PostgresStore import PostgresConversationStore
 from app.api.limiter import limiter
 from fastapi import Request
 from app.core.logger import logger
@@ -15,7 +15,7 @@ from app.agent.utils.embeddings import get_embedding
 
 
 router = APIRouter()
-mongo_store = MongoConversationStore()
+mongo_store = PostgresConversationStore()
 
 
 class ForkRequest(BaseModel):
@@ -50,19 +50,30 @@ async def fork_thread(fork_request: ForkRequest, request: Request):
 
         new_summary = existing_summary
         new_summary_embedding = []
+        
+        # ARC Logic: Split into Buffer and Summarizable History
+        buffer_size = 2 # e.g. Message at Fork + 1 before. Adjust as needed.
+        
+        # Ensure we capture the fork message itself in the buffer if it exists
+        # messages_data ends with the fork message (inclusive) per get_messages_until logic
+        
+        if len(messages_data) <= buffer_size:
+            messages_to_summarize = []
+            buffer_messages = messages_data
+        else:
+            messages_to_summarize = messages_data[:-buffer_size]
+            buffer_messages = messages_data[-buffer_size:]
 
-        # 2. If we have messages, we should update the summary to include them
-        # "modify new summury of node ... = previous node summury + current convo sumurry"
-        if messages_data:
+        # 2. Update Summary with messages strictly BEFORE the buffer
+        if messages_to_summarize:
             lc_messages = []
-            for m in messages_data:
+            for m in messages_to_summarize:
                 if m['role'] == 'user':
                     lc_messages.append(HumanMessage(content=m['text']))
                 elif m['role'] in ['assistant', 'ai']:
                     lc_messages.append(AIMessage(content=m['text']))
             
             # Generate new summary using LLM
-            # existing_summary serves as the "summary" input, lc_messages as "conversation"
             try:
                 llm = get_groq_llm()
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
@@ -75,14 +86,16 @@ async def fork_thread(fork_request: ForkRequest, request: Request):
                 logger.error(f"Failed to generate summary during fork: {e}")
                 # Fallback to existing summary if LLM fails
                 new_summary = existing_summary
-
+        
+        # 3. Create Fork with Buffer Messages
         success = mongo_store.fork_thread(
             user_id=fork_request.user_id,
             source_thread_id=fork_request.source_thread_id,
             new_thread_id=fork_request.new_thread_id,
             fork_at_message_id=fork_request.fork_at_message_id,
             summary=new_summary,
-            summary_embedding=new_summary_embedding
+            summary_embedding=new_summary_embedding,
+            initial_messages=buffer_messages
         )
         
         if success:

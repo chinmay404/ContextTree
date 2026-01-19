@@ -15,7 +15,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from datetime import datetime
 from uuid import uuid4
 from app.agent.utils.saver import redis_saver
-from app.agent.store.MongoStore import MongoConversationStore
+from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
 from app.agent.helpers.draw_graph import draw_graph
 from app.core.logger import logger
@@ -31,7 +31,7 @@ class getGraphResponse():
             raise MemoryError(
                 "Failed to initialize RedisSaver: memory is None")
         # self.memory = InMemorySaver()
-        self.mongo_store = MongoConversationStore()
+        self.mongo_store = PostgresConversationStore()
         Nodes = AgentNodes(mongo_store=self.mongo_store)
         self.nodes = Nodes.get_nodes()
         self.graph = self.build_graph()
@@ -99,7 +99,13 @@ class getGraphResponse():
 
             try:
                 result = self.graph.invoke(
-                    {"messages": messages_input, "system_message": self.sys_msg}, config)
+                    {
+                        "messages": messages_input, 
+                        "system_message": self.sys_msg,
+                        "summary": existing_summary
+                    }, 
+                    config
+                )
                 if result:
                     ai_messages = result.get("messages", [])
                     final_message = None
@@ -200,7 +206,11 @@ class getGraphResponse():
             updated_summary = existing_summary
             
             async for event in self.graph.astream_events(
-                {"messages": messages_input, "system_message": self.sys_msg}, 
+                {
+                    "messages": messages_input, 
+                    "system_message": self.sys_msg,
+                    "summary": existing_summary
+                }, 
                 config, 
                 version="v1"
             ):
