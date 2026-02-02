@@ -28,7 +28,7 @@ def get_Gemini(name: str = "deepseek-r1-distill-llama-70b"):
         return None
 
 
-def get_groq_llm(name: str = "deepseek-r1-distill-llama-70b"):
+def get_groq_llm(name):
     """qwen-qwq-32b	15	1,000,000	1,500"""
     try:
         api_key = os.getenv("GROQ_API_KEY")

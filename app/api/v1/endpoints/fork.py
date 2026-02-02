@@ -75,7 +75,7 @@ async def fork_thread(fork_request: ForkRequest, request: Request):
             
             # Generate new summary using LLM
             try:
-                llm = get_groq_llm()
+                llm = get_groq_llm(name="openai/gpt-oss-120b")
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
                 summary_response = llm.invoke(prompt)
                 new_summary = summary_response.content
@@ -102,6 +102,7 @@ async def fork_thread(fork_request: ForkRequest, request: Request):
             logger.info(
                 f"Successfully forked thread {fork_request.source_thread_id} "
                 f"to {fork_request.new_thread_id} at message {fork_request.fork_at_message_id}"
+                f"Summury {new_summary}"
             )
             return {
                 "status": "success",

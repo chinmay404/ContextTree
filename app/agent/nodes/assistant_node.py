@@ -19,7 +19,7 @@ from app.core.logger import logger
 class AgentNodes:
     def __init__(self, mongo_store=None):
         self.state = State()
-        self.groq_llm = get_groq_llm()
+        # self.groq_llm = get_groq_llm()
         self.sys_msg = load_prompt_from_yaml("REACT_LANGGRAPH_PROMPT")
         self.summury_prompt = load_prompt_from_yaml("SUMMARY_PROMPT")
         self.mongo_store = mongo_store
@@ -50,14 +50,18 @@ class AgentNodes:
             template = load_prompt_from_yaml("SYSTEM_PROMPT")
             current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
             
-            prompt_template = PromptTemplate(
-                input_variables=["summary", "current_time"],
-                template=template
-            )
+            user_query = None
+            for msg in reversed(history):
+                if isinstance(msg, HumanMessage):
+                    user_query = msg.content
+                    break
+
+            prompt_template = PromptTemplate.from_template(template)
             
             system_content = prompt_template.format(
                 summary=summary if summary else "None",
-                current_time=current_time
+                current_time=current_time,
+                user_query=user_query or ""
             )
 
             # Append additional context if present (RAG/External)
@@ -71,11 +75,22 @@ class AgentNodes:
             # Create messages list: System Message + History
             messages = [SystemMessage(content=system_content)] + history
 
-            ai_response: AIMessage = self.groq_llm.invoke(input=messages)
+            print("----- FINAL PROMPT DEBUG -----")
+            print("System Content (Instructions & Summary):", system_content)
+            # print("Context:", context)
+            # print("External Context:", external_context)
+            # print("Full Messages passed to LLM (System + History):", messages) 
+            print("------------------------------")
+
+            llm = get_groq_llm(name=model)
+            if llm is None:
+                raise RuntimeError("LLM initialization failed")
+            ai_response: AIMessage = llm.invoke(input=messages)
 
             print("Message Current Count:", current_count)
+            # Return only the new message delta
             return {
-                "messages": history + [ai_response],
+                "messages": [ai_response],
                 "count": current_count + 1,
                 "thread_id": thread_id,
                 "context": context,
@@ -86,7 +101,8 @@ class AgentNodes:
             }
         except Exception as e:
             print("Assistant Node error:", e)
-            logger.error("Assistant Node error:", e)
+            logger.error("Assistant Node error: %s", e)
+            return {"messages": state.get("messages", [])}
 
     def summury_decision(self, state: State) -> bool:
         try:
@@ -104,7 +120,12 @@ class AgentNodes:
         try:
             prompt = get_formated_summury_prompt(
                 state["messages"], state["summary"])
-            summary_msg = self.groq_llm.invoke(prompt)
+            model = state.get("model")
+            llm = get_groq_llm(name=model)
+            if not llm:
+                logger.error("Summarization skipped: Model Not Found")
+                return {"messages": [], "summary": state.get("summary")}
+            summary_msg = llm.invoke(prompt)
             new_summary = summary_msg.content
             
             # Save summary to MongoDB if mongo_store is available

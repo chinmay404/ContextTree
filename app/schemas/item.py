@@ -4,7 +4,7 @@ Pydantic schemas for the Item model.
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class ItemBase(BaseModel):
@@ -35,12 +35,17 @@ class ItemUpdate(BaseModel):
 
 class ChatMessage(BaseModel):
     """Schema for chat messages."""
+    model_config = ConfigDict(populate_by_name=True)
     message: str = Field(..., description="The user's message")
     message_id: str = Field(description="Unique identifier for the message")
     conversation_id: Optional[str] = Field(
-        None, description="Conversation identifier")
+        None, description="Conversation identifier", alias="nodeId")
     model_name: Optional[str] = Field(
-        None, description="Name of the model used for the response")
+        None, description="Name of the model used for the response", alias="model")
+    parent_thread_id: Optional[str] = Field(
+        None, description="Parent thread identifier", alias="parentNodeId")
+    fork_at_message_id: Optional[str] = Field(
+        None, description="Fork point message identifier", alias="forkedFromMessageId")
     temperature: Optional[float] = Field(
         None, description="Temperature setting for the model")
     context: Optional[list] = Field(

@@ -14,7 +14,8 @@ from app.agent.prompts.prompt_formation import get_formated_prompt
 from langchain_core.messages import AIMessage, HumanMessage
 from datetime import datetime
 from uuid import uuid4
-from app.agent.utils.saver import redis_saver
+import json
+from app.agent.utils.saver import postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
 from app.agent.helpers.draw_graph import draw_graph
@@ -26,10 +27,10 @@ from fastapi import APIRouter, HTTPException, status
 
 class getGraphResponse():
     def __init__(self):
-        self.memory = redis_saver()
+        self.memory = postgres_saver()
         if self.memory is None:
             raise MemoryError(
-                "Failed to initialize RedisSaver: memory is None")
+                "Failed to initialize PostgresSaver: memory is None")
         # self.memory = InMemorySaver()
         self.mongo_store = PostgresConversationStore()
         Nodes = AgentNodes(mongo_store=self.mongo_store)
@@ -96,13 +97,38 @@ class getGraphResponse():
 
             # Combine hydrated history with new message
             messages_input = initial_messages + [user_msg]
+            
+            # Deduplicate logic: If we hydrated from DB and the last message matches the current user message, don't append it again.
+            is_duplicate = False
+            if initial_messages:
+                last_msg = initial_messages[-1]
+                
+                # Check for ID match or exact content match
+                if last_msg.id == msg_id:
+                    is_duplicate = True
+                elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
+                    # Handle suffix differences (e.g. _u)
+                    if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
+                        is_duplicate = True
+                    if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
+                        is_duplicate = True
+                
+                # Content fallback check
+                if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
+                     is_duplicate = True
+                     
+                if is_duplicate:
+                    logger.info(f"Duplicate message detected in hydration: {msg_id}. Using DB version.")
+                    messages_input = initial_messages
 
             try:
                 result = self.graph.invoke(
                     {
                         "messages": messages_input, 
                         "system_message": self.sys_msg,
-                        "summary": existing_summary
+                        "summary": existing_summary,
+                        "model": config.get("configurable", {}).get("model"),
+                        "temperature": config.get("configurable", {}).get("temperature"),
                     }, 
                     config
                 )
@@ -135,35 +161,36 @@ class getGraphResponse():
                 raise RuntimeError("Agent produced no output")
                 return False
 
-            try:
-                self.mongo_store.add_message(
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    role="user",
-                    text=query,
-                    message_id=msg_id,
-                    embedding=get_embedding(query) or [],
-                    summary=updated_summary,
-                    summarize_fn="None",
-                    embed_summary_fn=get_embedding,
-                    context_fn=[]
-                )
+            if not is_duplicate:
+                try:
+                    self.mongo_store.add_message(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        role="user",
+                        text=query,
+                        message_id=msg_id,
+                        embedding=get_embedding(query) or [],
+                        summary=updated_summary,
+                        summarize_fn="None",
+                        embed_summary_fn=get_embedding,
+                        context_fn=[]
+                    )
 
-                self.mongo_store.add_message(
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    role="assistant",
-                    message_id=msg_id,
-                    text=str(final_message) if not isinstance(final_message, str) else final_message,
-                    embedding=get_embedding(str(final_message)) or [],
-                    summary=updated_summary,
-                    summarize_fn="None",
-                    embed_summary_fn=get_embedding,
-                    context_fn=[]
-                )
-            except Exception as e:
-                logger.error(f"getGraphResponse Convo save : {e}")
-                return False
+                    self.mongo_store.add_message(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        role="assistant",
+                        message_id=f"{msg_id}_ai",
+                        text=str(final_message) if not isinstance(final_message, str) else final_message,
+                        embedding=get_embedding(str(final_message)) or [],
+                        summary=updated_summary,
+                        summarize_fn="None",
+                        embed_summary_fn=get_embedding,
+                        context_fn=[]
+                    )
+                except Exception as e:
+                    logger.error(f"getGraphResponse Convo save : {e}")
+                    return False
 
             return final_message
         except Exception as e:
@@ -173,7 +200,11 @@ class getGraphResponse():
     async def get_stream_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         try:
             # Check for existing state in LangGraph
-            current_state = await self.graph.aget_state(config)
+            try:
+                current_state = await self.graph.aget_state(config)
+            except NotImplementedError:
+                # Fallback for sync checkpointers (e.g., PostgresSaver)
+                current_state = self.graph.get_state(config)
             initial_messages = []
             
             # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
@@ -202,26 +233,75 @@ class getGraphResponse():
             # Combine hydrated history with new message
             messages_input = initial_messages + [user_msg]
             
+            # Deduplicate logic: If we hydrated from DB and the last message matches the current user message, don't append it again.
+            is_duplicate = False
+            if initial_messages:
+                last_msg = initial_messages[-1]
+                
+                # Check for ID match or exact content match
+                if last_msg.id == msg_id:
+                    is_duplicate = True
+                elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
+                    # Handle suffix differences (e.g. _u)
+                    if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
+                        is_duplicate = True
+                    if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
+                        is_duplicate = True
+                
+                # Content fallback check
+                if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
+                     is_duplicate = True
+                     
+                if is_duplicate:
+                    logger.info(f"Duplicate message detected in stream hydration: {msg_id}. Using DB version.")
+                    messages_input = initial_messages
+            
             full_response = ""
             updated_summary = existing_summary
             
-            async for event in self.graph.astream_events(
-                {
-                    "messages": messages_input, 
-                    "system_message": self.sys_msg,
-                    "summary": existing_summary
-                }, 
-                config, 
-                version="v1"
-            ):
-                kind = event["event"]
-                
-                # Yield tokens from the assistant's LLM
-                if kind == "on_chat_model_stream":
-                    content = event["data"]["chunk"].content
-                    if content:
-                        full_response += content
-                        yield content
+            try:
+                async for event in self.graph.astream_events(
+                    {
+                        "messages": messages_input, 
+                        "system_message": self.sys_msg,
+                        "summary": existing_summary,
+                        "model": config.get("configurable", {}).get("model"),
+                        "temperature": config.get("configurable", {}).get("temperature"),
+                    }, 
+                    config, 
+                    version="v1"
+                ):
+                    kind = event["event"]
+                    
+                    # Yield tokens from the assistant's LLM
+                    if kind == "on_chat_model_stream":
+                        content = event["data"]["chunk"].content
+                        if content:
+                            full_response += content
+                            yield f"data: {json.dumps({'message': content})}\n\n"
+            except NotImplementedError:
+                # Sync fallback when async streaming is unsupported by the checkpointer
+                result = self.graph.invoke(
+                    {
+                        "messages": messages_input, 
+                        "system_message": self.sys_msg,
+                        "summary": existing_summary,
+                        "model": config.get("configurable", {}).get("model"),
+                        "temperature": config.get("configurable", {}).get("temperature"),
+                    },
+                    config
+                )
+                ai_messages = result.get("messages", []) if result else []
+                final_message = None
+                AI_RESPONSE_ = [
+                    msg for msg in ai_messages if isinstance(msg, AIMessage)
+                ]
+                if AI_RESPONSE_:
+                    final_message = AI_RESPONSE_[-1].content
+                if final_message:
+                    full_response = str(final_message)
+                    yield f"data: {json.dumps({'message': full_response})}\n\n"
+                updated_summary = result.get("summary", existing_summary) if result else existing_summary
                 
                 # Check for summary updates in output of stream if possible, 
                 # but usually summary is a separate node. 
@@ -239,24 +319,26 @@ class getGraphResponse():
                  return
 
             try:
-                self.mongo_store.add_message(
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    role="user",
-                    text=query,
-                    message_id=msg_id,
-                    embedding=get_embedding(query) or [],
-                    summary=updated_summary,
-                    summarize_fn="None",
-                    embed_summary_fn=get_embedding,
-                    context_fn=[]
-                )
+                # Only save user message if it wasn't already in the DB (deduplicated)
+                if not is_duplicate:
+                    self.mongo_store.add_message(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        role="user",
+                        text=query,
+                        message_id=msg_id,
+                        embedding=get_embedding(query) or [],
+                        summary=updated_summary,
+                        summarize_fn="None",
+                        embed_summary_fn=get_embedding,
+                        context_fn=[]
+                    )
 
                 self.mongo_store.add_message(
                     user_id=user_id,
                     thread_id=thread_id,
                     role="assistant",
-                    message_id=msg_id,
+                    message_id=f"{msg_id}_ai",
                     text=full_response,
                     embedding=get_embedding(full_response) or [],
                     summary=updated_summary,
@@ -267,6 +349,10 @@ class getGraphResponse():
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
 
+            yield "data: [DONE]\n\n"
+
         except Exception as e:
-            logger.error(f"get_stream_response : {e}")
-            yield f"Error: {str(e)}"
+            logger.error(f"get_stream_response : {repr(e)}")
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"

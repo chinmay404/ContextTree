@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     
     # Database settings
     DATABASE_URL: Optional[str] = None
+
+    # Conversation memory settings
+    MAX_MESSAGES_BEFORE_SUMMARY: int = 10
+    KEEP_LAST_MESSAGES: int = 6
+    FORK_BUFFER_MESSAGES: int = 2
     
     @validator("BACKEND_CORS_ORIGINS", pre=True)
     def assemble_cors_origins(cls, v: Any) -> List[str]:

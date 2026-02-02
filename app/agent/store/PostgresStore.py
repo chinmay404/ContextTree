@@ -36,6 +36,8 @@ class PostgresConversationStore:
         Resolves user_id (which might be UUID or email) to an email address.
         Returns the resolved email or defaults to user_id if lookup fails.
         """
+        if not user_id:
+            return "anonymous"
         # If it looks like an email, return it
         if "@" in user_id:
             return user_id
@@ -159,6 +161,68 @@ class PostgresConversationStore:
         finally:
             conn.close()
 
+    def get_thread_recent_messages(self, user_id: str, thread_id: str, limit: int) -> List[dict]:
+        """
+        Retrieves the most recent `limit` messages for a node, ordered oldest->newest.
+        """
+        conn = self._get_conn()
+        try:
+            register_vector(conn)
+            cur = conn.cursor(cursor_factory=DictCursor)
+
+            query = """
+                SELECT id as message_id, role, content as text, timestamp, position, embedding
+                FROM messages
+                WHERE node_id = %s
+                ORDER BY timestamp DESC, position DESC
+                LIMIT %s
+            """
+            cur.execute(query, (thread_id, limit))
+            msgs = [dict(r) for r in cur.fetchall()]
+            return list(reversed(msgs))
+        except Exception as e:
+            logger.error(f"Error getting recent thread messages: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def prune_thread_messages(self, thread_id: str, keep_last_n: int) -> int:
+        """
+        Deletes older messages in a thread, keeping only the last `keep_last_n`.
+        Returns the number of deleted messages.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT id
+                FROM messages
+                WHERE node_id = %s
+                ORDER BY timestamp, position
+                """,
+                (thread_id,)
+            )
+            ids = [row[0] for row in cur.fetchall()]
+
+            if keep_last_n <= 0 or len(ids) <= keep_last_n:
+                return 0
+
+            ids_to_delete = ids[:-keep_last_n]
+            cur.execute(
+                "DELETE FROM messages WHERE node_id = %s AND id = ANY(%s)",
+                (thread_id, ids_to_delete),
+            )
+            deleted = cur.rowcount
+            conn.commit()
+            return deleted
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error pruning thread messages: {e}")
+            return 0
+        finally:
+            conn.close()
+
     def find_similar_by_message_id(
         self,
         user_id: str,
@@ -188,8 +252,9 @@ class PostgresConversationStore:
                 ids = [m['message_id'] for m in msgs]
                 
                 if limit_msg_id:
-                    if limit_msg_id in ids:
-                        idx = ids.index(limit_msg_id)
+                    resolved_limit_id = self._resolve_message_id(limit_msg_id, ids)
+                    if resolved_limit_id and resolved_limit_id in ids:
+                        idx = ids.index(resolved_limit_id)
                         allowed_message_ids.update(ids[:idx])
                 else:
                     allowed_message_ids.update(ids)
@@ -247,15 +312,138 @@ class PostgresConversationStore:
         finally:
             conn.close()
 
+    def get_thread_message_count(self, thread_id: str) -> int:
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM messages WHERE node_id = %s", (thread_id,))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+        finally:
+            conn.close()
+
+    def get_message_by_id(self, message_id: str) -> Optional[dict]:
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor(cursor_factory=DictCursor)
+            cur.execute(
+                """
+                SELECT id as message_id, node_id as thread_id, role, content as text, timestamp, embedding
+                FROM messages
+                WHERE id = %s
+                """,
+                (message_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting message by id: {e}")
+            return None
+        finally:
+            conn.close()
+
+    def get_recent_messages(self, limit: int = 10) -> List[dict]:
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor(cursor_factory=DictCursor)
+            cur.execute(
+                """
+                SELECT id as message_id, node_id as thread_id, role, content as text, timestamp
+                FROM messages
+                ORDER BY timestamp DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.error(f"Error getting recent messages: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def thread_exists(self, thread_id: str) -> bool:
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM nodes WHERE id = %s", (thread_id,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+        finally:
+            conn.close()
+
+    def _resolve_message_id(self, target_id: str, candidate_ids: List[str]) -> Optional[str]:
+        """
+        Smart fuzzy matching to handle frontend (-u/-a) vs backend (_ai/_) ID mismatches.
+        Returns the matching ID from candidate_ids if found, else None.
+        """
+        if target_id in candidate_ids:
+            return target_id
+
+        def normalize_id(mid):
+            if not isinstance(mid, str): return str(mid)
+            # Strip known suffixes to get base ID
+            base = mid
+            for suffix in ["_ai", "_a", "-a", "_u", "-u"]:
+                if base.endswith(suffix):
+                    base = base[:-len(suffix)]
+                    break
+            return base
+
+        def get_role_hint(mid):
+                if not isinstance(mid, str): return "unknown"
+                if mid.endswith(("_ai", "_a", "-a")): return "assistant"
+                if mid.endswith(("_u", "-u")): return "user"
+                return "user" # Default assumption for base IDs
+
+        req_base = normalize_id(target_id)
+        req_role = get_role_hint(target_id)
+
+        for mid in candidate_ids:
+            if not isinstance(mid, str): continue
+            
+            db_base = normalize_id(mid)
+            db_role = get_role_hint(mid)
+            
+            if req_base == db_base:
+                if req_role == db_role:
+                    return mid
+                
+                # Fallback: if we are looking for 'user' and DB has base ID only
+                if req_role == "user" and db_role == "user": 
+                        return mid
+                
+                # Fallback: if we look for assistant and DB has _ai or _a
+                if req_role == "assistant" and db_role == "assistant":
+                        return mid
+
+        # Original legacy fallback
+        for mid in candidate_ids:
+            if isinstance(mid, str) and (mid.startswith(target_id) or target_id.startswith(mid) or mid.replace("_u", "") == target_id.replace("_u", "")):
+                return mid
+        
+        return None
+
     def get_messages_until(self, user_id: str, thread_id: str, message_id: str) -> Tuple[str, List[dict]]:
         summary = self.get_thread_summary(user_id, thread_id)
         msgs = self.get_thread_messages(user_id, thread_id)
         
         target_msgs = []
         found = False
+        ids = [m['message_id'] for m in msgs]
+
+        resolved_message_id = self._resolve_message_id(message_id, ids)
+        if not resolved_message_id:
+             # If strictly not found, assume not found (already tried fallbacks)
+             pass
+
         for m in msgs:
             target_msgs.append(m)
-            if m['message_id'] == message_id:
+            if m['message_id'] == resolved_message_id:
                 found = True
                 break
         
@@ -288,6 +476,67 @@ class PostgresConversationStore:
             if not source_node:
                 return False
             canvas_id = source_node[0]
+
+            # If child already exists, update summary and optionally seed buffer
+            cur.execute("SELECT id FROM nodes WHERE id = %s", (new_thread_id,))
+            child_exists = cur.fetchone() is not None
+            if child_exists:
+                if summary is not None:
+                    if summary_embedding is not None:
+                        cur.execute(
+                            "UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s",
+                            (summary, summary_embedding, new_thread_id),
+                        )
+                    else:
+                        cur.execute(
+                            "UPDATE nodes SET summary = %s WHERE id = %s",
+                            (summary, new_thread_id),
+                        )
+
+                cur.execute("SELECT COUNT(*) FROM messages WHERE node_id = %s", (new_thread_id,))
+                count_row = cur.fetchone()
+                child_msg_count = int(count_row[0]) if count_row else 0
+
+                # Allow insertion if count is 0 OR 1 (assuming the 1 is the new user trigger message)
+                if initial_messages and child_msg_count <= 1:
+                    # Check if we already have these messages (deduplication heuristic)
+                    # If count is 1, and we insert, we might duplicate if we already did this?
+                    # But if we did this, count would be 1 + len(initial_messages) > 1 (assuming len > 0).
+                    # So checking count <= 1 is safe provided len(initial_messages) >= 1.
+                    
+                    for idx, msg in enumerate(initial_messages):
+                        import uuid
+                        new_msg_id = str(uuid.uuid4())
+
+                        emb = msg.get('embedding')
+                        if emb is None or emb == {}:
+                            emb = []
+                        elif isinstance(emb, np.ndarray):
+                            emb = emb.tolist()
+                        elif not isinstance(emb, list):
+                            emb = []
+                        
+                        if not emb:
+                             emb = None
+
+                        cur.execute(
+                            """
+                            INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                new_msg_id,
+                                new_thread_id,
+                                msg.get('role'),
+                                msg.get('text', '') or msg.get('content', ''),
+                                emb,
+                                msg.get('timestamp', now),
+                                user_email,
+                            ),
+                        )
+
+                conn.commit()
+                return True
 
             # In Mongo store, if summary fallback was needed:
             # final_summary = summary if summary is not None else source.get("summary")
@@ -332,15 +581,17 @@ class PostgresConversationStore:
                      # We might want to keep reference to original? But ARC says "No dependency".
                      
                      emb = msg.get('embedding')
-                     if emb is None:
+                     if emb is None or emb == {}:
                          emb = []
                      elif isinstance(emb, np.ndarray):
                          emb = emb.tolist()
                      elif not isinstance(emb, list):
-                         # If it's something else (e.g. string), leave it or handle it?
-                         # For now assume list/array/None
-                         pass
+                         emb = []
 
+                     # Fix for "invalid input syntax for type vector: '{}'"
+                     if not emb:
+                         emb = None
+                     
                      cur.execute("""
                         INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
                         VALUES (%s, %s, %s, %s, %s, %s, %s)
