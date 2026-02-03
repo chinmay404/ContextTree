@@ -15,7 +15,7 @@ class MongoConversationStore:
         db_name: str = "Conversationstore",
         user_coll: str = "users",
         msg_coll_name: str = "messages",
-        embedding_dim: int = 1536
+        embedding_dim: int = 768
     ):
         """
         Initializes collections:

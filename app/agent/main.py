@@ -84,6 +84,106 @@ class getGraphResponse():
 
             # Get existing summary from MongoDB for this thread
             existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+
+            # --- RAG Context: similar messages + connected files ---
+            query_embedding = get_embedding(query) or []
+            context_snippets = []
+            external_context_snippets = []
+
+            if query_embedding:
+                try:
+                    # RAG Logic: Use ancestry to respect strict tree architecture
+                    # Search messages in: Current Node + Ancestors + Global Files (if linked?)
+                    # Wait, core doc says: "Ownership never flows backward or sideways"
+                    # So we should search messages ONLY in the ancestry chain.
+                    # Global search across all user history violates "No context leaks".
+                    
+                    ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
+                    # Convert to list of (id, None) tuples for the store method
+                    thread_scope = [(aid, None) for aid in ancestry_ids]
+                    
+                    sims = self.mongo_store.find_similar_by_message_id(
+                        user_id=user_id,
+                        thread_queries=thread_scope,
+                        query_embeddings=query_embedding,
+                        top_k=3,
+                    ) or []
+                    for idx, s in enumerate(sims):
+                        score = s.get("score")
+                        role = s.get("role")
+                        text = s.get("text", "")
+                        msg_id = s.get("message_id")
+                        score_str = f"{score:.3f}" if score is not None else "n/a"
+                        context_snippets.append(
+                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id}: {text}"
+                        )
+                except Exception as e:
+                    logger.error(f"Similarity search failed: {e}")
+
+                try:
+                    file_chunks = self.mongo_store.get_related_file_context(
+                        node_id=thread_id,
+                        query_embedding=query_embedding,
+                        limit=3,
+                    ) or []
+                    for idx, c in enumerate(file_chunks):
+                        meta = c.get("metadata")
+                        try:
+                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+                        except Exception:
+                            meta = meta or {}
+                        external_context_snippets.append(
+                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
+                        )
+                except Exception as e:
+                    logger.error(f"File context search failed: {e}")
+
+            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
+
+            # --- RAG Context: similar messages + connected files ---
+            query_embedding = get_embedding(query) or []
+            context_snippets = []
+            external_context_snippets = []
+
+            if query_embedding:
+                try:
+                    sims = self.mongo_store.find_similar_by_message_id(
+                        user_id=user_id,
+                        thread_queries=[],
+                        query_embeddings=query_embedding,
+                        top_k=3,
+                    ) or []
+                    for idx, s in enumerate(sims):
+                        score = s.get("score")
+                        role = s.get("role")
+                        text = s.get("text", "")
+                        msg_id = s.get("message_id")
+                        score_str = f"{score:.3f}" if score is not None else "n/a"
+                        context_snippets.append(
+                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id}: {text}"
+                        )
+                except Exception as e:
+                    logger.error(f"Similarity search failed: {e}")
+
+                try:
+                    file_chunks = self.mongo_store.get_related_file_context(
+                        node_id=thread_id,
+                        query_embedding=query_embedding,
+                        limit=3,
+                    ) or []
+                    for idx, c in enumerate(file_chunks):
+                        meta = c.get("metadata")
+                        try:
+                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+                        except Exception:
+                            meta = meta or {}
+                        external_context_snippets.append(
+                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
+                        )
+                except Exception as e:
+                    logger.error(f"File context search failed: {e}")
+
+            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
             
             prompt = get_formated_prompt(query, user_id)
             timestamp = datetime.utcnow().isoformat()
@@ -127,6 +227,8 @@ class getGraphResponse():
                         "messages": messages_input, 
                         "system_message": self.sys_msg,
                         "summary": existing_summary,
+                        "context": context_snippets,
+                        "external_context": external_context_str,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
                     }, 
@@ -206,6 +308,55 @@ class getGraphResponse():
                 # Fallback for sync checkpointers (e.g., PostgresSaver)
                 current_state = self.graph.get_state(config)
             initial_messages = []
+
+            # --- RAG Context: similar messages + connected files ---
+            query_embedding = get_embedding(query) or []
+            context_snippets: list[str] = []
+            external_context_snippets: list[str] = []
+
+            if query_embedding:
+                try:
+                    # Strict Ancestry Search
+                    ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
+                    thread_scope = [(aid, None) for aid in ancestry_ids]
+                    
+                    sims = self.mongo_store.find_similar_by_message_id(
+                        user_id=user_id,
+                        thread_queries=thread_scope,
+                        query_embeddings=query_embedding,
+                        top_k=3,
+                    ) or []
+                    for idx, s in enumerate(sims):
+                        score = s.get("score")
+                        role = s.get("role")
+                        text = s.get("text", "")
+                        msg_id_sim = s.get("message_id")
+                        score_str = f"{score:.3f}" if score is not None else "n/a"
+                        context_snippets.append(
+                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id_sim}: {text}"
+                        )
+                except Exception as e:
+                    logger.error(f"Similarity search failed: {e}")
+
+                try:
+                    file_chunks = self.mongo_store.get_related_file_context(
+                        node_id=thread_id,
+                        query_embedding=query_embedding,
+                        limit=3,
+                    ) or []
+                    for idx, c in enumerate(file_chunks):
+                        meta = c.get("metadata")
+                        try:
+                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+                        except Exception:
+                            meta = meta or {}
+                        external_context_snippets.append(
+                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
+                        )
+                except Exception as e:
+                    logger.error(f"File context search failed: {e}")
+
+            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
             
             # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
             if not current_state.values or not current_state.values.get("messages"):
@@ -265,6 +416,8 @@ class getGraphResponse():
                         "messages": messages_input, 
                         "system_message": self.sys_msg,
                         "summary": existing_summary,
+                        "context": context_snippets,
+                        "external_context": external_context_str,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
                     }, 
@@ -286,6 +439,8 @@ class getGraphResponse():
                         "messages": messages_input, 
                         "system_message": self.sys_msg,
                         "summary": existing_summary,
+                        "context": context_snippets,
+                        "external_context": external_context_str,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
                     },

@@ -17,7 +17,7 @@ class PostgresConversationStore:
     def __init__(
         self,
         db_url: Optional[str] = None,
-        embedding_dim: int = 1536
+        embedding_dim: int = 768
     ):
         self.db_url = db_url or os.getenv("DATABASE_URL")
         # Ensure we use the pooled 'postgres' database if generic
@@ -161,6 +161,39 @@ class PostgresConversationStore:
         finally:
             conn.close()
 
+    def get_thread_ancestry(self, thread_id: str) -> List[str]:
+        """
+        Returns a list of node_ids from current thread up to the root, 
+        following parent_node_id links.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            ancestry = []
+            queue = [thread_id]
+            
+            # Simple recursive CTE replacement or loop
+            # Using loop for safety against cycles if any
+            visited = set()
+            curr = thread_id
+            
+            while curr and curr not in visited:
+                visited.add(curr)
+                ancestry.append(curr)
+                cur.execute("SELECT parent_node_id FROM nodes WHERE id = %s", (curr,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    curr = row[0]
+                else:
+                    curr = None
+            
+            return ancestry
+        except Exception as e:
+            logger.error(f"Error getting thread ancestry: {e}")
+            return [thread_id]
+        finally:
+            conn.close()
+
     def get_thread_recent_messages(self, user_id: str, thread_id: str, limit: int) -> List[dict]:
         """
         Retrieves the most recent `limit` messages for a node, ordered oldest->newest.
@@ -240,45 +273,53 @@ class PostgresConversationStore:
             # We must resolve the "accessible message IDs" for each query (thread_id, msg_id).
             
             allowed_message_ids = set()
-            
-            for thread_id, limit_msg_id in thread_queries:
-                # We reuse get_thread_messages logic to get the list of relevant messages
-                # This is inefficient for large scale but correct.
-                # Creating a temporary list.
-                # Could be optimized with recursive SQL CTE but pgvector + CTE is fine.
+            is_global_search = not thread_queries
+
+            if not is_global_search:
+                for thread_id, limit_msg_id in thread_queries:
+                    # We reuse get_thread_messages logic to get the list of relevant messages
+                    msgs = self.get_thread_messages(user_id, thread_id)
+                    ids = [m['message_id'] for m in msgs]
+                    
+                    if limit_msg_id:
+                        resolved_limit_id = self._resolve_message_id(limit_msg_id, ids)
+                        if resolved_limit_id and resolved_limit_id in ids:
+                            idx = ids.index(resolved_limit_id)
+                            allowed_message_ids.update(ids[:idx])
+                    else:
+                        allowed_message_ids.update(ids)
                 
-                # Retrieve full history for this thread
-                msgs = self.get_thread_messages(user_id, thread_id)
-                ids = [m['message_id'] for m in msgs]
-                
-                if limit_msg_id:
-                    resolved_limit_id = self._resolve_message_id(limit_msg_id, ids)
-                    if resolved_limit_id and resolved_limit_id in ids:
-                        idx = ids.index(resolved_limit_id)
-                        allowed_message_ids.update(ids[:idx])
-                else:
-                    allowed_message_ids.update(ids)
-            
-            if not allowed_message_ids:
-                return []
-                
+                if not allowed_message_ids:
+                    return []
+
             # Vector Search
-            if len(allowed_message_ids) == 1:
-                in_clause = "(%s)"
-                params = [list(allowed_message_ids)[0]]
+            if is_global_search:
+                user_email_resolved = self._resolve_user_email(cur, user_id)
+                query = f"""
+                    SELECT id as message_id, role, content as text, (1 - (embedding <=> %s::vector)) as score
+                    FROM messages
+                    WHERE user_email = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(query, [query_embeddings, user_email_resolved, query_embeddings, top_k])
             else:
-                in_clause = "%s"
-                params = [tuple(allowed_message_ids)]
-                
-            query = f"""
-                SELECT id as message_id, role, content as text, (1 - (embedding <=> %s::vector)) as score
-                FROM messages
-                WHERE id IN {in_clause}
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """
-            
-            cur.execute(query, [query_embeddings, tuple(allowed_message_ids) if len(allowed_message_ids)>1 else list(allowed_message_ids)[0], query_embeddings, top_k])
+                if len(allowed_message_ids) == 1:
+                    in_clause = "(%s)"
+                    ids_param = list(allowed_message_ids)[0]
+                else:
+                    in_clause = "%s"
+                    ids_param = tuple(allowed_message_ids)
+
+                query = f"""
+                    SELECT id as message_id, role, content as text, (1 - (embedding <=> %s::vector)) as score
+                    FROM messages
+                    WHERE id IN {in_clause}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                cur.execute(query, [query_embeddings, ids_param, query_embeddings, top_k])
+
             return [dict(r) for r in cur.fetchall()]
 
         except Exception as e:
@@ -610,6 +651,168 @@ class PostgresConversationStore:
         except Exception as e:
             conn.rollback()
             logger.error(f"Error forking: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_file_binary(self, file_id: str) -> Optional[dict]:
+        """
+        Retrieves the binary content and metadata of a file from external_files.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor(cursor_factory=DictCursor)
+            cur.execute("""
+                SELECT id, file_name, mime_type, data 
+                FROM external_files 
+                WHERE id = %s
+            """, (file_id,))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching file binary: {e}")
+            raise e
+        finally:
+            conn.close()
+
+    def save_file_chunks(self, file_id: str, chunks: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
+        """
+        Saves chunks and embeddings to file_chunks table.
+        Updates external_files.processed = true.
+        """
+        conn = self._get_conn()
+        try:
+            register_vector(conn)
+            cur = conn.cursor()
+            
+            # Ensure metadatas is list of same length if None
+            if metadatas is None:
+                metadatas = [{'source': 'unknown'}] * len(chunks)
+            
+            # 1. Insert Chunks
+            data_list = []
+            for idx, (text, emb, meta) in enumerate(zip(chunks, embeddings, metadatas)):
+                import json
+                # Ensure metadata is json serializable dict
+                meta_json = json.dumps(meta)
+                item = (file_id, idx, text, emb, meta_json)
+                data_list.append(item)
+            
+            from psycopg2.extras import execute_values
+            
+            insert_query = """
+                INSERT INTO file_chunks (file_id, chunk_index, chunk_text, embedding, metadata)
+                VALUES %s
+            """
+            
+            execute_values(cur, insert_query, data_list)
+
+            # 2. Update processed status
+            cur.execute("""
+                UPDATE external_files 
+                SET processed = true, updated_at = NOW() 
+                WHERE id = %s
+            """, (file_id,))
+            
+            conn.commit()
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error saving file chunks: {e}")
+            raise e
+        finally:
+            conn.close()
+
+    def get_related_file_context(self, node_id: str, query_embedding: List[float], limit: int = 3) -> List[dict]:
+        """
+        Finds the nearest file chunks connected to a given node (via edges).
+        Returns chunk text plus metadata so the caller can format rich context.
+        """
+        if not query_embedding:
+            return []
+
+        conn = self._get_conn()
+        try:
+            register_vector(conn)
+            cur = conn.cursor(cursor_factory=DictCursor)
+            
+            query = """
+                WITH connected_files AS (
+                    SELECT n.id as file_node_id
+                    FROM nodes n
+                    JOIN edges e ON (e.from_node = n.id OR e.to_node = n.id)
+                    WHERE (e.from_node = %s OR e.to_node = %s)
+                      AND n.id != %s
+                      AND n.type = 'externalContext'
+                )
+                SELECT 
+                    fc.chunk_text,
+                    fc.metadata,
+                    fc.chunk_index,
+                    (fc.embedding <=> %s::vector) as distance,
+                    ef.file_name,
+                    ef.file_type
+                FROM file_chunks fc
+                JOIN external_files ef ON fc.file_id = ef.id
+                JOIN connected_files cf ON ef.node_id = cf.file_node_id 
+                ORDER BY distance ASC
+                LIMIT %s
+            """
+            
+            cur.execute(query, (node_id, node_id, node_id, np.array(query_embedding), limit))
+            rows = cur.fetchall()
+            
+            return [dict(row) for row in rows]
+            
+        except Exception as e:
+            logger.error(f"Error fetching related file context: {e}")
+            return []
+        finally:
+            conn.close()
+
+    def update_node_data_content(self, node_id: str, content: str) -> bool:
+        """
+        Persist extracted text onto the node's data jsonb and clear any loading flags.
+        Also replaces the placeholder contextContract ("Processing...") with the
+        extracted text or a friendly fallback when the file has no text.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+
+            text_value = content or ""
+            contract_value = content if content else "(No text content extracted)"
+
+            cur.execute(
+                """
+                UPDATE nodes 
+                SET data = jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    jsonb_set(
+                                        jsonb_set(
+                                            jsonb_set(coalesce(data, '{}'::jsonb), '{data,content}', to_jsonb(%s::text), true),
+                                            '{data,loading}', 'false'::jsonb, true
+                                        ),
+                                        '{content}', to_jsonb(%s::text), true
+                                    ),
+                                    '{loading}', 'false'::jsonb, true
+                                ),
+                                '{contextContract}', to_jsonb(%s::text), true
+                            ),
+                            '{data,contextContract}', to_jsonb(%s::text), true
+                        )
+                WHERE id = %s
+                """,
+                (text_value, text_value, contract_value, contract_value, node_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error updating node data content: {e}")
             return False
         finally:
             conn.close()

@@ -68,3 +68,7 @@ No depth-based token growth
 Deterministic behavior
 
 That’s the full arc. What you described in your last message matches this exactly.
+
+
+now context node :
+hwihc will connect to normal node when connected in APi we get that context node id so backend API knows this Externla context i need to use then it will do sim search on those docs if user disconnect node no externla context node id will pass so reposne will not be genarted form that externla context 

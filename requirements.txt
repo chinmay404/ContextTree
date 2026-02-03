@@ -24,6 +24,8 @@ pytest-cov>=4.1.0
 
 # Langgraph
 langchain
+langchain-community
+langchain-text-splitters
 langgraph
 langgraph-checkpoint-postgres
 psycopg-pool
@@ -37,3 +39,15 @@ pyppeteer
 psycopg2-binary
 pgvector
 langgraph-checkpoint-redis
+
+
+
+
+# RAG
+pypdf   
+python-docx
+docx2txt
+tiktoken   
+openai 
+langchain-google-genai
+langchain-text-splitters
