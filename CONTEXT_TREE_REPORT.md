@@ -3,7 +3,7 @@
 ## 1. Project Overview (What We Do)
 **ContextTree** (also referred to as "Convo Canvas API") is a backend API for a sophisticated chat application. Its primary purpose is to facilitate user-AI conversations with advanced structural capabilities.
 
-*   **Core Functionality:** It powers a chat interface where users can converse with an AI.
+*   **Core Functionalityd:** It powers a chat interface where users can converse with an AI.
 *   **Unique Selling Point:** It supports **Thread Forking**, allowing users to branch off a conversation from a specific message point, creating alternate conversation paths while preserving context.
 *   **AI Engine:** Uses Large Language Models (LLMs) such as Groq and Gemini, orchestrated via `LangChain` and `LangGraph`.
 
