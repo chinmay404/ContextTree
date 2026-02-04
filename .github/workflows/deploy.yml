@@ -22,7 +22,7 @@ jobs:
         ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
         echo "Syncing files..."
-        rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' ./ContextTree/ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current
+        rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current
 
         echo "Restarting service..."
         ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "cd /opt/api-service/current && source venv/bin/activate && pip install -r requirements.txt && sudo systemctl restart api-service"
