@@ -21,9 +21,9 @@ class IngestRequest(BaseModel):
     node_id: Optional[str] = None
     canvas_id: Optional[str] = None
 
-def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tuple[List[str], List[dict], str]:
+def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tuple[List[str], List[dict], str, Optional[str]]:
     """
-    Returns chunks, metadatas, and full_text (for preview)
+    Returns chunks, metadatas, full_text (for preview), and error message if any.
     """
     suffix = ""
     # Determine suffix based on mime_type (robust priority) or extension
@@ -81,11 +81,11 @@ def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tup
         # For CSV, page_content is row representation
         full_text = "\n\n".join([d.page_content for d in docs])
         
-        return chunks, metadatas, full_text
+        return chunks, metadatas, full_text, None
         
     except Exception as e:
         logger.error(f"Error loading file {file_name} with langchain: {e}")
-        return [], [], ""
+        return [], [], "", "Failed to read file content"
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -108,6 +108,10 @@ def process_file_background(request: IngestRequest):
     file_record = store.get_file_binary(request.file_id)
     if not file_record:
         logger.error(f"File {request.file_id} not found in DB")
+        if request.node_id:
+            store.update_node_processing_error(
+                request.node_id, "File not found in storage"
+            )
         return
 
     data = file_record.get('data')
@@ -119,6 +123,10 @@ def process_file_background(request: IngestRequest):
 
     if not data:
         logger.error(f"No binary data for file {request.file_id}")
+        if request.node_id:
+            store.update_node_processing_error(
+                request.node_id, "File content missing"
+            )
         return
         
     # Convert memoryview to bytes if needed
@@ -126,21 +134,48 @@ def process_file_background(request: IngestRequest):
         data = data.tobytes()
 
     # 2. Parse & Chunk
-    chunks, metadatas, text_content = load_and_split_documents(data, mime_type, file_name)
+    chunks, metadatas, text_content, load_error = load_and_split_documents(data, mime_type, file_name)
+
+    if load_error:
+        logger.warning(f"File processing error for {request.file_id}: {load_error}")
+        if request.node_id:
+            store.update_node_processing_error(request.node_id, load_error)
+        return
 
     if not chunks:
         logger.warning(f"No chunks extracted from file {request.file_id}")
         if request.node_id:
             limit_content = text_content[:100000] if text_content else ""
-            store.update_node_data_content(request.node_id, limit_content)
+            if limit_content:
+                store.update_node_data_content(request.node_id, limit_content)
+            else:
+                store.update_node_processing_error(
+                    request.node_id, "No text content extracted"
+                )
         return
 
     # 4. Embed
     logger.info(f"Generating embeddings for {len(chunks)} chunks")
-    embeddings = get_embeddings(chunks)
+    try:
+        embeddings = get_embeddings(chunks)
+    except Exception as e:
+        logger.error(f"Embedding generation failed for {request.file_id}: {e}")
+        if request.node_id:
+            store.update_node_processing_error(
+                request.node_id, "Failed to generate embeddings"
+            )
+        return
 
     # 5. Save
-    store.save_file_chunks(request.file_id, chunks, embeddings, metadatas)
+    try:
+        store.save_file_chunks(request.file_id, chunks, embeddings, metadatas)
+    except Exception as e:
+        logger.error(f"Saving file chunks failed for {request.file_id}: {e}")
+        if request.node_id:
+            store.update_node_processing_error(
+                request.node_id, "Failed to save processed file"
+            )
+        return
     
     # 6. Update Node with extracted content
     if request.node_id:

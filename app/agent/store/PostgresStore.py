@@ -793,12 +793,18 @@ class PostgresConversationStore:
                                 jsonb_set(
                                     jsonb_set(
                                         jsonb_set(
-                                            jsonb_set(coalesce(data, '{}'::jsonb), '{data,content}', to_jsonb(%s::text), true),
-                                            '{data,loading}', 'false'::jsonb, true
+                                            jsonb_set(
+                                                jsonb_set(
+                                                    jsonb_set(coalesce(data, '{}'::jsonb), '{data,content}', to_jsonb(%s::text), true),
+                                                    '{data,loading}', 'false'::jsonb, true
+                                                ),
+                                                '{data,error}', 'null'::jsonb, true
+                                            ),
+                                            '{content}', to_jsonb(%s::text), true
                                         ),
-                                        '{content}', to_jsonb(%s::text), true
+                                        '{loading}', 'false'::jsonb, true
                                     ),
-                                    '{loading}', 'false'::jsonb, true
+                                    '{error}', 'null'::jsonb, true
                                 ),
                                 '{contextContract}', to_jsonb(%s::text), true
                             ),
@@ -813,6 +819,47 @@ class PostgresConversationStore:
         except Exception as e:
             conn.rollback()
             logger.error(f"Error updating node data content: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def update_node_processing_error(self, node_id: str, message: str) -> bool:
+        """
+        Mark a file node as failed, store a user-friendly error, and clear loading flags.
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.cursor()
+            error_value = message or "Failed to process file"
+
+            cur.execute(
+                """
+                UPDATE nodes 
+                SET data = jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    jsonb_set(
+                                        jsonb_set(
+                                            jsonb_set(coalesce(data, '{}'::jsonb), '{data,error}', to_jsonb(%s::text), true),
+                                            '{data,loading}', 'false'::jsonb, true
+                                        ),
+                                        '{error}', to_jsonb(%s::text), true
+                                    ),
+                                    '{loading}', 'false'::jsonb, true
+                                ),
+                                '{contextContract}', to_jsonb(%s::text), true
+                            ),
+                            '{data,contextContract}', to_jsonb(%s::text), true
+                        )
+                WHERE id = %s
+                """,
+                (error_value, error_value, error_value, error_value, node_id)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error updating node processing error: {e}")
             return False
         finally:
             conn.close()
