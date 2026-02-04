@@ -13,7 +13,7 @@ echo ">>> Installing Nginx and Certbot..."
 sudo apt-get install -y nginx certbot python3-certbot-nginx
 
 echo ">>> Configuring Nginx..."
-# Create Nginx config for FastAPI
+
 cat <<EOF | sudo tee /etc/nginx/sites-available/contexttreeapi
 server {
     server_name $DOMAIN;
