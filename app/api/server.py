@@ -42,7 +42,11 @@ def create_application() -> FastAPI:
         allow_headers=["*"],
     )
 
-    application.include_router(api_router, prefix=settings.API_V1_STR)
+    api_prefix = settings.API_V1_STR or ""
+    application.include_router(api_router, prefix=api_prefix)
+    # Also serve unprefixed routes for clients that call "/chat/..." or "/files/..."
+    if api_prefix:
+        application.include_router(api_router, prefix="")
 
     @application.get("/")
     async def root():
