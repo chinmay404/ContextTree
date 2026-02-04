@@ -190,5 +190,6 @@ async def ingest_file(request: IngestRequest, background_tasks: BackgroundTasks)
     """
     Triggers background ingestion of a file already stored in DB.
     """
+    logger.info(f"Ingest request received for file_id: {request.file_id} user: {request.user_email}")
     background_tasks.add_task(process_file_background, request)
     return {"status": "processing_started", "file_id": request.file_id}
