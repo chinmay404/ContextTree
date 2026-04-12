@@ -1,260 +1,270 @@
 """
-Items CRUD endpoints.
+Chat endpoints.
+
+POST /       — synchronous (returns full response JSON)
+POST /stream — streaming (Server-Sent Events)
+
+Rate limit: 60 messages/minute per authenticated user_id.
+If user_id is not present in the body (shouldn't happen in normal use),
+falls back to remote IP to avoid crashing.
 """
-from typing import List, Optional
-from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException, status
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import AIMessage, HumanMessage
 
-from app.schemas.item import ChatMessage
+from app.agent.helpers.get_llm import get_llm
 from app.agent.main import getGraphResponse
-from app.api.limiter import limiter
-from fastapi import Request
-
-
-from app.core.logger import logger
-from app.core.config import settings
-from app.agent.helpers.get_llm import get_groq_llm
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
-from langchain_core.messages import HumanMessage, AIMessage
 from app.agent.utils.embeddings import get_embedding
-
+from app.api.limiter import limiter
+from app.core.config import settings
+from app.core.logger import logger
+from app.schemas.item import ChatMessage
 
 router = APIRouter()
-try:
-    graph = getGraphResponse()
-    graph_init = True
-    graph_error = None
-except Exception as e:
-    logger.error(f"Failed to initialize graph: {e}")
-    graph = None
-    graph_init = False
-    graph_error = str(e)
 
+# ── Graph singleton ────────────────────────────────────────────────────────────
+graph = None
+graph_init = False
+graph_error = None
+
+
+def _initialise_graph(force: bool = False) -> bool:
+    """
+    Build the LangGraph singleton.
+
+    The backend used to try this only once at import time. If Supabase or the
+    checkpointer was briefly unavailable during startup, the process stayed in a
+    broken 503 state until it was restarted. We keep the singleton model, but
+    allow a safe retry on demand.
+    """
+    global graph, graph_init, graph_error
+
+    if graph_init and graph is not None and not force:
+        return True
+
+    try:
+        graph = getGraphResponse()
+        graph_init = True
+        graph_error = None
+        logger.info("Graph initialised successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialise graph: {e}")
+        graph = None
+        graph_init = False
+        graph_error = str(e)
+        return False
+
+
+def _require_graph():
+    if _initialise_graph(force=not graph_init) and graph is not None:
+        return graph
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"Graph failed to initialise: {graph_error}",
+    )
+
+
+_initialise_graph()
+
+
+# ── Rate-limit key: prefer user_id from body, fall back to IP ─────────────────
+def _user_key(request: Request) -> str:
+    """
+    SlowAPI key function.  We want per-user limits, not per-IP, so that users
+    behind the same NAT/proxy don't block each other.
+    The user_id is injected into the request body by the Next.js proxy before
+    forwarding, so we can read it here.  Body parsing is done lazily via state
+    set by the dependency injection route function.
+    """
+    uid = getattr(request.state, "user_id", None)
+    if uid:
+        return uid
+    # Fallback — shouldn't happen in production
+    return request.client.host if request.client else "unknown"
+
+
+# ── Fork initialisation (shared between sync and stream routes) ───────────────
+
+def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
+    """
+    On the first message of a branched node, seed the new thread with a
+    compressed summary + a small verbatim buffer from the parent.
+
+    This preserves the Context Tree guarantee: the branch starts with an
+    accurate, scoped summary of the parent lineage — not a blank slate.
+    """
+    if not (chat_message.parent_thread_id and chat_message.fork_at_message_id):
+        return
+
+    thread_exists = active_graph.mongo_store.thread_exists(chat_message.conversation_id)
+    should_init = not thread_exists
+
+    if thread_exists and not should_init:
+        try:
+            count = active_graph.mongo_store.get_thread_message_count(chat_message.conversation_id)
+            if count <= 1:
+                should_init = True
+        except Exception as e:
+            logger.warning(f"Could not check message count for fork init: {e}")
+
+    if not should_init:
+        return
+
+    # ── Gather parent history up to the fork point ────────────────────────────
+    existing_summary, messages_data = active_graph.mongo_store.get_messages_until(
+        chat_message.user_id,
+        chat_message.parent_thread_id,
+        chat_message.fork_at_message_id,
+    )
+    if not messages_data:
+        fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
+        logger.warning("fork_at_message_id not found; falling back to last-K messages")
+        messages_data = active_graph.mongo_store.get_thread_recent_messages(
+            chat_message.user_id,
+            chat_message.parent_thread_id,
+            fallback_k,
+        )
+
+    # ── Split into "summarise" portion and verbatim buffer ────────────────────
+    buffer_size = getattr(settings, "FORK_BUFFER_MESSAGES", 2)
+    if len(messages_data) <= buffer_size:
+        messages_to_summarize = []
+        buffer_messages = messages_data
+    else:
+        messages_to_summarize = messages_data[:-buffer_size]
+        buffer_messages = messages_data[-buffer_size:]
+
+    new_summary = existing_summary
+    new_summary_embedding = []
+
+    if messages_to_summarize:
+        lc_messages = []
+        for m in messages_to_summarize:
+            if m["role"] == "user":
+                lc_messages.append(HumanMessage(content=m["text"]))
+            elif m["role"] in ("assistant", "ai"):
+                lc_messages.append(AIMessage(content=m["text"]))
+
+        llm = get_llm(chat_message.model_name)
+        if llm:
+            try:
+                prompt = get_formated_summury_prompt(lc_messages, existing_summary)
+                summary_response = llm.invoke(prompt)
+                new_summary = summary_response.content
+                new_summary_embedding = get_embedding(new_summary) or []
+            except Exception as e:
+                logger.error(f"Fork summarisation failed: {e}")
+
+    active_graph.mongo_store.fork_thread(
+        user_id=chat_message.user_id,
+        source_thread_id=chat_message.parent_thread_id,
+        new_thread_id=chat_message.conversation_id,
+        fork_at_message_id=chat_message.fork_at_message_id,
+        summary=new_summary,
+        summary_embedding=new_summary_embedding,
+        initial_messages=buffer_messages,
+    )
+    logger.info(
+        f"Fork initialised: {chat_message.parent_thread_id} → {chat_message.conversation_id} "
+        f"at message {chat_message.fork_at_message_id}"
+    )
+
+
+# ── Sync endpoint ──────────────────────────────────────────────────────────────
 
 @router.post("/")
-@limiter.limit("5/minute")
-async def get_response(chat_message: ChatMessage,
-                       request: Request):
-    if graph and graph_init:
-        try:
-            # Initialize forked thread if needed (lazy fork on first message)
-            # Check if fork init is needed
-            thread_exists = graph.mongo_store.thread_exists(chat_message.conversation_id)
-            should_init_fork = False
-            
-            if not thread_exists:
-                should_init_fork = True
-            elif (
-                chat_message.parent_thread_id
-                and chat_message.fork_at_message_id
-            ):
-                # If thread exists but has no messages, it might be an empty shell created by optimistic UI
-                try:
-                    msg_count = graph.mongo_store.get_thread_message_count(chat_message.conversation_id)
-                    # Allow init if empty OR has just the trigger message (count=1)
-                    if msg_count <= 1:
-                        should_init_fork = True
-                except Exception as e:
-                    logger.warning(f"Failed to check message count for fork init: {e}")
+@limiter.limit("60/minute", key_func=_user_key)
+async def get_response(chat_message: ChatMessage, request: Request):
+    active_graph = _require_graph()
 
-            if (
-                chat_message.parent_thread_id
-                and chat_message.fork_at_message_id
-                and chat_message.conversation_id
-                and should_init_fork
-            ):
-                existing_summary, messages_data = graph.mongo_store.get_messages_until(
-                    chat_message.user_id,
-                    chat_message.parent_thread_id,
-                    chat_message.fork_at_message_id,
-                )
-                if not messages_data:
-                    logger.warning(
-                        "Fork init fallback: fork_at_message_id not found; using parent last-K messages."
-                    )
-                    fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
-                    messages_data = graph.mongo_store.get_thread_recent_messages(
-                        chat_message.user_id,
-                        chat_message.parent_thread_id,
-                        fallback_k,
-                    )
+    if not chat_message.conversation_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="nodeId (conversation_id) is required",
+        )
 
-                new_summary = existing_summary
-                new_summary_embedding = []
-                buffer_size = getattr(settings, "FORK_BUFFER_MESSAGES", 2)
+    # Store user_id on request.state so _user_key can read it
+    request.state.user_id = chat_message.user_id or request.client.host
 
-                if len(messages_data) <= buffer_size:
-                    messages_to_summarize = []
-                    buffer_messages = messages_data
-                else:
-                    messages_to_summarize = messages_data[:-buffer_size]
-                    buffer_messages = messages_data[-buffer_size:]
+    try:
+        _init_fork_if_needed(chat_message, active_graph)
 
-                if messages_to_summarize:
-                    lc_messages = []
-                    for m in messages_to_summarize:
-                        if m['role'] == 'user':
-                            lc_messages.append(HumanMessage(content=m['text']))
-                        elif m['role'] in ['assistant', 'ai']:
-                            lc_messages.append(AIMessage(content=m['text']))
-
-                    llm = get_groq_llm(name=chat_message.model_name)
-                    if llm:
-                        prompt = get_formated_summury_prompt(lc_messages, existing_summary)
-                        summary_response = llm.invoke(prompt)
-                        new_summary = summary_response.content
-                        new_summary_embedding = get_embedding(new_summary) or []
-
-                graph.mongo_store.fork_thread(
-                    user_id=chat_message.user_id,
-                    source_thread_id=chat_message.parent_thread_id,
-                    new_thread_id=chat_message.conversation_id,
-                    fork_at_message_id=chat_message.fork_at_message_id,
-                    summary=new_summary,
-                    summary_embedding=new_summary_embedding,
-                    initial_messages=buffer_messages,
-                )
-
-            config = {"configurable": {
+        config = {
+            "configurable": {
                 "model": chat_message.model_name,
                 "temperature": chat_message.temperature,
                 "thread_id": chat_message.conversation_id,
-            }}
-            logger.info(f"REQUEST {chat_message.conversation_id}: {config}")
+            }
+        }
+        logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
-            res = graph.get_response(
+        res = active_graph.get_response(
+            query=chat_message.message,
+            msg_id=chat_message.message_id,
+            config=config,
+            thread_id=chat_message.conversation_id,
+            user_id=chat_message.user_id,
+        )
+        if not res:
+            raise HTTPException(status_code=500, detail="Failed to generate AI response")
+
+        summary = active_graph.mongo_store.get_thread_summary(
+            chat_message.user_id, chat_message.conversation_id
+        )
+        return {"message": res, "summary": summary or ""}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Stream endpoint ────────────────────────────────────────────────────────────
+
+@router.post("/stream")
+@limiter.limit("60/minute", key_func=_user_key)
+async def stream_response(chat_message: ChatMessage, request: Request):
+    active_graph = _require_graph()
+
+    if not chat_message.conversation_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="nodeId (conversation_id) is required",
+        )
+
+    request.state.user_id = chat_message.user_id or request.client.host
+
+    try:
+        _init_fork_if_needed(chat_message, active_graph)
+
+        config = {
+            "configurable": {
+                "model": chat_message.model_name,
+                "temperature": chat_message.temperature,
+                "thread_id": chat_message.conversation_id,
+            }
+        }
+        logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")
+
+        return StreamingResponse(
+            active_graph.get_stream_response(
                 query=chat_message.message,
                 msg_id=chat_message.message_id,
                 config=config,
                 thread_id=chat_message.conversation_id,
-                user_id=chat_message.user_id
-            )
-            if res:
-                logger.info(f"RESPONSE {chat_message.conversation_id}: {res}")
-                return res
-            else:
-                raise HTTPException(
-                    status_code=500, detail="Faild To Generate Genarte Response From AI")
-        except Exception as e:
-            logger.error(f"Error : Get Response Endpoint : {e}")
-            raise HTTPException(500, detail=str(e))
-    else:
-        logger.error(
-            f"Error : Get Response Endpoint : Graph Not init : {graph_error}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Service unavailable: Graph failed to initialize - {graph_error}"
+                user_id=chat_message.user_id,
+            ),
+            media_type="text/event-stream",
         )
-
-
-@router.post("/stream")
-@limiter.limit("5/minute")
-async def stream_response(chat_message: ChatMessage, request: Request):
-    if graph and graph_init:
-        try:
-            # Initialize forked thread if needed (lazy fork on first message)
-            # Check if fork init is needed
-            thread_exists = graph.mongo_store.thread_exists(chat_message.conversation_id)
-            should_init_fork = False
-            
-            if not thread_exists:
-                should_init_fork = True
-            elif (
-                chat_message.parent_thread_id
-                and chat_message.fork_at_message_id
-            ):
-                # If thread exists but has no messages, it might be an empty shell created by optimistic UI
-                try:
-                    msg_count = graph.mongo_store.get_thread_message_count(chat_message.conversation_id)
-                    # Allow init if empty OR has just the trigger message (count=1)
-                    if msg_count <= 1:
-                        should_init_fork = True
-                except Exception as e:
-                    logger.warning(f"Failed to check message count for fork init: {e}")
-
-            if (
-                chat_message.parent_thread_id
-                and chat_message.fork_at_message_id
-                and chat_message.conversation_id
-                and should_init_fork
-            ):
-                existing_summary, messages_data = graph.mongo_store.get_messages_until(
-                    chat_message.user_id,
-                    chat_message.parent_thread_id,
-                    chat_message.fork_at_message_id,
-                )
-                if not messages_data:
-                    logger.warning(
-                        "Fork init fallback: fork_at_message_id not found; using parent last-K messages."
-                    )
-                    fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
-                    messages_data = graph.mongo_store.get_thread_recent_messages(
-                        chat_message.user_id,
-                        chat_message.parent_thread_id,
-                        fallback_k,
-                    )
-
-                new_summary = existing_summary
-                new_summary_embedding = []
-                buffer_size = getattr(settings, "FORK_BUFFER_MESSAGES", 2)
-
-                if len(messages_data) <= buffer_size:
-                    messages_to_summarize = []
-                    buffer_messages = messages_data
-                else:
-                    messages_to_summarize = messages_data[:-buffer_size]
-                    buffer_messages = messages_data[-buffer_size:]
-
-                if messages_to_summarize:
-                    lc_messages = []
-                    for m in messages_to_summarize:
-                        if m['role'] == 'user':
-                            lc_messages.append(HumanMessage(content=m['text']))
-                        elif m['role'] in ['assistant', 'ai']:
-                            lc_messages.append(AIMessage(content=m['text']))
-
-                    llm = get_groq_llm(name=chat_message.model_name)
-                    if llm:
-                        prompt = get_formated_summury_prompt(lc_messages, existing_summary)
-                        summary_response = llm.invoke(prompt)
-                        new_summary = summary_response.content
-                        new_summary_embedding = get_embedding(new_summary) or []
-
-                graph.mongo_store.fork_thread(
-                    user_id=chat_message.user_id,
-                    source_thread_id=chat_message.parent_thread_id,
-                    new_thread_id=chat_message.conversation_id,
-                    fork_at_message_id=chat_message.fork_at_message_id,
-                    summary=new_summary,
-                    summary_embedding=new_summary_embedding,
-                    initial_messages=buffer_messages,
-                )
-
-            config = {"configurable": {
-                "model": chat_message.model_name,
-                "temperature": chat_message.temperature,
-                "thread_id": chat_message.conversation_id,
-            }}
-            logger.info(f"STREAM REQUEST {chat_message.conversation_id}: {config}")
-
-            return StreamingResponse(
-                graph.get_stream_response(
-                    query=chat_message.message,
-                    msg_id=chat_message.message_id,
-                    config=config,
-                    thread_id=chat_message.conversation_id,
-                    user_id=chat_message.user_id
-                ),
-                media_type="text/event-stream"
-            )
-        except Exception as e:
-            logger.error(f"Error : Stream Response Endpoint : {e}")
-            raise HTTPException(500, detail=str(e))
-    else:
-        logger.error(f"Error : Stream Response Endpoint : Graph Not init : {graph_error}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Service unavailable: Graph failed to initialize - {graph_error}"
-        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Stream endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
