@@ -1,46 +1,72 @@
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
-from pydantic import validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
+
 class Settings(BaseSettings):
+    # ── API ────────────────────────────────────────────────────────────────────
     version_str: str = "v1"
-    # API settings
     API_V1_STR: str = "/api/v1"
-    PROJECT_NAME: str = "Convo Canvas API"
-    VERSION: str = "0.1.0"
-    DESCRIPTION: str = "Convo Canvas Backend API"
-    
-    # Server settings
+    PROJECT_NAME: str = "ContextTree API"
+    VERSION: str = "0.2.0"
+    DESCRIPTION: str = "ContextTree Backend — scoped, branching LLM conversations"
+
+    # ── Server ─────────────────────────────────────────────────────────────────
     SERVER_HOST: str = "0.0.0.0"
     SERVER_PORT: int = 8000
-    DEBUG_MODE: bool = True
+    DEBUG_MODE: bool = False
     LOG_LEVEL: str = "INFO"
-    
-    # CORS settings
+
+    # ── CORS ───────────────────────────────────────────────────────────────────
     BACKEND_CORS_ORIGINS: List[str] = ["*"]
-    
-    # Database settings
+
+    # ── Database ───────────────────────────────────────────────────────────────
     DATABASE_URL: Optional[str] = None
 
-    # Conversation memory settings
+    # ── LLM: Groq ──────────────────────────────────────────────────────────────
+    GROQ_API_KEY: Optional[str] = None
+    DEFAULT_GROQ_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+    # ── LLM: Google Gemini ─────────────────────────────────────────────────────
+    GOOGLE_API_KEY: Optional[str] = None
+    DEFAULT_GEMINI_MODEL: str = "gemini/gemini-2.0-flash"
+
+    # ── LLM: NVIDIA NIM ────────────────────────────────────────────────────────
+    NVIDIA_API_KEY: Optional[str] = None
+    DEFAULT_NVIDIA_MODEL: str = "moonshotai/kimi-k2-instruct-0905"
+
+    # ── Conversation memory ────────────────────────────────────────────────────
+    # Trigger summarisation after this many assistant turns per node
     MAX_MESSAGES_BEFORE_SUMMARY: int = 10
+    # Keep this many recent messages verbatim after summarisation
     KEEP_LAST_MESSAGES: int = 6
+    # Carry forward this many messages as verbatim buffer when forking
     FORK_BUFFER_MESSAGES: int = 2
-    
-    @validator("BACKEND_CORS_ORIGINS", pre=True)
+
+    # ── Context assembly ───────────────────────────────────────────────────────
+    # Max tokens reserved for rolling summary
+    MAX_SUMMARY_TOKENS: int = 500
+    # Max tokens reserved for the most recent messages
+    MAX_PREVIOUS_MESSAGES_TOKENS: int = 2000
+    # Token budget kept free for the LLM's own response
+    RESERVE_TOKENS: int = 1000
+
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
+    @classmethod
     def assemble_cors_origins(cls, v: Any) -> List[str]:
         if isinstance(v, str) and not v.startswith("["):
             return [i.strip() for i in v.split(",")]
-        elif isinstance(v, (list, str)):
+        if isinstance(v, (list, str)):
             return v
         raise ValueError(v)
-    
-    class Config:
-        case_sensitive = True
-        env_file = ".env"
-        extra = "ignore"
+
+    model_config = {
+        "case_sensitive": True,
+        "env_file": ".env",
+        "extra": "ignore",
+    }
 
 
 settings = Settings()

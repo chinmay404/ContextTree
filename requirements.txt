@@ -31,6 +31,7 @@ langgraph-checkpoint-postgres
 psycopg-pool
 langchain_google_genai
 langchain_groq
+langchain-openai
 langchain
 pymongo
 slowapi
