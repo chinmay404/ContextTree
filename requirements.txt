@@ -28,6 +28,7 @@ langchain-community
 langchain-text-splitters
 langgraph
 langgraph-checkpoint-postgres
+psycopg[binary]>=3.2
 psycopg-pool
 langchain_google_genai
 langchain_groq

@@ -1,6 +1,3 @@
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from psycopg_pool import ConnectionPool, AsyncConnectionPool
 import os
 from dotenv import load_dotenv
 import atexit
@@ -24,6 +21,16 @@ def postgres_saver():
     tables/indexes were already created by a previous run.
     """
     try:
+        try:
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from psycopg_pool import ConnectionPool
+        except ImportError as import_err:
+            print(
+                "Postgres checkpoint support is unavailable: "
+                f"{import_err}. Install psycopg[binary] in the backend environment."
+            )
+            return None
+
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise ValueError("DATABASE_URL must be set")
@@ -87,6 +94,16 @@ def async_postgres_saver():
        loop that is later abandoned.
     """
     try:
+        try:
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+            from psycopg_pool import AsyncConnectionPool
+        except ImportError as import_err:
+            print(
+                "Async Postgres checkpoint support is unavailable: "
+                f"{import_err}. Install psycopg[binary] in the backend environment."
+            )
+            return None
+
         db_url = os.getenv("DATABASE_URL")
         if not db_url:
             raise ValueError("DATABASE_URL must be set")

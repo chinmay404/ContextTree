@@ -1,37 +1,69 @@
 
-from app.agent.helpers.load_prompt import load_prompt_from_yaml
-from langchain_core.messages import HumanMessage
-from IPython.display import Image, display
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import tool_node, tools_condition, ToolNode
-from langgraph.checkpoint.memory import MemorySaver
-from app.agent.helpers.load_prompt import load_prompt_from_yaml
 from datetime import datetime
-from langgraph.checkpoint.memory import InMemorySaver
 from app.agent.nodes.assistant_node import AgentNodes
 from app.agent.state import State
 from app.agent.prompts.prompt_formation import get_formated_prompt
 from langchain_core.messages import AIMessage, HumanMessage
-from datetime import datetime
-from uuid import uuid4
 import json
-from app.agent.utils.saver import postgres_saver
+from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
-from app.agent.helpers.draw_graph import draw_graph
+from app.core.config import settings
 from app.core.logger import logger
 
+from fastapi import HTTPException
 
-from fastapi import APIRouter, HTTPException, status
+
+SIMILAR_CONTEXT_LIMIT = 3
+FILE_CONTEXT_LIMIT = 3
+MAX_SUMMARY_CHARS = 2400
+MAX_RECENT_MESSAGE_CHARS = 1400
+MAX_SIMILAR_SNIPPET_CHARS = 320
+MAX_FILE_SNIPPET_CHARS = 900
+MAX_FILE_METADATA_CHARS = 220
+
+
+def _clip_text(value, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[: max_chars - 1].rstrip()}…"
+
+
+def _has_meaningful_embedding(embedding) -> bool:
+    return bool(embedding) and any(abs(float(x)) > 1e-8 for x in embedding)
+
+
+def _build_memory_saver():
+    """Best-effort in-memory fallback for local/dev when PostgresSaver is unavailable."""
+    try:
+        from langgraph.checkpoint.memory import MemorySaver
+        return MemorySaver()
+    except Exception as memory_err:
+        try:
+            from langgraph.checkpoint.memory import InMemorySaver
+            return InMemorySaver()
+        except Exception as in_memory_err:
+            logger.error(
+                "Failed to initialize in-memory LangGraph saver: %s / %s",
+                memory_err,
+                in_memory_err,
+            )
+            return None
 
 
 class getGraphResponse():
     def __init__(self):
         self.memory = postgres_saver()
         if self.memory is None:
+            logger.warning(
+                "PostgresSaver unavailable; falling back to in-memory checkpointing."
+            )
+            self.memory = _build_memory_saver()
+        if self.memory is None:
             raise MemoryError(
-                "Failed to initialize PostgresSaver: memory is None")
-        # self.memory = InMemorySaver()
+                "Failed to initialize any LangGraph checkpointer")
         self.mongo_store = PostgresConversationStore()
         Nodes = AgentNodes(mongo_store=self.mongo_store)
         self.nodes = Nodes.get_nodes()
@@ -39,30 +71,41 @@ class getGraphResponse():
         if self.graph is None:
             raise RuntimeError(
                 "Failed to initialize graph: build_graph returned None")
-        self.sys_msg = load_prompt_from_yaml("REACT_LANGGRAPH_PROMPT")
+        # Build async graph for streaming support
+        self.async_graph = self._build_async_graph()
+
+    def _make_builder(self):
+        builder = StateGraph(State)
+        builder.add_node("assistant", self.nodes["assistant"])
+        builder.add_node("summurize", self.nodes["summurize"])
+        builder.add_edge(START, "assistant")
+        builder.add_conditional_edges(
+            "assistant", self.nodes["summury_decision"],
+            {True: "summurize", False: END}
+        )
+        builder.add_edge("summurize", END)
+        return builder
 
     def build_graph(self):
         try:
-            builder = StateGraph(State)
-            builder.add_node("assistant", self.nodes["assistant"])
-            builder.add_node("summurize",
-                             self.nodes["summurize"])
-
-            builder.add_edge(START, "assistant")
-            builder.add_conditional_edges(
-                "assistant", self.nodes["summury_decision"],
-                {
-                    True: "summurize",
-                    False: END
-                })
-            builder.add_edge("summurize", END)
-            builder.add_edge("assistant", END)
-
+            builder = self._make_builder()
             graph = builder.compile(checkpointer=self.memory)
-            # draw_graph(graph)
             return graph
         except Exception as e:
             logger.error(f"getGraphResponse - graph builder - {e}")
+            return None
+
+    def _build_async_graph(self):
+        """Build a separate graph with AsyncPostgresSaver for streaming."""
+        try:
+            async_memory = async_postgres_saver()
+            if async_memory is None:
+                logger.warning("AsyncPostgresSaver not available, streaming will use sync fallback")
+                return None
+            builder = self._make_builder()
+            return builder.compile(checkpointer=async_memory)
+        except Exception as e:
+            logger.warning(f"Failed to build async graph: {e}")
             return None
 
     def get_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
@@ -74,117 +117,14 @@ class getGraphResponse():
             # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
             # This handles the "fork" scenario where Mongo has history but Redis matches a new thread ID
             if not current_state.values or not current_state.values.get("messages"):
-                logger.info(f"Hydrating state from Mongo for thread {thread_id}")
-                mongo_msgs = self.mongo_store.get_thread_messages(user_id, thread_id)
-                for m in mongo_msgs:
-                    if m['role'] == 'user':
-                        initial_messages.append(HumanMessage(content=m['text'], id=m['message_id']))
-                    elif m['role'] in ['assistant', 'ai']:
-                        initial_messages.append(AIMessage(content=m['text'], id=m['message_id']))
+                logger.info(f"Hydrating recent state from Mongo for thread {thread_id}")
+                initial_messages = self._hydrate_recent_messages(user_id, thread_id)
 
             # Get existing summary from MongoDB for this thread
             existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+            prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
+            context_snippets, external_context_str = self._build_retrieved_context(query, user_id, thread_id)
 
-            # --- RAG Context: similar messages + connected files ---
-            query_embedding = get_embedding(query) or []
-            context_snippets = []
-            external_context_snippets = []
-
-            if query_embedding:
-                try:
-                    # RAG Logic: Use ancestry to respect strict tree architecture
-                    # Search messages in: Current Node + Ancestors + Global Files (if linked?)
-                    # Wait, core doc says: "Ownership never flows backward or sideways"
-                    # So we should search messages ONLY in the ancestry chain.
-                    # Global search across all user history violates "No context leaks".
-                    
-                    ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
-                    # Convert to list of (id, None) tuples for the store method
-                    thread_scope = [(aid, None) for aid in ancestry_ids]
-                    
-                    sims = self.mongo_store.find_similar_by_message_id(
-                        user_id=user_id,
-                        thread_queries=thread_scope,
-                        query_embeddings=query_embedding,
-                        top_k=3,
-                    ) or []
-                    for idx, s in enumerate(sims):
-                        score = s.get("score")
-                        role = s.get("role")
-                        text = s.get("text", "")
-                        msg_id = s.get("message_id")
-                        score_str = f"{score:.3f}" if score is not None else "n/a"
-                        context_snippets.append(
-                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id}: {text}"
-                        )
-                except Exception as e:
-                    logger.error(f"Similarity search failed: {e}")
-
-                try:
-                    file_chunks = self.mongo_store.get_related_file_context(
-                        node_id=thread_id,
-                        query_embedding=query_embedding,
-                        limit=3,
-                    ) or []
-                    for idx, c in enumerate(file_chunks):
-                        meta = c.get("metadata")
-                        try:
-                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
-                        except Exception:
-                            meta = meta or {}
-                        external_context_snippets.append(
-                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
-                        )
-                except Exception as e:
-                    logger.error(f"File context search failed: {e}")
-
-            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
-
-            # --- RAG Context: similar messages + connected files ---
-            query_embedding = get_embedding(query) or []
-            context_snippets = []
-            external_context_snippets = []
-
-            if query_embedding:
-                try:
-                    sims = self.mongo_store.find_similar_by_message_id(
-                        user_id=user_id,
-                        thread_queries=[],
-                        query_embeddings=query_embedding,
-                        top_k=3,
-                    ) or []
-                    for idx, s in enumerate(sims):
-                        score = s.get("score")
-                        role = s.get("role")
-                        text = s.get("text", "")
-                        msg_id = s.get("message_id")
-                        score_str = f"{score:.3f}" if score is not None else "n/a"
-                        context_snippets.append(
-                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id}: {text}"
-                        )
-                except Exception as e:
-                    logger.error(f"Similarity search failed: {e}")
-
-                try:
-                    file_chunks = self.mongo_store.get_related_file_context(
-                        node_id=thread_id,
-                        query_embedding=query_embedding,
-                        limit=3,
-                    ) or []
-                    for idx, c in enumerate(file_chunks):
-                        meta = c.get("metadata")
-                        try:
-                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
-                        except Exception:
-                            meta = meta or {}
-                        external_context_snippets.append(
-                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
-                        )
-                except Exception as e:
-                    logger.error(f"File context search failed: {e}")
-
-            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
-            
             prompt = get_formated_prompt(query, user_id)
             timestamp = datetime.utcnow().isoformat()
             user_msg = HumanMessage(
@@ -224,9 +164,8 @@ class getGraphResponse():
             try:
                 result = self.graph.invoke(
                     {
-                        "messages": messages_input, 
-                        "system_message": self.sys_msg,
-                        "summary": existing_summary,
+                        "messages": messages_input,
+                        "summary": prompt_summary,
                         "context": context_snippets,
                         "external_context": external_context_str,
                         "model": config.get("configurable", {}).get("model"),
@@ -261,7 +200,6 @@ class getGraphResponse():
 
             if final_message is None:
                 raise RuntimeError("Agent produced no output")
-                return False
 
             if not is_duplicate:
                 try:
@@ -299,215 +237,188 @@ class getGraphResponse():
             logger.error(f"get_graph_res : {e}")
             return False
 
+    def _prepare_stream_input(self, query, config, user_id, thread_id, msg_id):
+        """Shared preparation logic for both sync and async streaming."""
+        # Check for existing state in LangGraph
+        current_state = self.graph.get_state(config)
+        initial_messages = []
+        context_snippets, external_context_str = self._build_retrieved_context(query, user_id, thread_id)
+
+        # Hydrate state from DB if checkpointer has no messages for this thread
+        if not current_state.values or not current_state.values.get("messages"):
+            initial_messages = self._hydrate_recent_messages(user_id, thread_id)
+
+        existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+        prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
+
+        prompt = get_formated_prompt(query, user_id)
+        timestamp = datetime.utcnow().isoformat()
+        user_msg = HumanMessage(
+            content=prompt,
+            id=msg_id,
+            metadata={"user_id": user_id, "thread_id": thread_id, "timestamp": timestamp}
+        )
+
+        messages_input = initial_messages + [user_msg]
+
+        # Deduplicate
+        is_duplicate = False
+        if initial_messages:
+            last_msg = initial_messages[-1]
+            if last_msg.id == msg_id:
+                is_duplicate = True
+            elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
+                if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
+                    is_duplicate = True
+                if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
+                    is_duplicate = True
+            if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
+                is_duplicate = True
+            if is_duplicate:
+                logger.info(f"Duplicate message detected in stream hydration: {msg_id}.")
+                messages_input = initial_messages
+
+        graph_input = {
+            "messages": messages_input,
+            "summary": prompt_summary,
+            "context": context_snippets,
+            "external_context": external_context_str,
+            "model": config.get("configurable", {}).get("model"),
+            "temperature": config.get("configurable", {}).get("temperature"),
+        }
+
+        return graph_input, existing_summary, is_duplicate, query
+
+    def _hydrate_recent_messages(self, user_id: str, thread_id: str):
+        recent_limit = max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6)))
+        mongo_msgs = self.mongo_store.get_thread_recent_messages(user_id, thread_id, recent_limit)
+        initial_messages = []
+        for m in mongo_msgs:
+            clipped_text = _clip_text(m["text"], MAX_RECENT_MESSAGE_CHARS)
+            if m["role"] == "user":
+                initial_messages.append(HumanMessage(content=clipped_text, id=m["message_id"]))
+            elif m["role"] in ["assistant", "ai"]:
+                initial_messages.append(AIMessage(content=clipped_text, id=m["message_id"]))
+        return initial_messages
+
+    def _build_retrieved_context(self, query: str, user_id: str, thread_id: str):
+        query_embedding = get_embedding(query) or []
+        if not _has_meaningful_embedding(query_embedding):
+            return [], None
+
+        context_snippets: list[str] = []
+        external_context_snippets: list[str] = []
+
+        try:
+            ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
+            thread_scope = [(aid, None) for aid in ancestry_ids]
+            sims = self.mongo_store.find_similar_by_message_id(
+                user_id=user_id,
+                thread_queries=thread_scope,
+                query_embeddings=query_embedding,
+                top_k=SIMILAR_CONTEXT_LIMIT,
+            ) or []
+            for idx, s in enumerate(sims):
+                score = s.get("score")
+                role = s.get("role")
+                text = _clip_text(s.get("text", ""), MAX_SIMILAR_SNIPPET_CHARS)
+                msg_id_sim = s.get("message_id")
+                score_str = f"{score:.3f}" if score is not None else "n/a"
+                context_snippets.append(
+                    f"[sim {idx + 1} | role={role} | score={score_str}] id={msg_id_sim}: {text}"
+                )
+        except Exception as e:
+            logger.error(f"Similarity search failed: {e}")
+
+        try:
+            file_chunks = self.mongo_store.get_related_file_context(
+                node_id=thread_id,
+                query_embedding=query_embedding,
+                limit=FILE_CONTEXT_LIMIT,
+            ) or []
+            for idx, c in enumerate(file_chunks):
+                meta = c.get("metadata")
+                try:
+                    meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+                except Exception:
+                    meta = meta or {}
+                external_context_snippets.append(
+                    f"[file {idx + 1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] "
+                    f"{_clip_text(c.get('chunk_text', ''), MAX_FILE_SNIPPET_CHARS)}\n"
+                    f"meta: {_clip_text(meta, MAX_FILE_METADATA_CHARS)}"
+                )
+        except Exception as e:
+            logger.error(f"File context search failed: {e}")
+
+        external_context_str = "\n\n".join(external_context_snippets) if external_context_snippets else None
+        return context_snippets, external_context_str
+
     async def get_stream_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         try:
-            # Check for existing state in LangGraph
-            try:
-                current_state = await self.graph.aget_state(config)
-            except NotImplementedError:
-                # Fallback for sync checkpointers (e.g., PostgresSaver)
-                current_state = self.graph.get_state(config)
-            initial_messages = []
-
-            # --- RAG Context: similar messages + connected files ---
-            query_embedding = get_embedding(query) or []
-            context_snippets: list[str] = []
-            external_context_snippets: list[str] = []
-
-            if query_embedding:
-                try:
-                    # Strict Ancestry Search
-                    ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
-                    thread_scope = [(aid, None) for aid in ancestry_ids]
-                    
-                    sims = self.mongo_store.find_similar_by_message_id(
-                        user_id=user_id,
-                        thread_queries=thread_scope,
-                        query_embeddings=query_embedding,
-                        top_k=3,
-                    ) or []
-                    for idx, s in enumerate(sims):
-                        score = s.get("score")
-                        role = s.get("role")
-                        text = s.get("text", "")
-                        msg_id_sim = s.get("message_id")
-                        score_str = f"{score:.3f}" if score is not None else "n/a"
-                        context_snippets.append(
-                            f"[sim {idx+1} | role={role} | score={score_str}] id={msg_id_sim}: {text}"
-                        )
-                except Exception as e:
-                    logger.error(f"Similarity search failed: {e}")
-
-                try:
-                    file_chunks = self.mongo_store.get_related_file_context(
-                        node_id=thread_id,
-                        query_embedding=query_embedding,
-                        limit=3,
-                    ) or []
-                    for idx, c in enumerate(file_chunks):
-                        meta = c.get("metadata")
-                        try:
-                            meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
-                        except Exception:
-                            meta = meta or {}
-                        external_context_snippets.append(
-                            f"[file {idx+1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] {c.get('chunk_text', '')}\nmeta: {meta}"
-                        )
-                except Exception as e:
-                    logger.error(f"File context search failed: {e}")
-
-            external_context_str = "\n".join(external_context_snippets) if external_context_snippets else None
-            
-            # If no state in Redis (new thread or forked thread), verify if we have history in Mongo
-            if not current_state.values or not current_state.values.get("messages"):
-                # logger.info(f"Hydrating state from Mongo for thread {thread_id}")
-                mongo_msgs = self.mongo_store.get_thread_messages(user_id, thread_id)
-                for m in mongo_msgs:
-                    if m['role'] == 'user':
-                        initial_messages.append(HumanMessage(content=m['text'], id=m['message_id']))
-                    elif m['role'] in ['assistant', 'ai']:
-                        initial_messages.append(AIMessage(content=m['text'], id=m['message_id']))
-
-            # Get existing summary from MongoDB for this thread
-            existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
-            
-            prompt = get_formated_prompt(query, user_id)
-            timestamp = datetime.utcnow().isoformat()
-            user_msg = HumanMessage(
-                content=prompt,
-                id=msg_id,
-                metadata={"user_id": user_id,
-                          "thread_id": thread_id,
-                          "timestamp": timestamp}
+            graph_input, existing_summary, is_duplicate, raw_query = self._prepare_stream_input(
+                query, config, user_id, thread_id, msg_id
             )
 
-            # Combine hydrated history with new message
-            messages_input = initial_messages + [user_msg]
-            
-            # Deduplicate logic: If we hydrated from DB and the last message matches the current user message, don't append it again.
-            is_duplicate = False
-            if initial_messages:
-                last_msg = initial_messages[-1]
-                
-                # Check for ID match or exact content match
-                if last_msg.id == msg_id:
-                    is_duplicate = True
-                elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
-                    # Handle suffix differences (e.g. _u)
-                    if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
-                        is_duplicate = True
-                    if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
-                        is_duplicate = True
-                
-                # Content fallback check
-                if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
-                     is_duplicate = True
-                     
-                if is_duplicate:
-                    logger.info(f"Duplicate message detected in stream hydration: {msg_id}. Using DB version.")
-                    messages_input = initial_messages
-            
             full_response = ""
             updated_summary = existing_summary
-            
-            try:
-                async for event in self.graph.astream_events(
-                    {
-                        "messages": messages_input, 
-                        "system_message": self.sys_msg,
-                        "summary": existing_summary,
-                        "context": context_snippets,
-                        "external_context": external_context_str,
-                        "model": config.get("configurable", {}).get("model"),
-                        "temperature": config.get("configurable", {}).get("temperature"),
-                    }, 
-                    config, 
-                    version="v1"
-                ):
-                    kind = event["event"]
-                    
-                    # Yield tokens from the assistant's LLM
-                    if kind == "on_chat_model_stream":
-                        content = event["data"]["chunk"].content
-                        if content:
-                            full_response += content
-                            yield f"data: {json.dumps({'message': content})}\n\n"
-            except NotImplementedError:
-                # Sync fallback when async streaming is unsupported by the checkpointer
-                result = self.graph.invoke(
-                    {
-                        "messages": messages_input, 
-                        "system_message": self.sys_msg,
-                        "summary": existing_summary,
-                        "context": context_snippets,
-                        "external_context": external_context_str,
-                        "model": config.get("configurable", {}).get("model"),
-                        "temperature": config.get("configurable", {}).get("temperature"),
-                    },
-                    config
-                )
+            streamed = False
+
+            # Try async streaming with async graph first
+            stream_graph = self.async_graph if self.async_graph else None
+            if stream_graph:
+                try:
+                    async for event in stream_graph.astream_events(graph_input, config, version="v1"):
+                        kind = event["event"]
+                        if kind == "on_chat_model_stream":
+                            content = event["data"]["chunk"].content
+                            if content:
+                                full_response += content
+                                yield f"data: {json.dumps({'message': content})}\n\n"
+                    streamed = True
+                except (NotImplementedError, Exception) as e:
+                    logger.warning(f"Async streaming failed, using sync fallback: {e}")
+                    streamed = False
+
+            # Sync fallback
+            if not streamed:
+                result = self.graph.invoke(graph_input, config)
                 ai_messages = result.get("messages", []) if result else []
-                final_message = None
-                AI_RESPONSE_ = [
-                    msg for msg in ai_messages if isinstance(msg, AIMessage)
-                ]
-                if AI_RESPONSE_:
-                    final_message = AI_RESPONSE_[-1].content
-                if final_message:
-                    full_response = str(final_message)
+                ai_responses = [msg for msg in ai_messages if isinstance(msg, AIMessage)]
+                if ai_responses:
+                    full_response = str(ai_responses[-1].content)
                     yield f"data: {json.dumps({'message': full_response})}\n\n"
                 updated_summary = result.get("summary", existing_summary) if result else existing_summary
-                
-                # Check for summary updates in output of stream if possible, 
-                # but usually summary is a separate node. 
-                # If 'summurize' node runs, we might see its output in 'on_chain_end' or similar, 
-                # but extracting it from stream events is tricky.
-                # For now, we'll try to get state after stream to see if summary updated, 
-                # OR just rely on the fact that summarize node updates the DB itself in the current implementation.
-            
-            # The 'summurize' node in existing code does: self.mongo_store.update_thread_summary(...)
-            # So we don't need to manually save summary here if the node ran.
-            # But we DO need to save the user message and the final assistant message.
 
             if not full_response:
-                 logger.error("Agent produced no output in stream")
-                 return
+                logger.error("Agent produced no output in stream")
+                return
 
+            # Save messages to DB (both guarded by is_duplicate to prevent double-saves on retry)
             try:
-                # Only save user message if it wasn't already in the DB (deduplicated)
                 if not is_duplicate:
                     self.mongo_store.add_message(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        role="user",
-                        text=query,
-                        message_id=msg_id,
-                        embedding=get_embedding(query) or [],
-                        summary=updated_summary,
-                        summarize_fn="None",
-                        embed_summary_fn=get_embedding,
-                        context_fn=[]
+                        user_id=user_id, thread_id=thread_id,
+                        role="user", text=raw_query, message_id=msg_id,
+                        embedding=get_embedding(raw_query) or [],
+                        summary=updated_summary, summarize_fn="None",
+                        embed_summary_fn=get_embedding, context_fn=[]
                     )
-
-                self.mongo_store.add_message(
-                    user_id=user_id,
-                    thread_id=thread_id,
-                    role="assistant",
-                    message_id=f"{msg_id}_ai",
-                    text=full_response,
-                    embedding=get_embedding(full_response) or [],
-                    summary=updated_summary,
-                    summarize_fn="None",
-                    embed_summary_fn=get_embedding,
-                    context_fn=[]
-                )
+                    self.mongo_store.add_message(
+                        user_id=user_id, thread_id=thread_id,
+                        role="assistant", message_id=f"{msg_id}_ai",
+                        text=full_response,
+                        embedding=get_embedding(full_response) or [],
+                        summary=updated_summary, summarize_fn="None",
+                        embed_summary_fn=get_embedding, context_fn=[]
+                    )
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
 
+            # Include updated summary in the done signal so frontend can update
+            done_data = {"summary": self.mongo_store.get_thread_summary(user_id, thread_id)}
+            yield f"data: {json.dumps(done_data)}\n\n"
             yield "data: [DONE]\n\n"
 
         except Exception as e:
             logger.error(f"get_stream_response : {repr(e)}")
-            import traceback
-            traceback.print_exc()
             yield f"data: {json.dumps({'error': str(e)})}\n\n"

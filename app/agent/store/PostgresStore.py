@@ -1,73 +1,115 @@
-import os
+"""
+PostgresConversationStore — persistence layer for ContextTree's FastAPI backend.
+
+Key design decisions:
+- Module-level ThreadedConnectionPool: connections are reused across requests instead
+  of opening a fresh TCP connection per DB call (previous behaviour).
+- All methods acquire a connection via the _get_conn() context manager which commits
+  on success, rolls back on any exception, and returns the connection to the pool.
+- Vector similarity search uses `= ANY(%s::text[])` instead of the old broken
+  IN-clause construction that failed for single-element sets.
+"""
+
+from __future__ import annotations
+
 import json
-import logging
+import os
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Tuple, Optional, Any
-import psycopg2
-from psycopg2.extras import Json, DictCursor
-from psycopg2 import pool
-from pgvector.psycopg2 import register_vector
+from typing import List, Optional, Tuple
+
 import numpy as np
+import psycopg2
 from dotenv import load_dotenv
+from pgvector.psycopg2 import register_vector
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import DictCursor, execute_values
+
 from app.core.logger import logger
 
 load_dotenv()
 
-class PostgresConversationStore:
-    def __init__(
-        self,
-        db_url: Optional[str] = None,
-        embedding_dim: int = 768
-    ):
-        self.db_url = db_url or os.getenv("DATABASE_URL")
-        # Ensure we use the pooled 'postgres' database if generic
-        if not self.db_url:
-             raise ValueError("DATABASE_URL not found.")
-             
-        self.embedding_dim = embedding_dim
-        # We assume tables exist now (nodes, messages, etc.)
+# ── Module-level connection pool ───────────────────────────────────────────────
+_pool: Optional[pg_pool.ThreadedConnectionPool] = None
 
+
+def _get_pool(db_url: str) -> pg_pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = pg_pool.ThreadedConnectionPool(minconn=2, maxconn=20, dsn=db_url)
+        logger.info("PostgreSQL connection pool created (min=2, max=20)")
+    return _pool
+
+
+class PostgresConversationStore:
+    def __init__(self, db_url: Optional[str] = None, embedding_dim: int = 768):
+        self.db_url = db_url or os.getenv("DATABASE_URL")
+        if not self.db_url:
+            raise ValueError("DATABASE_URL not found in environment.")
+        self.embedding_dim = embedding_dim
+        # Pool is opened lazily on first DB call — allows the app to start even
+        # when the database is temporarily unavailable (e.g. Supabase paused).
+
+    # ── Connection management ──────────────────────────────────────────────────
+
+    @contextmanager
     def _get_conn(self):
-        conn = psycopg2.connect(self.db_url)
-        return conn
-        
+        """
+        Borrow a connection from the pool.
+        Commits on clean exit, rolls back + re-raises on exception.
+        """
+        p = _get_pool(self.db_url)
+        conn = p.getconn()
+        try:
+            register_vector(conn)
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            p.putconn(conn)
+
+    # ── Internal helpers ───────────────────────────────────────────────────────
+
     def _resolve_user_email(self, cur, user_id: str) -> str:
-        """
-        Resolves user_id (which might be UUID or email) to an email address.
-        Returns the resolved email or defaults to user_id if lookup fails.
-        """
         if not user_id:
             return "anonymous"
-        # If it looks like an email, return it
         if "@" in user_id:
             return user_id
-            
-        # Try to look up by ID
         try:
             cur.execute("SELECT email FROM users WHERE id = %s", (user_id,))
             row = cur.fetchone()
             if row:
                 return row[0]
         except Exception:
-            pass # Ignore errors (e.g. invalid UUID syntax)
-            
+            pass
         return user_id
 
     def _get_default_canvas(self, cur, user_email: str) -> str:
-        """
-        Finds a canvas for the user to attach new nodes to.
-        Prioritizes existing canvases. If none, creates a 'General' canvas.
-        """
         cur.execute("SELECT id FROM canvases WHERE user_email = %s LIMIT 1", (user_email,))
         row = cur.fetchone()
         if row:
             return row[0]
-            
-        # Create default canvas
-        import uuid
         new_id = str(uuid.uuid4())
-        cur.execute("INSERT INTO canvases (id, user_email, data) VALUES (%s, %s, '{}')", (new_id, user_email))
+        cur.execute(
+            "INSERT INTO canvases (id, user_email, data) VALUES (%s, %s, '{}'::jsonb)",
+            (new_id, user_email),
+        )
         return new_id
+
+    def _normalize_embedding(self, emb) -> Optional[list]:
+        """Return a plain Python list of floats, or None if empty/invalid."""
+        if emb is None or emb == {}:
+            return None
+        if isinstance(emb, np.ndarray):
+            emb = emb.tolist()
+        if isinstance(emb, list) and len(emb) > 0:
+            return emb
+        return None
+
+    # ── Messages ───────────────────────────────────────────────────────────────
 
     def add_message(
         self,
@@ -80,418 +122,287 @@ class PostgresConversationStore:
         summary: str = None,
         summarize_fn=None,
         embed_summary_fn=None,
-        context_fn=None
+        context_fn=None,
     ):
-        conn = self._get_conn()
-        try:
-            register_vector(conn)
+        now = datetime.utcnow()
+        with self._get_conn() as conn:
             cur = conn.cursor()
-            
             user_email = self._resolve_user_email(cur, user_id)
-            now = datetime.utcnow()
 
-            # 1. Ensure Node (Thread) Creation/Update
-            cur.execute("SELECT id FROM nodes WHERE id = %s", (thread_id,))
-            exists = cur.fetchone()
-            
             summary_embedding = None
-            if summary and embed_summary_fn and callable(embed_summary_fn):
+            if summary and callable(embed_summary_fn):
                 try:
-                    summary_embedding = embed_summary_fn(summary) or []
+                    summary_embedding = self._normalize_embedding(embed_summary_fn(summary))
                 except Exception:
-                    summary_embedding = []
+                    pass
 
-            if exists:
+            cur.execute("SELECT id FROM nodes WHERE id = %s", (thread_id,))
+            if cur.fetchone():
                 if summary:
                     if summary_embedding:
-                         cur.execute("UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s", (summary, summary_embedding, thread_id))
+                        cur.execute(
+                            "UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s",
+                            (summary, summary_embedding, thread_id),
+                        )
                     else:
-                         cur.execute("UPDATE nodes SET summary = %s WHERE id = %s", (summary, thread_id))
+                        cur.execute("UPDATE nodes SET summary = %s WHERE id = %s", (summary, thread_id))
             else:
-                # Create Node. We need a canvas_id.
                 canvas_id = self._get_default_canvas(cur, user_email)
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO nodes (id, canvas_id, user_email, summary, summary_embedding, created_at, is_primary)
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """, (thread_id, canvas_id, user_email, summary, summary_embedding, now, True))
-            
-            # 2. Insert Message
-            # 'messages' table: id, node_id, role, content, (user_email from schema?), embedding
-            cur.execute("""
+                    """,
+                    (thread_id, canvas_id, user_email, summary, summary_embedding, now, True),
+                )
+
+            emb = self._normalize_embedding(embedding)
+            cur.execute(
+                """
                 INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (id) DO NOTHING
-            """, (message_id, thread_id, role, text, embedding, now, user_email))
-            
-            conn.commit()
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Error adding message: {e}")
-            raise e
-        finally:
-            conn.close()
+                """,
+                (message_id, thread_id, role, text, emb, now, user_email),
+            )
 
     def get_thread_messages(self, user_id: str, thread_id: str) -> List[dict]:
-        """
-        Retrieves messages for a node.
-        In the 'Arc' architecture, nodes are independent. 
-        This method retrieves ONLY the messages belonging to the specific thread_id,
-        without traversing parents.
-        """
-        conn = self._get_conn()
         try:
-            register_vector(conn)
-            cur = conn.cursor(cursor_factory=DictCursor)
-            
-            query = """
-                SELECT id as message_id, role, content as text, timestamp, position, embedding
-                FROM messages 
-                WHERE node_id = %s
-                ORDER BY timestamp, position
-            """
-            cur.execute(query, (thread_id,))
-            msgs = [dict(r) for r in cur.fetchall()]
-            
-            return msgs
-            
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    FROM messages
+                    WHERE node_id = %s
+                    ORDER BY timestamp, position
+                    """,
+                    (thread_id,),
+                )
+                return [dict(r) for r in cur.fetchall()]
         except Exception as e:
             logger.error(f"Error getting thread messages: {e}")
             return []
-        finally:
-            conn.close()
-
-    def get_thread_ancestry(self, thread_id: str) -> List[str]:
-        """
-        Returns a list of node_ids from current thread up to the root, 
-        following parent_node_id links.
-        """
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor()
-            ancestry = []
-            queue = [thread_id]
-            
-            # Simple recursive CTE replacement or loop
-            # Using loop for safety against cycles if any
-            visited = set()
-            curr = thread_id
-            
-            while curr and curr not in visited:
-                visited.add(curr)
-                ancestry.append(curr)
-                cur.execute("SELECT parent_node_id FROM nodes WHERE id = %s", (curr,))
-                row = cur.fetchone()
-                if row and row[0]:
-                    curr = row[0]
-                else:
-                    curr = None
-            
-            return ancestry
-        except Exception as e:
-            logger.error(f"Error getting thread ancestry: {e}")
-            return [thread_id]
-        finally:
-            conn.close()
 
     def get_thread_recent_messages(self, user_id: str, thread_id: str, limit: int) -> List[dict]:
-        """
-        Retrieves the most recent `limit` messages for a node, ordered oldest->newest.
-        """
-        conn = self._get_conn()
         try:
-            register_vector(conn)
-            cur = conn.cursor(cursor_factory=DictCursor)
-
-            query = """
-                SELECT id as message_id, role, content as text, timestamp, position, embedding
-                FROM messages
-                WHERE node_id = %s
-                ORDER BY timestamp DESC, position DESC
-                LIMIT %s
-            """
-            cur.execute(query, (thread_id, limit))
-            msgs = [dict(r) for r in cur.fetchall()]
-            return list(reversed(msgs))
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    FROM messages
+                    WHERE node_id = %s
+                    ORDER BY timestamp DESC, position DESC
+                    LIMIT %s
+                    """,
+                    (thread_id, limit),
+                )
+                return list(reversed([dict(r) for r in cur.fetchall()]))
         except Exception as e:
             logger.error(f"Error getting recent thread messages: {e}")
             return []
-        finally:
-            conn.close()
+
+    def get_thread_message_count(self, thread_id: str) -> int:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM messages WHERE node_id = %s", (thread_id,))
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def get_message_by_id(self, message_id: str) -> Optional[dict]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT id as message_id, node_id as thread_id, role, content as text, timestamp, embedding
+                    FROM messages WHERE id = %s
+                    """,
+                    (message_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting message by id: {e}")
+            return None
+
+    def get_recent_messages(self, limit: int = 10) -> List[dict]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT id as message_id, node_id as thread_id, role, content as text, timestamp
+                    FROM messages ORDER BY timestamp DESC LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting recent messages: {e}")
+            return []
 
     def prune_thread_messages(self, thread_id: str, keep_last_n: int) -> int:
-        """
-        Deletes older messages in a thread, keeping only the last `keep_last_n`.
-        Returns the number of deleted messages.
-        """
-        conn = self._get_conn()
         try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                SELECT id
-                FROM messages
-                WHERE node_id = %s
-                ORDER BY timestamp, position
-                """,
-                (thread_id,)
-            )
-            ids = [row[0] for row in cur.fetchall()]
-
-            if keep_last_n <= 0 or len(ids) <= keep_last_n:
-                return 0
-
-            ids_to_delete = ids[:-keep_last_n]
-            cur.execute(
-                "DELETE FROM messages WHERE node_id = %s AND id = ANY(%s)",
-                (thread_id, ids_to_delete),
-            )
-            deleted = cur.rowcount
-            conn.commit()
-            return deleted
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM messages WHERE node_id = %s ORDER BY timestamp, position",
+                    (thread_id,),
+                )
+                ids = [row[0] for row in cur.fetchall()]
+                if keep_last_n <= 0 or len(ids) <= keep_last_n:
+                    return 0
+                ids_to_delete = ids[:-keep_last_n]
+                cur.execute(
+                    "DELETE FROM messages WHERE node_id = %s AND id = ANY(%s)",
+                    (thread_id, ids_to_delete),
+                )
+                return cur.rowcount
         except Exception as e:
-            conn.rollback()
             logger.error(f"Error pruning thread messages: {e}")
             return 0
-        finally:
-            conn.close()
+
+    # ── Summaries ──────────────────────────────────────────────────────────────
+
+    def get_thread_summary(self, user_id: str, thread_id: str) -> str:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT summary FROM nodes WHERE id = %s", (thread_id,))
+                row = cur.fetchone()
+                return row[0] if row else ""
+        except Exception:
+            return ""
+
+    def update_thread_summary(self, user_id: str, thread_id: str, summary: str) -> bool:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE nodes SET summary = %s WHERE id = %s", (summary, thread_id))
+                return cur.rowcount > 0
+        except Exception:
+            return False
+
+    # ── Thread / ancestry ──────────────────────────────────────────────────────
+
+    def thread_exists(self, thread_id: str) -> bool:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM nodes WHERE id = %s", (thread_id,))
+                return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def get_thread_ancestry(self, thread_id: str) -> List[str]:
+        """
+        Returns IDs from current thread to root, following parent_node_id links.
+        Critically: ancestry is SCOPED — RAG searches respect tree boundaries.
+        """
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                ancestry = []
+                visited: set = set()
+                curr = thread_id
+                while curr and curr not in visited:
+                    visited.add(curr)
+                    ancestry.append(curr)
+                    cur.execute("SELECT parent_node_id FROM nodes WHERE id = %s", (curr,))
+                    row = cur.fetchone()
+                    curr = row[0] if row and row[0] else None
+                return ancestry
+        except Exception as e:
+            logger.error(f"Error getting thread ancestry: {e}")
+            return [thread_id]
+
+    def get_messages_until(
+        self, user_id: str, thread_id: str, message_id: str
+    ) -> Tuple[str, List[dict]]:
+        summary = self.get_thread_summary(user_id, thread_id)
+        msgs = self.get_thread_messages(user_id, thread_id)
+        ids = [m["message_id"] for m in msgs]
+        resolved = self._resolve_message_id(message_id, ids)
+        target_msgs: List[dict] = []
+        for m in msgs:
+            target_msgs.append(m)
+            if m["message_id"] == resolved:
+                return summary, target_msgs
+        return summary, []
+
+    # ── Similarity search ──────────────────────────────────────────────────────
 
     def find_similar_by_message_id(
         self,
         user_id: str,
         thread_queries: List[Tuple[str, Optional[str]]],
         query_embeddings: List[float],
-        top_k: int = 3
+        top_k: int = 3,
     ) -> List[dict]:
-        conn = self._get_conn()
+        """
+        Vector similarity search scoped to the given thread ancestry.
+        Uses `= ANY(%s::text[])` to avoid the old broken IN-clause construction.
+        """
         try:
-            register_vector(conn)
-            cur = conn.cursor(cursor_factory=DictCursor)
-            
-            # Since threads are trees, "messages in a thread" is complex.
-            # But the user query semantics usually mean "messages belonging to this conversation view".
-            # We must resolve the "accessible message IDs" for each query (thread_id, msg_id).
-            
-            allowed_message_ids = set()
-            is_global_search = not thread_queries
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
 
-            if not is_global_search:
-                for thread_id, limit_msg_id in thread_queries:
-                    # We reuse get_thread_messages logic to get the list of relevant messages
-                    msgs = self.get_thread_messages(user_id, thread_id)
-                    ids = [m['message_id'] for m in msgs]
-                    
-                    if limit_msg_id:
-                        resolved_limit_id = self._resolve_message_id(limit_msg_id, ids)
-                        if resolved_limit_id and resolved_limit_id in ids:
-                            idx = ids.index(resolved_limit_id)
-                            allowed_message_ids.update(ids[:idx])
-                    else:
-                        allowed_message_ids.update(ids)
-                
-                if not allowed_message_ids:
-                    return []
+                is_global = not thread_queries
+                allowed_ids: List[str] = []
 
-            # Vector Search
-            if is_global_search:
-                user_email_resolved = self._resolve_user_email(cur, user_id)
-                query = f"""
-                    SELECT id as message_id, role, content as text, (1 - (embedding <=> %s::vector)) as score
-                    FROM messages
-                    WHERE user_email = %s
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                """
-                cur.execute(query, [query_embeddings, user_email_resolved, query_embeddings, top_k])
-            else:
-                if len(allowed_message_ids) == 1:
-                    in_clause = "(%s)"
-                    ids_param = list(allowed_message_ids)[0]
+                if not is_global:
+                    for thread_id, limit_msg_id in thread_queries:
+                        msgs = self.get_thread_messages(user_id, thread_id)
+                        ids = [m["message_id"] for m in msgs]
+                        if limit_msg_id:
+                            resolved = self._resolve_message_id(limit_msg_id, ids)
+                            if resolved and resolved in ids:
+                                idx = ids.index(resolved)
+                                allowed_ids.extend(ids[:idx])
+                        else:
+                            allowed_ids.extend(ids)
+
+                    if not allowed_ids:
+                        return []
+
+                if is_global:
+                    user_email = self._resolve_user_email(cur, user_id)
+                    cur.execute(
+                        """
+                        SELECT id as message_id, role, content as text,
+                               (1 - (embedding <=> %s::vector)) as score
+                        FROM messages
+                        WHERE user_email = %s
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_embeddings, user_email, query_embeddings, top_k),
+                    )
                 else:
-                    in_clause = "%s"
-                    ids_param = tuple(allowed_message_ids)
+                    # Use = ANY(%s::text[]) — correct for any list size
+                    cur.execute(
+                        """
+                        SELECT id as message_id, role, content as text,
+                               (1 - (embedding <=> %s::vector)) as score
+                        FROM messages
+                        WHERE id = ANY(%s::text[])
+                        ORDER BY embedding <=> %s::vector
+                        LIMIT %s
+                        """,
+                        (query_embeddings, allowed_ids, query_embeddings, top_k),
+                    )
 
-                query = f"""
-                    SELECT id as message_id, role, content as text, (1 - (embedding <=> %s::vector)) as score
-                    FROM messages
-                    WHERE id IN {in_clause}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                """
-                cur.execute(query, [query_embeddings, ids_param, query_embeddings, top_k])
-
-            return [dict(r) for r in cur.fetchall()]
-
+                return [dict(r) for r in cur.fetchall()]
         except Exception as e:
             logger.error(f"Error in find_similar: {e}")
             return []
-        finally:
-            conn.close()
 
-    def update_thread_summary(self, user_id: str, thread_id: str, summary: str) -> bool:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("UPDATE nodes SET summary = %s WHERE id = %s", (summary, thread_id))
-            conn.commit()
-            return cur.rowcount > 0
-        except Exception:
-            conn.rollback()
-            return False
-        finally:
-            conn.close()
-
-    def get_thread_summary(self, user_id: str, thread_id: str) -> str:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT summary FROM nodes WHERE id = %s", (thread_id,))
-            row = cur.fetchone()
-            return row[0] if row else ""
-        except Exception:
-            return ""
-        finally:
-            conn.close()
-
-    def get_thread_message_count(self, thread_id: str) -> int:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM messages WHERE node_id = %s", (thread_id,))
-            row = cur.fetchone()
-            return int(row[0]) if row else 0
-        except Exception:
-            return 0
-        finally:
-            conn.close()
-
-    def get_message_by_id(self, message_id: str) -> Optional[dict]:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor(cursor_factory=DictCursor)
-            cur.execute(
-                """
-                SELECT id as message_id, node_id as thread_id, role, content as text, timestamp, embedding
-                FROM messages
-                WHERE id = %s
-                """,
-                (message_id,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Error getting message by id: {e}")
-            return None
-        finally:
-            conn.close()
-
-    def get_recent_messages(self, limit: int = 10) -> List[dict]:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor(cursor_factory=DictCursor)
-            cur.execute(
-                """
-                SELECT id as message_id, node_id as thread_id, role, content as text, timestamp
-                FROM messages
-                ORDER BY timestamp DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cur.fetchall()
-            return [dict(r) for r in rows]
-        except Exception as e:
-            logger.error(f"Error getting recent messages: {e}")
-            return []
-        finally:
-            conn.close()
-
-    def thread_exists(self, thread_id: str) -> bool:
-        conn = self._get_conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT 1 FROM nodes WHERE id = %s", (thread_id,))
-            return cur.fetchone() is not None
-        except Exception:
-            return False
-        finally:
-            conn.close()
-
-    def _resolve_message_id(self, target_id: str, candidate_ids: List[str]) -> Optional[str]:
-        """
-        Smart fuzzy matching to handle frontend (-u/-a) vs backend (_ai/_) ID mismatches.
-        Returns the matching ID from candidate_ids if found, else None.
-        """
-        if target_id in candidate_ids:
-            return target_id
-
-        def normalize_id(mid):
-            if not isinstance(mid, str): return str(mid)
-            # Strip known suffixes to get base ID
-            base = mid
-            for suffix in ["_ai", "_a", "-a", "_u", "-u"]:
-                if base.endswith(suffix):
-                    base = base[:-len(suffix)]
-                    break
-            return base
-
-        def get_role_hint(mid):
-                if not isinstance(mid, str): return "unknown"
-                if mid.endswith(("_ai", "_a", "-a")): return "assistant"
-                if mid.endswith(("_u", "-u")): return "user"
-                return "user" # Default assumption for base IDs
-
-        req_base = normalize_id(target_id)
-        req_role = get_role_hint(target_id)
-
-        for mid in candidate_ids:
-            if not isinstance(mid, str): continue
-            
-            db_base = normalize_id(mid)
-            db_role = get_role_hint(mid)
-            
-            if req_base == db_base:
-                if req_role == db_role:
-                    return mid
-                
-                # Fallback: if we are looking for 'user' and DB has base ID only
-                if req_role == "user" and db_role == "user": 
-                        return mid
-                
-                # Fallback: if we look for assistant and DB has _ai or _a
-                if req_role == "assistant" and db_role == "assistant":
-                        return mid
-
-        # Original legacy fallback
-        for mid in candidate_ids:
-            if isinstance(mid, str) and (mid.startswith(target_id) or target_id.startswith(mid) or mid.replace("_u", "") == target_id.replace("_u", "")):
-                return mid
-        
-        return None
-
-    def get_messages_until(self, user_id: str, thread_id: str, message_id: str) -> Tuple[str, List[dict]]:
-        summary = self.get_thread_summary(user_id, thread_id)
-        msgs = self.get_thread_messages(user_id, thread_id)
-        
-        target_msgs = []
-        found = False
-        ids = [m['message_id'] for m in msgs]
-
-        resolved_message_id = self._resolve_message_id(message_id, ids)
-        if not resolved_message_id:
-             # If strictly not found, assume not found (already tried fallbacks)
-             pass
-
-        for m in msgs:
-            target_msgs.append(m)
-            if m['message_id'] == resolved_message_id:
-                found = True
-                break
-        
-        if not found:
-            return summary, []
-            
-        return summary, target_msgs
+    # ── Fork ───────────────────────────────────────────────────────────────────
 
     def fork_thread(
         self,
@@ -501,365 +412,272 @@ class PostgresConversationStore:
         fork_at_message_id: str,
         summary: str = None,
         summary_embedding: List[float] = None,
-        initial_messages: List[dict] = []
+        initial_messages: List[dict] = [],
     ) -> bool:
-        conn = self._get_conn()
         try:
-            register_vector(conn)
-            cur = conn.cursor()
-            
-            user_email = self._resolve_user_email(cur, user_id)
-            now = datetime.utcnow()
-            
-            # Get Source Node Details (Canvas ID mostly)
-            cur.execute("SELECT canvas_id, user_email FROM nodes WHERE id = %s", (source_thread_id,))
-            source_node = cur.fetchone()
-            if not source_node:
-                return False
-            canvas_id = source_node[0]
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                now = datetime.utcnow()
+                user_email = self._resolve_user_email(cur, user_id)
 
-            # If child already exists, update summary and optionally seed buffer
-            cur.execute("SELECT id FROM nodes WHERE id = %s", (new_thread_id,))
-            child_exists = cur.fetchone() is not None
-            if child_exists:
-                if summary is not None:
-                    if summary_embedding is not None:
-                        cur.execute(
-                            "UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s",
-                            (summary, summary_embedding, new_thread_id),
-                        )
-                    else:
-                        cur.execute(
-                            "UPDATE nodes SET summary = %s WHERE id = %s",
-                            (summary, new_thread_id),
-                        )
-
-                cur.execute("SELECT COUNT(*) FROM messages WHERE node_id = %s", (new_thread_id,))
-                count_row = cur.fetchone()
-                child_msg_count = int(count_row[0]) if count_row else 0
-
-                # Allow insertion if count is 0 OR 1 (assuming the 1 is the new user trigger message)
-                if initial_messages and child_msg_count <= 1:
-                    # Check if we already have these messages (deduplication heuristic)
-                    # If count is 1, and we insert, we might duplicate if we already did this?
-                    # But if we did this, count would be 1 + len(initial_messages) > 1 (assuming len > 0).
-                    # So checking count <= 1 is safe provided len(initial_messages) >= 1.
-                    
-                    for idx, msg in enumerate(initial_messages):
-                        import uuid
-                        new_msg_id = str(uuid.uuid4())
-
-                        emb = msg.get('embedding')
-                        if emb is None or emb == {}:
-                            emb = []
-                        elif isinstance(emb, np.ndarray):
-                            emb = emb.tolist()
-                        elif not isinstance(emb, list):
-                            emb = []
-                        
-                        if not emb:
-                             emb = None
-
-                        cur.execute(
-                            """
-                            INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (
-                                new_msg_id,
-                                new_thread_id,
-                                msg.get('role'),
-                                msg.get('text', '') or msg.get('content', ''),
-                                emb,
-                                msg.get('timestamp', now),
-                                user_email,
-                            ),
-                        )
-
-                conn.commit()
-                return True
-
-            # In Mongo store, if summary fallback was needed:
-            # final_summary = summary if summary is not None else source.get("summary")
-            # We rely on provided summary or null. (Code provided in MongoStore mostly passed it or used existing)
-            
-            cur.execute("""
-                INSERT INTO nodes (
-                    id, canvas_id, user_email, parent_node_id, 
-                    forked_from_message_id, summary, summary_embedding, created_at, is_primary
+                cur.execute(
+                    "SELECT canvas_id FROM nodes WHERE id = %s", (source_thread_id,)
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                new_thread_id,
-                canvas_id,
-                user_email,
-                source_thread_id,
-                fork_at_message_id,
-                summary,
-                summary_embedding,
-                now,
-                False 
-            ))
-            
-            # Insert Initial Messages (Buffer)
-            if initial_messages:
-                for idx, msg in enumerate(initial_messages):
-                     # Ensure we have message_id. 
-                     # If these are copies, they should theoretically have new IDs if we want them independent?
-                     # The prompt says: "Take a small buffer of exact messages". "raw_messages_B = [buffer messages]".
-                     # If we reuse IDs, future edits/deletions in B might affect A if not careful? 
-                     # But 'messages' table has 'node_id' as PK part? No, 'id' (UUID) is usually PK.
-                     # If 'id' is PK, we cannot insert same message_id for different node_id.
-                     # We MUST generate new IDs for the copied messages in B.
-                     # Or the schema uses (id, node_id) as PK? 
-                     # The insert in add_message uses: ON CONFLICT (id) DO NOTHING.
-                     # This suggests 'id' is unique global.
-                     # So we MUST generate NEW IDs for the buffer messages in the new thread.
-                     
-                     import uuid
-                     new_msg_id = str(uuid.uuid4())
-                     
-                     # We might want to keep reference to original? But ARC says "No dependency".
-                     
-                     emb = msg.get('embedding')
-                     if emb is None or emb == {}:
-                         emb = []
-                     elif isinstance(emb, np.ndarray):
-                         emb = emb.tolist()
-                     elif not isinstance(emb, list):
-                         emb = []
+                source = cur.fetchone()
+                if not source:
+                    return False
+                canvas_id = source[0]
 
-                     # Fix for "invalid input syntax for type vector: '{}'"
-                     if not emb:
-                         emb = None
-                     
-                     cur.execute("""
-                        INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s)
-                     """, (
-                        new_msg_id, 
-                        new_thread_id, 
-                        msg.get('role'), 
-                        msg.get('text', '') or msg.get('content', ''), 
-                        emb, 
-                        msg.get('timestamp', now), 
-                        user_email
-                     ))
-            
-            conn.commit()
-            return True
+                cur.execute("SELECT id FROM nodes WHERE id = %s", (new_thread_id,))
+                child_exists = cur.fetchone() is not None
+
+                if child_exists:
+                    if summary is not None:
+                        se = self._normalize_embedding(summary_embedding)
+                        if se:
+                            cur.execute(
+                                "UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s",
+                                (summary, se, new_thread_id),
+                            )
+                        else:
+                            cur.execute(
+                                "UPDATE nodes SET summary = %s WHERE id = %s",
+                                (summary, new_thread_id),
+                            )
+
+                    cur.execute(
+                        "SELECT COUNT(*) FROM messages WHERE node_id = %s", (new_thread_id,)
+                    )
+                    count = int((cur.fetchone() or [0])[0])
+                    if initial_messages and count <= 1:
+                        self._insert_buffer_messages(cur, new_thread_id, user_email, initial_messages, now)
+                    return True
+
+                se = self._normalize_embedding(summary_embedding)
+                cur.execute(
+                    """
+                    INSERT INTO nodes (
+                        id, canvas_id, user_email, parent_node_id,
+                        forked_from_message_id, summary, summary_embedding, created_at, is_primary
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        new_thread_id, canvas_id, user_email, source_thread_id,
+                        fork_at_message_id, summary, se, now, False,
+                    ),
+                )
+                if initial_messages:
+                    self._insert_buffer_messages(cur, new_thread_id, user_email, initial_messages, now)
+                return True
         except Exception as e:
-            conn.rollback()
-            logger.error(f"Error forking: {e}")
+            logger.error(f"Error forking thread: {e}")
             return False
-        finally:
-            conn.close()
+
+    def _insert_buffer_messages(self, cur, node_id: str, user_email: str, messages: list, now):
+        """Insert copied buffer messages with fresh IDs (messages are independent in new branch)."""
+        for msg in messages:
+            emb = self._normalize_embedding(msg.get("embedding"))
+            cur.execute(
+                """
+                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    node_id,
+                    msg.get("role"),
+                    msg.get("text", "") or msg.get("content", ""),
+                    emb,
+                    msg.get("timestamp", now),
+                    user_email,
+                ),
+            )
+
+    # ── File context ───────────────────────────────────────────────────────────
 
     def get_file_binary(self, file_id: str) -> Optional[dict]:
-        """
-        Retrieves the binary content and metadata of a file from external_files.
-        """
-        conn = self._get_conn()
         try:
-            cur = conn.cursor(cursor_factory=DictCursor)
-            cur.execute("""
-                SELECT id, file_name, mime_type, data 
-                FROM external_files 
-                WHERE id = %s
-            """, (file_id,))
-            row = cur.fetchone()
-            if row:
-                return dict(row)
-            return None
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    "SELECT id, file_name, mime_type, data FROM external_files WHERE id = %s",
+                    (file_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error fetching file binary: {e}")
-            raise e
-        finally:
-            conn.close()
+            raise
 
-    def save_file_chunks(self, file_id: str, chunks: List[str], embeddings: List[List[float]], metadatas: Optional[List[dict]] = None):
-        """
-        Saves chunks and embeddings to file_chunks table.
-        Updates external_files.processed = true.
-        """
-        conn = self._get_conn()
-        try:
-            register_vector(conn)
+    def save_file_chunks(
+        self,
+        file_id: str,
+        chunks: List[str],
+        embeddings: List[List[float]],
+        metadatas: Optional[List[dict]] = None,
+    ):
+        if metadatas is None:
+            metadatas = [{"source": "unknown"}] * len(chunks)
+
+        data_list = [
+            (file_id, idx, text, emb, json.dumps(meta))
+            for idx, (text, emb, meta) in enumerate(zip(chunks, embeddings, metadatas))
+        ]
+
+        with self._get_conn() as conn:
             cur = conn.cursor()
-            
-            # Ensure metadatas is list of same length if None
-            if metadatas is None:
-                metadatas = [{'source': 'unknown'}] * len(chunks)
-            
-            # 1. Insert Chunks
-            data_list = []
-            for idx, (text, emb, meta) in enumerate(zip(chunks, embeddings, metadatas)):
-                import json
-                # Ensure metadata is json serializable dict
-                meta_json = json.dumps(meta)
-                item = (file_id, idx, text, emb, meta_json)
-                data_list.append(item)
-            
-            from psycopg2.extras import execute_values
-            
-            insert_query = """
-                INSERT INTO file_chunks (file_id, chunk_index, chunk_text, embedding, metadata)
-                VALUES %s
-            """
-            
-            execute_values(cur, insert_query, data_list)
+            execute_values(
+                cur,
+                "INSERT INTO file_chunks (file_id, chunk_index, chunk_text, embedding, metadata) VALUES %s",
+                data_list,
+            )
+            cur.execute(
+                "UPDATE external_files SET processed = true, updated_at = NOW() WHERE id = %s",
+                (file_id,),
+            )
 
-            # 2. Update processed status
-            cur.execute("""
-                UPDATE external_files 
-                SET processed = true, updated_at = NOW() 
-                WHERE id = %s
-            """, (file_id,))
-            
-            conn.commit()
-            
-        except Exception as e:
-            conn.rollback()
-            logger.error(f"Error saving file chunks: {e}")
-            raise e
-        finally:
-            conn.close()
-
-    def get_related_file_context(self, node_id: str, query_embedding: List[float], limit: int = 3) -> List[dict]:
+    def get_related_file_context(
+        self, node_id: str, query_embedding: List[float], limit: int = 5
+    ) -> List[dict]:
         """
-        Finds the nearest file chunks connected to a given node (via edges).
-        Returns chunk text plus metadata so the caller can format rich context.
+        Finds nearest file chunks connected to this node via edges.
+        Limit raised to 5 (was hardcoded to 3) for richer RAG context.
         """
         if not query_embedding:
             return []
-
-        conn = self._get_conn()
         try:
-            register_vector(conn)
-            cur = conn.cursor(cursor_factory=DictCursor)
-            
-            query = """
-                WITH connected_files AS (
-                    SELECT n.id as file_node_id
-                    FROM nodes n
-                    JOIN edges e ON (e.from_node = n.id OR e.to_node = n.id)
-                    WHERE (e.from_node = %s OR e.to_node = %s)
-                      AND n.id != %s
-                      AND n.type = 'externalContext'
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    WITH connected_files AS (
+                        SELECT n.id AS file_node_id
+                        FROM nodes n
+                        JOIN edges e ON (e.from_node = n.id OR e.to_node = n.id)
+                        WHERE (e.from_node = %s OR e.to_node = %s)
+                          AND n.id != %s
+                          AND n.type = 'externalContext'
+                    )
+                    SELECT
+                        fc.chunk_text,
+                        fc.metadata,
+                        fc.chunk_index,
+                        (fc.embedding <=> %s::vector) AS distance,
+                        ef.file_name,
+                        ef.file_type
+                    FROM file_chunks fc
+                    JOIN external_files ef ON fc.file_id = ef.id
+                    JOIN connected_files cf ON ef.node_id = cf.file_node_id
+                    ORDER BY distance ASC
+                    LIMIT %s
+                    """,
+                    (node_id, node_id, node_id, np.array(query_embedding), limit),
                 )
-                SELECT 
-                    fc.chunk_text,
-                    fc.metadata,
-                    fc.chunk_index,
-                    (fc.embedding <=> %s::vector) as distance,
-                    ef.file_name,
-                    ef.file_type
-                FROM file_chunks fc
-                JOIN external_files ef ON fc.file_id = ef.id
-                JOIN connected_files cf ON ef.node_id = cf.file_node_id 
-                ORDER BY distance ASC
-                LIMIT %s
-            """
-            
-            cur.execute(query, (node_id, node_id, node_id, np.array(query_embedding), limit))
-            rows = cur.fetchall()
-            
-            return [dict(row) for row in rows]
-            
+                return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             logger.error(f"Error fetching related file context: {e}")
             return []
-        finally:
-            conn.close()
+
+    # ── Node content updates ───────────────────────────────────────────────────
 
     def update_node_data_content(self, node_id: str, content: str) -> bool:
-        """
-        Persist extracted text onto the node's data jsonb and clear any loading flags.
-        Also replaces the placeholder contextContract ("Processing...") with the
-        extracted text or a friendly fallback when the file has no text.
-        """
-        conn = self._get_conn()
         try:
-            cur = conn.cursor()
-
             text_value = content or ""
             contract_value = content if content else "(No text content extracted)"
-
-            cur.execute(
-                """
-                UPDATE nodes 
-                SET data = jsonb_set(
-                            jsonb_set(
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE nodes
+                    SET data = jsonb_set(
                                 jsonb_set(
                                     jsonb_set(
                                         jsonb_set(
                                             jsonb_set(
                                                 jsonb_set(
-                                                    jsonb_set(coalesce(data, '{}'::jsonb), '{data,content}', to_jsonb(%s::text), true),
-                                                    '{data,loading}', 'false'::jsonb, true
-                                                ),
-                                                '{data,error}', 'null'::jsonb, true
-                                            ),
-                                            '{content}', to_jsonb(%s::text), true
-                                        ),
-                                        '{loading}', 'false'::jsonb, true
-                                    ),
-                                    '{error}', 'null'::jsonb, true
-                                ),
-                                '{contextContract}', to_jsonb(%s::text), true
-                            ),
-                            '{data,contextContract}', to_jsonb(%s::text), true
-                        )
-                WHERE id = %s
-                """,
-                (text_value, text_value, contract_value, contract_value, node_id)
-            )
-            conn.commit()
-            return cur.rowcount > 0
+                                                    jsonb_set(
+                                                        jsonb_set(coalesce(data, '{}'::jsonb),
+                                                            '{data,content}', to_jsonb(%s::text), true),
+                                                        '{data,loading}', 'false'::jsonb, true),
+                                                    '{data,error}', 'null'::jsonb, true),
+                                                '{content}', to_jsonb(%s::text), true),
+                                            '{loading}', 'false'::jsonb, true),
+                                        '{error}', 'null'::jsonb, true),
+                                    '{contextContract}', to_jsonb(%s::text), true),
+                                '{data,contextContract}', to_jsonb(%s::text), true)
+                    WHERE id = %s
+                    """,
+                    (text_value, text_value, contract_value, contract_value, node_id),
+                )
+                return cur.rowcount > 0
         except Exception as e:
-            conn.rollback()
             logger.error(f"Error updating node data content: {e}")
             return False
-        finally:
-            conn.close()
 
     def update_node_processing_error(self, node_id: str, message: str) -> bool:
-        """
-        Mark a file node as failed, store a user-friendly error, and clear loading flags.
-        """
-        conn = self._get_conn()
         try:
-            cur = conn.cursor()
             error_value = message or "Failed to process file"
-
-            cur.execute(
-                """
-                UPDATE nodes 
-                SET data = jsonb_set(
-                            jsonb_set(
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE nodes
+                    SET data = jsonb_set(
                                 jsonb_set(
                                     jsonb_set(
                                         jsonb_set(
-                                            jsonb_set(coalesce(data, '{}'::jsonb), '{data,error}', to_jsonb(%s::text), true),
-                                            '{data,loading}', 'false'::jsonb, true
-                                        ),
-                                        '{error}', to_jsonb(%s::text), true
-                                    ),
-                                    '{loading}', 'false'::jsonb, true
-                                ),
-                                '{contextContract}', to_jsonb(%s::text), true
-                            ),
-                            '{data,contextContract}', to_jsonb(%s::text), true
-                        )
-                WHERE id = %s
-                """,
-                (error_value, error_value, error_value, error_value, node_id)
-            )
-            conn.commit()
-            return cur.rowcount > 0
+                                            jsonb_set(
+                                                jsonb_set(coalesce(data, '{}'::jsonb),
+                                                    '{data,error}', to_jsonb(%s::text), true),
+                                                '{data,loading}', 'false'::jsonb, true),
+                                            '{error}', to_jsonb(%s::text), true),
+                                        '{loading}', 'false'::jsonb, true),
+                                    '{contextContract}', to_jsonb(%s::text), true),
+                                '{data,contextContract}', to_jsonb(%s::text), true)
+                    WHERE id = %s
+                    """,
+                    (error_value, error_value, error_value, error_value, node_id),
+                )
+                return cur.rowcount > 0
         except Exception as e:
-            conn.rollback()
             logger.error(f"Error updating node processing error: {e}")
             return False
-        finally:
-            conn.close()
+
+    # ── ID resolution ──────────────────────────────────────────────────────────
+
+    def _resolve_message_id(self, target_id: str, candidate_ids: List[str]) -> Optional[str]:
+        """
+        Fuzzy match to handle frontend suffix conventions (_u, _ai, -a, -u)
+        vs backend stored IDs.
+        """
+        if target_id in candidate_ids:
+            return target_id
+
+        def normalize(mid: str) -> str:
+            for suffix in ("_ai", "_a", "-a", "_u", "-u"):
+                if mid.endswith(suffix):
+                    return mid[: -len(suffix)]
+            return mid
+
+        def role_hint(mid: str) -> str:
+            if mid.endswith(("_ai", "_a", "-a")):
+                return "assistant"
+            if mid.endswith(("_u", "-u")):
+                return "user"
+            return "user"
+
+        req_base = normalize(target_id)
+        req_role = role_hint(target_id)
+
+        for mid in candidate_ids:
+            if not isinstance(mid, str):
+                continue
+            if normalize(mid) == req_base and role_hint(mid) == req_role:
+                return mid
+
+        # Looser fallback
+        for mid in candidate_ids:
+            if isinstance(mid, str) and normalize(mid) == req_base:
+                return mid
+
+        return None

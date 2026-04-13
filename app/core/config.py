@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # ── LLM: Google Gemini ─────────────────────────────────────────────────────
     GOOGLE_API_KEY: Optional[str] = None
-    DEFAULT_GEMINI_MODEL: str = "gemini/gemini-2.0-flash"
+    DEFAULT_GEMINI_MODEL: str = "gemini/gemini-3-flash-preview"
 
     # ── LLM: NVIDIA NIM ────────────────────────────────────────────────────────
     NVIDIA_API_KEY: Optional[str] = None

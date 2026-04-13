@@ -2,12 +2,9 @@
 LLM provider routing.
 
 Model naming convention (sent from frontend):
-  - gemini/<model>   → Google Gemini via langchain_google_genai
-  - nvidia-hosted ids → NVIDIA NIM via langchain_openai (OpenAI-compatible)
-  - everything else  → Groq via langchain_groq
-
-Supported Gemini model IDs (the part after "gemini/"):
-  gemini-3-flash-preview, gemini-2.5-pro, gemini-2.0-flash, gemini-1.5-pro, gemini-1.5-flash
+  - gemini/<model>        → Google Gemini via langchain_google_genai
+  - NVIDIA-hosted ids     → NVIDIA NIM via langchain_openai (OpenAI-compatible)
+  - everything else       → Groq via langchain_groq
 """
 
 from __future__ import annotations
@@ -20,19 +17,39 @@ from app.core.logger import logger
 load_dotenv()
 
 # ── Groq defaults ──────────────────────────────────────────────────────────────
-_GROQ_DEFAULT = "meta-llama/llama-4-scout-17b-16e-instruct"
+_GROQ_DEFAULT = os.getenv("DEFAULT_GROQ_MODEL") or "openai/gpt-oss-120b"
 _GROQ_SENTINEL = {"None", "null", "default-model-name", "", None}
-_NVIDIA_DEFAULT = "moonshotai/kimi-k2-instruct-0905"
+_NVIDIA_DEFAULT = os.getenv("DEFAULT_NVIDIA_MODEL") or "moonshotai/kimi-k2-instruct-0905"
 _NVIDIA_SENTINEL = {"None", "null", "default-model-name", "", None}
 
 # ── Gemini model aliases ───────────────────────────────────────────────────────
-# Maps the short model string (after "gemini/") to its full Gemini model ID.
+# Google currently returns `models/<id>` names from the official models list.
 _GEMINI_ALIASES: dict[str, str] = {
-    "gemini-3-flash-preview": "gemini-3-flash-preview",
-    "gemini-2.5-pro":    "gemini-2.5-pro-preview-06-05",
-    "gemini-2.0-flash":  "gemini-2.0-flash",
-    "gemini-1.5-pro":    "gemini-1.5-pro",
-    "gemini-1.5-flash":  "gemini-1.5-flash",
+    "gemini-3-flash-preview": "models/gemini-3-flash-preview",
+    "gemini-3-pro-preview": "models/gemini-3-pro-preview",
+    "gemini-3.1-pro-preview": "models/gemini-3.1-pro-preview",
+    "gemini-2.5-flash": "models/gemini-2.5-flash",
+    "gemini-2.5-pro": "models/gemini-2.5-pro",
+    # Legacy IDs are promoted to currently-available models so older nodes keep working.
+    "gemini-2.0-flash": "models/gemini-2.5-flash",
+    "gemini-1.5-pro": "models/gemini-2.5-pro",
+    "gemini-1.5-flash": "models/gemini-2.5-flash",
+    "gemini-flash-latest": "models/gemini-flash-latest",
+    "gemini-flash-lite-latest": "models/gemini-flash-lite-latest",
+    "gemini-pro-latest": "models/gemini-pro-latest",
+}
+
+_NVIDIA_ALIASES: dict[str, str] = {
+    "moonshotai/kimi-k2-instruct": "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2-instruct-0905": "moonshotai/kimi-k2-instruct-0905",
+    "z-ai/glm-4.7": "z-ai/glm4_7",
+    "z-ai/glm4.7": "z-ai/glm4_7",
+    "z-ai/glm4_7": "z-ai/glm4_7",
+    "deepseek-ai/deepseek-v3.1": "deepseek-ai/deepseek-v3_1",
+    "deepseek-ai/deepseek-v3_1": "deepseek-ai/deepseek-v3_1",
+    "deepseek-ai/deepseek-v3.2": "deepseek-ai/deepseek-v3_2",
+    "deepseek-ai/deepseek-v3_2": "deepseek-ai/deepseek-v3_2",
+    "mistralai/mistral-large-3-675b-instruct-2512": "mistralai/mistral-large-3-675b-instruct-2512",
 }
 
 _NVIDIA_PREFIXES = (
@@ -56,26 +73,37 @@ def _is_nvidia(model_name: str | None) -> bool:
     return model_name.startswith(_NVIDIA_PREFIXES)
 
 
+def _normalize_gemini_model_name(model_name: str | None) -> str:
+    bare = model_name or os.getenv("DEFAULT_GEMINI_MODEL") or "gemini-3-flash-preview"
+    if bare.startswith("gemini/"):
+        bare = bare[len("gemini/"):]
+    if bare.startswith("models/"):
+        return bare
+
+    resolved = _GEMINI_ALIASES.get(bare, bare)
+    return resolved if resolved.startswith("models/") else f"models/{resolved}"
+
+
+def _normalize_nvidia_model_name(model_name: str | None) -> str:
+    if model_name in _NVIDIA_SENTINEL:
+        return _NVIDIA_DEFAULT
+    return _NVIDIA_ALIASES.get(model_name or _NVIDIA_DEFAULT, model_name or _NVIDIA_DEFAULT)
+
+
 def get_gemini_llm(model_name: str | None = None):
     """
     Returns a ChatGoogleGenerativeAI instance.
     model_name may be:
-      - "gemini/gemini-2.0-flash"  (frontend format)
-      - "gemini-2.0-flash"         (bare)
-      - None → falls back to gemini-2.0-flash
+      - "gemini/gemini-3-flash-preview"  (frontend format)
+      - "gemini-3-flash-preview"         (bare)
+      - None → falls back to DEFAULT_GEMINI_MODEL or Gemini 3 Flash Preview
     """
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.error("GOOGLE_API_KEY not set — cannot initialise Gemini LLM")
         return None
 
-    # Normalise: strip the "gemini/" prefix if present
-    bare = model_name or "gemini-2.0-flash"
-    if bare.startswith("gemini/"):
-        bare = bare[len("gemini/"):]
-
-    # Resolve alias to full model ID accepted by the Gemini API
-    resolved = _GEMINI_ALIASES.get(bare, bare)
+    resolved = _normalize_gemini_model_name(model_name)
 
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -117,8 +145,7 @@ def get_groq_llm(name: str | None = None):
 
 def get_nvidia_llm(model_name: str | None = None):
     """Returns a ChatOpenAI instance pointed at NVIDIA's OpenAI-compatible API."""
-    if model_name in _NVIDIA_SENTINEL:
-        model_name = _NVIDIA_DEFAULT
+    model_name = _normalize_nvidia_model_name(model_name)
 
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:

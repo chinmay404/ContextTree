@@ -17,8 +17,25 @@ def get_formated_summury_prompt(messages, summury):
         input_variables=["summary", "conversation"],
         template=template
     )
+    # Format LangChain message objects into readable conversation text
+    conversation_lines = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            conversation_lines.append(f"User: {msg.content}")
+        elif isinstance(msg, AIMessage):
+            conversation_lines.append(f"Assistant: {msg.content}")
+        elif isinstance(msg, SystemMessage):
+            conversation_lines.append(f"System: {msg.content}")
+        elif isinstance(msg, dict):
+            role = msg.get("role", "unknown")
+            text = msg.get("text", "") or msg.get("content", "")
+            conversation_lines.append(f"{role.capitalize()}: {text}")
+        else:
+            conversation_lines.append(str(msg))
+    conversation_text = "\n".join(conversation_lines)
+
     final_prompt = prompt_template.format(
-        conversation=messages,
-        summary=summury,
+        conversation=conversation_text,
+        summary=summury if summury else "None",
     )
     return final_prompt
