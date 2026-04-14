@@ -299,27 +299,43 @@ class PostgresConversationStore:
         except Exception:
             return False
 
-    def get_thread_ancestry(self, thread_id: str) -> List[str]:
+    def get_thread_ancestry_scopes(self, thread_id: str) -> List[Tuple[str, Optional[str]]]:
         """
-        Returns IDs from current thread to root, following parent_node_id links.
-        Critically: ancestry is SCOPED — RAG searches respect tree boundaries.
+        Returns [(thread_id, limit_message_id)] from current thread to root.
+
+        The current thread has no limit. Each ancestor is scoped by the child
+        node's forked_from_message_id so retrieval cannot see messages that were
+        added to the parent after the branch was created.
         """
         try:
             with self._get_conn() as conn:
-                cur = conn.cursor()
-                ancestry = []
+                cur = conn.cursor(cursor_factory=DictCursor)
+                ancestry: List[Tuple[str, Optional[str]]] = []
                 visited: set = set()
                 curr = thread_id
+                limit_message_id: Optional[str] = None
+
                 while curr and curr not in visited:
                     visited.add(curr)
-                    ancestry.append(curr)
-                    cur.execute("SELECT parent_node_id FROM nodes WHERE id = %s", (curr,))
+                    ancestry.append((curr, limit_message_id))
+                    cur.execute(
+                        "SELECT parent_node_id, forked_from_message_id FROM nodes WHERE id = %s",
+                        (curr,),
+                    )
                     row = cur.fetchone()
-                    curr = row[0] if row and row[0] else None
+                    if not row:
+                        break
+                    limit_message_id = row["forked_from_message_id"] or None
+                    curr = row["parent_node_id"] or None
+
                 return ancestry
         except Exception as e:
-            logger.error(f"Error getting thread ancestry: {e}")
-            return [thread_id]
+            logger.error(f"Error getting thread ancestry scopes: {e}")
+            return [(thread_id, None)]
+
+    def get_thread_ancestry(self, thread_id: str) -> List[str]:
+        """Compatibility helper returning only the thread IDs."""
+        return [thread for thread, _ in self.get_thread_ancestry_scopes(thread_id)]
 
     def get_messages_until(
         self, user_id: str, thread_id: str, message_id: str
@@ -328,11 +344,12 @@ class PostgresConversationStore:
         msgs = self.get_thread_messages(user_id, thread_id)
         ids = [m["message_id"] for m in msgs]
         resolved = self._resolve_message_id(message_id, ids)
+        scoped_summary = summary if resolved and ids and resolved == ids[-1] else ""
         target_msgs: List[dict] = []
         for m in msgs:
             target_msgs.append(m)
             if m["message_id"] == resolved:
-                return summary, target_msgs
+                return scoped_summary, target_msgs
         return summary, []
 
     # ── Similarity search ──────────────────────────────────────────────────────
@@ -363,7 +380,7 @@ class PostgresConversationStore:
                             resolved = self._resolve_message_id(limit_msg_id, ids)
                             if resolved and resolved in ids:
                                 idx = ids.index(resolved)
-                                allowed_ids.extend(ids[:idx])
+                                allowed_ids.extend(ids[: idx + 1])
                         else:
                             allowed_ids.extend(ids)
 
@@ -654,15 +671,15 @@ class PostgresConversationStore:
             return target_id
 
         def normalize(mid: str) -> str:
-            for suffix in ("_ai", "_a", "-a", "_u", "-u"):
+            for suffix in ("_assistant", "-assistant", "_ai", "_a", "-a", "_user", "-user", "_u", "-u"):
                 if mid.endswith(suffix):
                     return mid[: -len(suffix)]
             return mid
 
         def role_hint(mid: str) -> str:
-            if mid.endswith(("_ai", "_a", "-a")):
+            if mid.endswith(("_assistant", "-assistant", "_ai", "_a", "-a")):
                 return "assistant"
-            if mid.endswith(("_u", "-u")):
+            if mid.endswith(("_user", "-user", "_u", "-u")):
                 return "user"
             return "user"
 

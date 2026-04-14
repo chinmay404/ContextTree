@@ -316,8 +316,7 @@ class getGraphResponse():
         external_context_snippets: list[str] = []
 
         try:
-            ancestry_ids = self.mongo_store.get_thread_ancestry(thread_id)
-            thread_scope = [(aid, None) for aid in ancestry_ids]
+            thread_scope = self.mongo_store.get_thread_ancestry_scopes(thread_id)
             sims = self.mongo_store.find_similar_by_message_id(
                 user_id=user_id,
                 thread_queries=thread_scope,
