@@ -1,8 +1,11 @@
 """
 Health check endpoints.
 """
+import os
+
 from fastapi import APIRouter, status
 from app.api.limiter import limiter
+from app.core.deploy_info import get_deploy_info
 
 from fastapi import Request
 
@@ -21,5 +24,7 @@ async def health_check(request: Request):
     """
     return {
         "status": "healthy",
-        "message": "The service is up and running."
+        "message": "The service is up and running.",
+        "pid": os.getpid(),
+        "deploy": get_deploy_info(),
     }

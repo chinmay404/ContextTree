@@ -1,6 +1,9 @@
 """
 FastAPI application creation and configuration.
 """
+import os
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,6 +18,7 @@ from slowapi import _rate_limit_exceeded_handler
 
 
 from app.core.logger import logger
+from app.core.deploy_info import get_deploy_info
 
 # TODO : add_event_handler for Checking Dbs Connections
 
@@ -47,6 +51,24 @@ def create_application() -> FastAPI:
     # Also serve unprefixed routes for clients that call "/chat/..." or "/files/..."
     if api_prefix:
         application.include_router(api_router, prefix="")
+
+    @application.on_event("startup")
+    async def log_startup_context():
+        deploy = get_deploy_info()
+        logger.info(
+            "Startup context: cwd=%s python=%s api_prefix=%s version=%s deploy=%s",
+            os.getcwd(),
+            sys.executable,
+            api_prefix,
+            settings.VERSION,
+            deploy,
+        )
+        logger.info(
+            "Provider key availability: groq=%s google=%s nvidia=%s",
+            bool(settings.GROQ_API_KEY),
+            bool(settings.GOOGLE_API_KEY),
+            bool(settings.NVIDIA_API_KEY),
+        )
 
     @application.get("/")
     async def root():

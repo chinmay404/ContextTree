@@ -3,6 +3,11 @@ name: CI/CD to EC2 via SSH
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: backend-ec2-production
+  cancel-in-progress: false
 
 jobs:
   test-build-deploy:
@@ -14,6 +19,7 @@ jobs:
 
     - name: Deploy to EC2
       run: |
+        set -euxo pipefail
         mkdir -p ~/.ssh
         echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/id_rsa
         chmod 600 ~/.ssh/id_rsa
@@ -22,7 +28,37 @@ jobs:
         ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
         echo "Syncing files..."
-        rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current
+        rsync -avz --delete \
+          --exclude '.git' \
+          --exclude '.github' \
+          --exclude 'venv' \
+          --exclude '__pycache__' \
+          --exclude '.env' \
+          --exclude 'app.log' \
+          ./ ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current/
 
-        echo "Restarting service..."
-        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "cd /opt/api-service/current && source venv/bin/activate && pip install -r requirements.txt && sudo systemctl restart api-service"
+        echo "Stamping deploy metadata..."
+        printf '%s\n' \
+          '{' \
+          "  \"sha\": \"${GITHUB_SHA}\"," \
+          "  \"deployed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," \
+          "  \"workflow\": \"${GITHUB_WORKFLOW}\"," \
+          "  \"run_id\": \"${GITHUB_RUN_ID}\"," \
+          "  \"actor\": \"${GITHUB_ACTOR}\"" \
+          '}' > DEPLOY_INFO.json
+        scp DEPLOY_INFO.json ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}:/opt/api-service/current/DEPLOY_INFO.json
+
+        echo "Installing dependencies, clearing app caches, and restarting service..."
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "\
+          cd /opt/api-service/current && \
+          venv/bin/pip install --upgrade -r requirements.txt && \
+          find app -type d -name '__pycache__' -prune -exec rm -rf {} + && \
+          sudo systemctl restart api-service && \
+          sleep 3 && \
+          systemctl is-active --quiet api-service"
+
+        echo "Smoke testing deployed API..."
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "\
+          curl -fsS http://127.0.0.1:8000/api/v1/health/ && \
+          printf '\n--- recent service log ---\n' && \
+          sudo journalctl -u api-service -n 40 --no-pager"

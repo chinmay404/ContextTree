@@ -122,6 +122,14 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
         chat_message.parent_thread_id,
         chat_message.fork_at_message_id,
     )
+    if messages_data:
+        logger.info(
+            "Fork source scope resolved: parent=%s fork_at=%s returned_messages=%s last_message=%s",
+            chat_message.parent_thread_id,
+            chat_message.fork_at_message_id,
+            len(messages_data),
+            messages_data[-1]["message_id"],
+        )
     if not messages_data:
         fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
         logger.warning("fork_at_message_id not found; falling back to last-K messages")
@@ -160,6 +168,14 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
                 new_summary_embedding = get_embedding(new_summary) or []
             except Exception as e:
                 logger.error(f"Fork summarisation failed: {e}")
+    logger.info(
+        "Fork initialisation payload: new_thread=%s parent=%s buffer_messages=%s summarized_messages=%s summary_chars=%s",
+        chat_message.conversation_id,
+        chat_message.parent_thread_id,
+        len(buffer_messages),
+        len(messages_to_summarize),
+        len(new_summary or ""),
+    )
 
     active_graph.mongo_store.fork_thread(
         user_id=chat_message.user_id,

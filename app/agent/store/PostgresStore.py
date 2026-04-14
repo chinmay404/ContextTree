@@ -344,6 +344,21 @@ class PostgresConversationStore:
         msgs = self.get_thread_messages(user_id, thread_id)
         ids = [m["message_id"] for m in msgs]
         resolved = self._resolve_message_id(message_id, ids)
+        if resolved and resolved != message_id:
+            logger.info(
+                "Resolved fork message id for thread %s: requested=%s resolved=%s total_candidates=%s",
+                thread_id,
+                message_id,
+                resolved,
+                len(ids),
+            )
+        if not resolved:
+            logger.warning(
+                "Could not resolve fork message id for thread %s: requested=%s total_candidates=%s",
+                thread_id,
+                message_id,
+                len(ids),
+            )
         scoped_summary = summary if resolved and ids and resolved == ids[-1] else ""
         target_msgs: List[dict] = []
         for m in msgs:
@@ -494,6 +509,19 @@ class PostgresConversationStore:
         """Insert copied buffer messages with fresh IDs (messages are independent in new branch)."""
         for msg in messages:
             emb = self._normalize_embedding(msg.get("embedding"))
+            content = msg.get("text", "") or msg.get("content", "")
+            if isinstance(content, (dict, list)):
+                try:
+                    content = json.dumps(content)
+                except Exception:
+                    content = str(content)
+            elif not isinstance(content, str):
+                content = str(content)
+
+            timestamp = msg.get("timestamp", now)
+            if not isinstance(timestamp, datetime):
+                timestamp = now
+
             cur.execute(
                 """
                 INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
@@ -503,9 +531,9 @@ class PostgresConversationStore:
                     str(uuid.uuid4()),
                     node_id,
                     msg.get("role"),
-                    msg.get("text", "") or msg.get("content", ""),
+                    content,
                     emb,
-                    msg.get("timestamp", now),
+                    timestamp,
                     user_email,
                 ),
             )
@@ -670,31 +698,48 @@ class PostgresConversationStore:
         if target_id in candidate_ids:
             return target_id
 
-        def normalize(mid: str) -> str:
-            for suffix in ("_assistant", "-assistant", "_ai", "_a", "-a", "_user", "-user", "_u", "-u"):
-                if mid.endswith(suffix):
-                    return mid[: -len(suffix)]
-            return mid
+        assistant_suffixes = ("_assistant", "-assistant", "_ai", "_a", "-a")
+        user_suffixes = ("_user", "-user", "_u", "-u")
 
-        def role_hint(mid: str) -> str:
-            if mid.endswith(("_assistant", "-assistant", "_ai", "_a", "-a")):
-                return "assistant"
-            if mid.endswith(("_user", "-user", "_u", "-u")):
-                return "user"
-            return "user"
+        def normalize_and_role(mid: str) -> Tuple[str, str]:
+            value = str(mid or "")
+            role = "user"
 
-        req_base = normalize(target_id)
-        req_role = role_hint(target_id)
+            changed = True
+            while changed and value:
+                changed = False
+                for suffix in assistant_suffixes:
+                    if value.endswith(suffix):
+                        if role == "user":
+                            role = "assistant"
+                        value = value[: -len(suffix)]
+                        changed = True
+                        break
+                if changed:
+                    continue
+                for suffix in user_suffixes:
+                    if value.endswith(suffix):
+                        value = value[: -len(suffix)]
+                        changed = True
+                        break
+
+            return value, role
+
+        req_base, req_role = normalize_and_role(target_id)
 
         for mid in candidate_ids:
             if not isinstance(mid, str):
                 continue
-            if normalize(mid) == req_base and role_hint(mid) == req_role:
+            cand_base, cand_role = normalize_and_role(mid)
+            if cand_base == req_base and cand_role == req_role:
                 return mid
 
         # Looser fallback
         for mid in candidate_ids:
-            if isinstance(mid, str) and normalize(mid) == req_base:
+            if not isinstance(mid, str):
+                continue
+            cand_base, _ = normalize_and_role(mid)
+            if cand_base == req_base:
                 return mid
 
         return None
