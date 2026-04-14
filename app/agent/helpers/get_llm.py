@@ -42,13 +42,13 @@ _GEMINI_ALIASES: dict[str, str] = {
 _NVIDIA_ALIASES: dict[str, str] = {
     "moonshotai/kimi-k2-instruct": "moonshotai/kimi-k2-instruct",
     "moonshotai/kimi-k2-instruct-0905": "moonshotai/kimi-k2-instruct-0905",
-    "z-ai/glm-4.7": "z-ai/glm4_7",
-    "z-ai/glm4.7": "z-ai/glm4_7",
-    "z-ai/glm4_7": "z-ai/glm4_7",
-    "deepseek-ai/deepseek-v3.1": "deepseek-ai/deepseek-v3_1",
-    "deepseek-ai/deepseek-v3_1": "deepseek-ai/deepseek-v3_1",
-    "deepseek-ai/deepseek-v3.2": "deepseek-ai/deepseek-v3_2",
-    "deepseek-ai/deepseek-v3_2": "deepseek-ai/deepseek-v3_2",
+    "z-ai/glm-4.7": "z-ai/glm4.7",
+    "z-ai/glm4.7": "z-ai/glm4.7",
+    "z-ai/glm4_7": "z-ai/glm4.7",
+    "deepseek-ai/deepseek-v3.1": "deepseek-ai/deepseek-v3.1",
+    "deepseek-ai/deepseek-v3_1": "deepseek-ai/deepseek-v3.1",
+    "deepseek-ai/deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
+    "deepseek-ai/deepseek-v3_2": "deepseek-ai/deepseek-v3.2",
     "mistralai/mistral-large-3-675b-instruct-2512": "mistralai/mistral-large-3-675b-instruct-2512",
 }
 
@@ -169,6 +169,16 @@ def get_nvidia_llm(model_name: str | None = None):
         return None
 
 
+def _fallback_to_groq_default(original_model_name: str | None, provider_name: str):
+    logger.warning(
+        "%s init failed for '%s', falling back to Groq default '%s'",
+        provider_name,
+        original_model_name,
+        _GROQ_DEFAULT,
+    )
+    return get_groq_llm(name=_GROQ_DEFAULT)
+
+
 def get_llm(model_name: str | None = None):
     """
     Unified LLM dispatcher.
@@ -178,18 +188,18 @@ def get_llm(model_name: str | None = None):
       - nvidia-hosted model ids → NVIDIA NIM
       - everything else        → Groq
 
-    Falls back to Groq default if Gemini init fails.
+    Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
     if _is_gemini(model_name):
         llm = get_gemini_llm(model_name)
         if llm is not None:
             return llm
-        logger.warning(f"Gemini init failed for '{model_name}', falling back to Groq default")
+        return _fallback_to_groq_default(model_name, "Gemini")
 
     if _is_nvidia(model_name):
         llm = get_nvidia_llm(model_name)
         if llm is not None:
             return llm
-        logger.warning(f"NVIDIA init failed for '{model_name}', falling back to Groq default")
+        return _fallback_to_groq_default(model_name, "NVIDIA")
 
     return get_groq_llm(name=model_name)

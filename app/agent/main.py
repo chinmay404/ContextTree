@@ -31,6 +31,30 @@ def _clip_text(value, max_chars: int) -> str:
     return f"{text[: max_chars - 1].rstrip()}…"
 
 
+def _normalized_message_id(message_id: str | None) -> str:
+    raw = str(message_id or "").strip()
+    for suffix in ("_assistant", "-assistant", "_ai", "_a", "-a", "_user", "-user", "_u", "-u"):
+        if raw.endswith(suffix):
+            return raw[: -len(suffix)]
+    return raw
+
+
+def _is_duplicate_hydrated_user_message(last_msg, msg_id: str | None) -> bool:
+    """
+    Only de-dupe exact replays of the same user message.
+
+    Older logic also matched by content / prefix, which could incorrectly treat
+    a legitimate new prompt as a retry. That was especially confusing around
+    branches where the hydrated buffer already contains recent parent history.
+    """
+    if not isinstance(last_msg, HumanMessage):
+        return False
+
+    last_id = _normalized_message_id(getattr(last_msg, "id", None))
+    incoming_id = _normalized_message_id(msg_id)
+    return bool(last_id and incoming_id and last_id == incoming_id)
+
+
 def _has_meaningful_embedding(embedding) -> bool:
     return bool(embedding) and any(abs(float(x)) > 1e-8 for x in embedding)
 
@@ -142,21 +166,10 @@ class getGraphResponse():
             is_duplicate = False
             if initial_messages:
                 last_msg = initial_messages[-1]
-                
-                # Check for ID match or exact content match
-                if last_msg.id == msg_id:
+
+                if _is_duplicate_hydrated_user_message(last_msg, msg_id):
                     is_duplicate = True
-                elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
-                    # Handle suffix differences (e.g. _u)
-                    if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
-                        is_duplicate = True
-                    if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
-                        is_duplicate = True
-                
-                # Content fallback check
-                if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
-                     is_duplicate = True
-                     
+
                 if is_duplicate:
                     logger.info(f"Duplicate message detected in hydration: {msg_id}. Using DB version.")
                     messages_input = initial_messages
@@ -265,14 +278,7 @@ class getGraphResponse():
         is_duplicate = False
         if initial_messages:
             last_msg = initial_messages[-1]
-            if last_msg.id == msg_id:
-                is_duplicate = True
-            elif isinstance(last_msg.id, str) and isinstance(msg_id, str):
-                if last_msg.id.startswith(msg_id) or msg_id.startswith(last_msg.id):
-                    is_duplicate = True
-                if last_msg.id.replace("_u", "") == msg_id.replace("_u", ""):
-                    is_duplicate = True
-            if not is_duplicate and isinstance(last_msg, HumanMessage) and last_msg.content == prompt:
+            if _is_duplicate_hydrated_user_message(last_msg, msg_id):
                 is_duplicate = True
             if is_duplicate:
                 logger.info(f"Duplicate message detected in stream hydration: {msg_id}.")
