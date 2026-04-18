@@ -3,6 +3,7 @@ from langchain_core.messages import AnyMessage
 from langgraph.graph.message import add_messages
 
 class State(TypedDict):
+    user_id: Optional[str]
     count: int
     thread_id: Optional[str]
     context: List[str]

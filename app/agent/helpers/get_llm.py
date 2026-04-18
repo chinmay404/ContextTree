@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
+from app.agent.helpers.byok import get_user_provider_api_key
 from app.core.logger import logger
 
 load_dotenv()
@@ -19,8 +20,12 @@ load_dotenv()
 # ── Groq defaults ──────────────────────────────────────────────────────────────
 _GROQ_DEFAULT = os.getenv("DEFAULT_GROQ_MODEL") or "openai/gpt-oss-120b"
 _GROQ_SENTINEL = {"None", "null", "default-model-name", "", None}
+_OPENAI_DEFAULT = os.getenv("DEFAULT_OPENAI_MODEL") or "gpt-5"
+_OPENAI_SENTINEL = {"None", "null", "default-model-name", "", None}
 _NVIDIA_DEFAULT = os.getenv("DEFAULT_NVIDIA_MODEL") or "moonshotai/kimi-k2-instruct-0905"
 _NVIDIA_SENTINEL = {"None", "null", "default-model-name", "", None}
+_ANTHROPIC_DEFAULT = os.getenv("DEFAULT_ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
+_ANTHROPIC_SENTINEL = {"None", "null", "default-model-name", "", None}
 
 # ── Gemini model aliases ───────────────────────────────────────────────────────
 # Google currently returns `models/<id>` names from the official models list.
@@ -37,6 +42,30 @@ _GEMINI_ALIASES: dict[str, str] = {
     "gemini-flash-latest": "models/gemini-flash-latest",
     "gemini-flash-lite-latest": "models/gemini-flash-lite-latest",
     "gemini-pro-latest": "models/gemini-pro-latest",
+}
+
+_OPENAI_ALIASES: dict[str, str] = {
+    "gpt-5": "gpt-5",
+    "gpt-5-mini": "gpt-5-mini",
+    "gpt-5.4": "gpt-5",
+    "gpt-5.4-mini": "gpt-5-mini",
+    "openai/gpt-5": "gpt-5",
+    "openai/gpt-5-mini": "gpt-5-mini",
+    "openai/gpt-5.4": "gpt-5",
+    "openai/gpt-5.4-mini": "gpt-5-mini",
+}
+
+_ANTHROPIC_ALIASES: dict[str, str] = {
+    "claude-sonnet-4-20250514": "claude-sonnet-4-20250514",
+    "claude-sonnet-4-0": "claude-sonnet-4-20250514",
+    "claude-sonnet-4-5": "claude-sonnet-4-20250514",
+    "anthropic/claude-sonnet-4-20250514": "claude-sonnet-4-20250514",
+    "anthropic/claude-sonnet-4-0": "claude-sonnet-4-20250514",
+    "anthropic/claude-sonnet-4-5": "claude-sonnet-4-20250514",
+    "claude-opus-4-1-20250805": "claude-opus-4-1-20250805",
+    "claude-opus-4-1": "claude-opus-4-1-20250805",
+    "anthropic/claude-opus-4-1-20250805": "claude-opus-4-1-20250805",
+    "anthropic/claude-opus-4-1": "claude-opus-4-1-20250805",
 }
 
 _NVIDIA_ALIASES: dict[str, str] = {
@@ -67,10 +96,33 @@ def _is_gemini(model_name: str | None) -> bool:
     return model_name.startswith("gemini/") or model_name.startswith("gemini-")
 
 
+def _is_openai_direct(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    return model_name.startswith("openai/") and not model_name.startswith("openai/gpt-oss")
+
+
+def _is_anthropic(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    return model_name.startswith("anthropic/")
+
+
 def _is_nvidia(model_name: str | None) -> bool:
     if not model_name:
         return False
     return model_name.startswith(_NVIDIA_PREFIXES)
+
+
+def _normalize_openai_model_name(model_name: str | None) -> str:
+    if model_name in _OPENAI_SENTINEL:
+        return _OPENAI_DEFAULT
+
+    bare = model_name or _OPENAI_DEFAULT
+    if bare.startswith("openai/"):
+        bare = bare[len("openai/"):]
+
+    return _OPENAI_ALIASES.get(model_name or bare, _OPENAI_ALIASES.get(bare, bare))
 
 
 def _normalize_gemini_model_name(model_name: str | None) -> str:
@@ -84,10 +136,42 @@ def _normalize_gemini_model_name(model_name: str | None) -> str:
     return resolved if resolved.startswith("models/") else f"models/{resolved}"
 
 
+def _normalize_anthropic_model_name(model_name: str | None) -> str:
+    if model_name in _ANTHROPIC_SENTINEL:
+        return _ANTHROPIC_DEFAULT
+    return _ANTHROPIC_ALIASES.get(model_name or _ANTHROPIC_DEFAULT, model_name or _ANTHROPIC_DEFAULT)
+
+
 def _normalize_nvidia_model_name(model_name: str | None) -> str:
     if model_name in _NVIDIA_SENTINEL:
         return _NVIDIA_DEFAULT
     return _NVIDIA_ALIASES.get(model_name or _NVIDIA_DEFAULT, model_name or _NVIDIA_DEFAULT)
+
+
+def _resolve_provider_key(
+    provider: str,
+    env_key_name: str,
+    user_id: str | None = None,
+):
+    env_key = os.getenv(env_key_name)
+    if env_key:
+        return env_key
+
+    return get_user_provider_api_key(user_id, provider)
+
+
+def validate_model_access(model_name: str | None, user_id: str | None = None) -> str | None:
+    if _is_openai_direct(model_name):
+        if _resolve_provider_key("openai", "OPENAI_API_KEY", user_id):
+            return None
+        return "Connect your OpenAI API key to use GPT models."
+
+    if _is_anthropic(model_name):
+        if _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id):
+            return None
+        return "Connect your Anthropic API key to use Claude models."
+
+    return None
 
 
 def get_gemini_llm(model_name: str | None = None):
@@ -120,6 +204,29 @@ def get_gemini_llm(model_name: str | None = None):
         return None
 
 
+def get_openai_llm(model_name: str | None = None, user_id: str | None = None):
+    resolved = _normalize_openai_model_name(model_name)
+    api_key = _resolve_provider_key("openai", "OPENAI_API_KEY", user_id)
+    if not api_key:
+        logger.error("No OpenAI credentials available for %s", resolved)
+        return None
+
+    try:
+        from langchain_openai import ChatOpenAI
+
+        llm = ChatOpenAI(
+            model=resolved,
+            api_key=api_key,
+            temperature=0.8,
+            max_retries=2,
+        )
+        logger.info("Initialised OpenAI LLM: %s", resolved)
+        return llm
+    except Exception as e:
+        logger.error(f"Failed to initialise OpenAI LLM ({resolved}): {e}")
+        return None
+
+
 def get_groq_llm(name: str | None = None):
     """Returns a ChatGroq instance, falling back to the default Groq model."""
     if name in _GROQ_SENTINEL:
@@ -140,6 +247,29 @@ def get_groq_llm(name: str | None = None):
         return llm
     except Exception as e:
         logger.error(f"Failed to initialise Groq LLM ({name}): {e}")
+        return None
+
+
+def get_anthropic_llm(model_name: str | None = None, user_id: str | None = None):
+    resolved = _normalize_anthropic_model_name(model_name)
+    api_key = _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id)
+    if not api_key:
+        logger.error("No Anthropic credentials available for %s", resolved)
+        return None
+
+    try:
+        from langchain_anthropic import ChatAnthropic
+
+        llm = ChatAnthropic(
+            model=resolved,
+            api_key=api_key,
+            temperature=0.8,
+            max_retries=2,
+        )
+        logger.info("Initialised Anthropic LLM: %s", resolved)
+        return llm
+    except Exception as e:
+        logger.error(f"Failed to initialise Anthropic LLM ({resolved}): {e}")
         return None
 
 
@@ -179,17 +309,31 @@ def _fallback_to_groq_default(original_model_name: str | None, provider_name: st
     return get_groq_llm(name=_GROQ_DEFAULT)
 
 
-def get_llm(model_name: str | None = None):
+def get_llm(model_name: str | None = None, user_id: str | None = None):
     """
     Unified LLM dispatcher.
 
     Routes:
+      - openai/* direct GPT ids  → OpenAI
+      - anthropic/* direct ids   → Anthropic
       - gemini/* or gemini-*  → Gemini
       - nvidia-hosted model ids → NVIDIA NIM
       - everything else        → Groq
 
     Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
+    if _is_openai_direct(model_name):
+        llm = get_openai_llm(model_name, user_id=user_id)
+        if llm is not None:
+            return llm
+        return None
+
+    if _is_anthropic(model_name):
+        llm = get_anthropic_llm(model_name, user_id=user_id)
+        if llm is not None:
+            return llm
+        return None
+
     if _is_gemini(model_name):
         llm = get_gemini_llm(model_name)
         if llm is not None:

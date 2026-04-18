@@ -33,6 +33,7 @@ psycopg-pool
 langchain_google_genai
 langchain_groq
 langchain-openai
+langchain-anthropic
 langchain
 pymongo
 slowapi
@@ -41,6 +42,7 @@ pyppeteer
 psycopg2-binary
 pgvector
 langgraph-checkpoint-redis
+cryptography
 
 
 

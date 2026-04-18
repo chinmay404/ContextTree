@@ -55,6 +55,18 @@ class AgentNodes:
     def __init__(self, mongo_store=None):
         self.mongo_store = mongo_store
 
+    def _resolve_state_user_id(self, state: State):
+        user_id = state.get("user_id")
+        if user_id:
+            return user_id
+
+        for msg in reversed(state.get("messages", [])):
+            metadata = getattr(msg, "metadata", None) or {}
+            if isinstance(metadata, dict) and metadata.get("user_id"):
+                return metadata.get("user_id")
+
+        return None
+
     def assistant(self, state: State) -> State:
         try:
             current_count = state.get("count", 0)
@@ -65,6 +77,7 @@ class AgentNodes:
             model = state.get("model", None)
             temperature = state.get("temperature", 0.9)
             history = state.get("messages", [])
+            user_id = self._resolve_state_user_id(state)
 
             template = load_prompt_from_yaml("SYSTEM_PROMPT")
             current_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -91,7 +104,7 @@ class AgentNodes:
 
             messages = [SystemMessage(content=system_content)] + history
 
-            llm = get_llm(model)
+            llm = get_llm(model, user_id=user_id)
             if llm is None:
                 raise RuntimeError("LLM initialization failed for model: " + str(model))
 
@@ -110,6 +123,7 @@ class AgentNodes:
             return {
                 "messages": [ai_response],
                 "count": current_count + 1,
+                "user_id": user_id,
                 "thread_id": thread_id,
                 "context": context,
                 "external_context": external_context,
@@ -136,7 +150,8 @@ class AgentNodes:
             from app.core.config import settings
             prompt = get_formated_summury_prompt(state["messages"], state["summary"])
             model = state.get("model")
-            llm = get_llm(model)
+            user_id = self._resolve_state_user_id(state)
+            llm = get_llm(model, user_id=user_id)
             if not llm:
                 logger.error("Summarization skipped: LLM init failed")
                 return {"messages": [], "summary": state.get("summary")}
@@ -147,12 +162,7 @@ class AgentNodes:
             if self.mongo_store:
                 thread_id = state.get("thread_id")
                 messages = state.get("messages", [])
-                user_id = None
-                for msg in reversed(messages):
-                    if hasattr(msg, "metadata") and msg.metadata:
-                        user_id = msg.metadata.get("user_id")
-                        if user_id:
-                            break
+                user_id = self._resolve_state_user_id(state)
 
                 if user_id and thread_id:
                     try:

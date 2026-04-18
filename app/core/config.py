@@ -29,13 +29,24 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = None
     DEFAULT_GROQ_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
+    # ── LLM: OpenAI direct / BYOK ─────────────────────────────────────────────
+    OPENAI_API_KEY: Optional[str] = None
+    DEFAULT_OPENAI_MODEL: str = "gpt-5"
+
     # ── LLM: Google Gemini ─────────────────────────────────────────────────────
     GOOGLE_API_KEY: Optional[str] = None
     DEFAULT_GEMINI_MODEL: str = "gemini/gemini-3-flash-preview"
 
+    # ── LLM: Anthropic direct / BYOK ──────────────────────────────────────────
+    ANTHROPIC_API_KEY: Optional[str] = None
+    DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
+
     # ── LLM: NVIDIA NIM ────────────────────────────────────────────────────────
     NVIDIA_API_KEY: Optional[str] = None
     DEFAULT_NVIDIA_MODEL: str = "moonshotai/kimi-k2-instruct-0905"
+
+    # ── Secure BYOK storage ────────────────────────────────────────────────────
+    BYOK_ENCRYPTION_SECRET: Optional[str] = None
 
     # ── Conversation memory ────────────────────────────────────────────────────
     # Trigger summarisation after this many assistant turns per node

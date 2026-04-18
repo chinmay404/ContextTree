@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
-from app.agent.helpers.get_llm import get_llm
+from app.agent.helpers.get_llm import get_llm, validate_model_access
 from app.agent.main import getGraphResponse
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
@@ -159,7 +159,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
             elif m["role"] in ("assistant", "ai"):
                 lc_messages.append(AIMessage(content=m["text"]))
 
-        llm = get_llm(chat_message.model_name)
+        llm = get_llm(chat_message.model_name, user_id=chat_message.user_id)
         if llm:
             try:
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
@@ -209,6 +209,10 @@ async def get_response(chat_message: ChatMessage, request: Request):
     request.state.user_id = chat_message.user_id or request.client.host
 
     try:
+        access_error = validate_model_access(chat_message.model_name, chat_message.user_id)
+        if access_error:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
+
         _init_fork_if_needed(chat_message, active_graph)
 
         config = {
@@ -258,6 +262,10 @@ async def stream_response(chat_message: ChatMessage, request: Request):
     request.state.user_id = chat_message.user_id or request.client.host
 
     try:
+        access_error = validate_model_access(chat_message.model_name, chat_message.user_id)
+        if access_error:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
+
         _init_fork_if_needed(chat_message, active_graph)
 
         config = {
