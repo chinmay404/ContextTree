@@ -3,6 +3,12 @@ from langgraph.graph import StateGraph, START, END
 from app.agent.state import State
 from app.agent.helpers.load_prompt import load_prompt_from_yaml
 from app.agent.helpers.get_llm import get_llm
+from app.agent.helpers.memory_model import get_summary_model_name
+from app.agent.memory import (
+    build_memory_context_block,
+    sanitize_chat_response_text,
+    sanitize_summary_text,
+)
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from langchain_core.messages import RemoveMessage
@@ -75,6 +81,7 @@ class AgentNodes:
             context = state.get("context", [])
             external_context = state.get("external_context", None)
             summary = state.get("summary", None)
+            memory_facts = state.get("memory_facts", {})
             model = state.get("model", None)
             temperature = state.get("temperature", 0.9)
             history = state.get("messages", [])
@@ -91,19 +98,20 @@ class AgentNodes:
 
             prompt_template = PromptTemplate.from_template(template)
             system_content = prompt_template.format(
-                summary=summary if summary else "None",
                 current_time=current_time,
                 user_query=user_query or "",
             )
+            memory_context = build_memory_context_block(
+                summary=sanitize_summary_text(summary),
+                memory_facts=memory_facts,
+                context=context,
+                external_context=external_context,
+            )
 
-            if context:
-                context_str = "\n".join(context) if isinstance(context, list) else str(context)
-                system_content += f"\n\n<RELEVANT_CONTEXT>\n{context_str}\n</RELEVANT_CONTEXT>"
-
-            if external_context:
-                system_content += f"\n\n<EXTERNAL_CONTEXT>\n{external_context}\n</EXTERNAL_CONTEXT>"
-
-            messages = [SystemMessage(content=system_content)] + history
+            messages = [
+                SystemMessage(content=system_content),
+                SystemMessage(content=memory_context),
+            ] + history
 
             llm = get_llm(model, user_id=user_id)
             if llm is None:
@@ -119,7 +127,7 @@ class AgentNodes:
                     tags=["chat-model"],
                 )
             ).invoke(input=messages)
-            normalized_content = _message_content_to_text(ai_response.content)
+            normalized_content = sanitize_chat_response_text(_message_content_to_text(ai_response.content))
             if normalized_content != ai_response.content:
                 ai_response = AIMessage(
                     content=normalized_content,
@@ -137,7 +145,8 @@ class AgentNodes:
                 "thread_id": thread_id,
                 "context": context,
                 "external_context": external_context,
-                "summary": summary,
+                "summary": sanitize_summary_text(summary),
+                "memory_facts": memory_facts,
                 "model": model,
                 "temperature": temperature,
             }
@@ -159,7 +168,7 @@ class AgentNodes:
         try:
             from app.core.config import settings
             prompt = get_formated_summury_prompt(state["messages"], state["summary"])
-            model = state.get("model")
+            model = get_summary_model_name(state.get("model"))
             user_id = self._resolve_state_user_id(state)
             llm = get_llm(model, user_id=user_id)
             if not llm:
@@ -176,7 +185,7 @@ class AgentNodes:
                     tags=["summary", "chat-model"],
                 )
             ).invoke(prompt)
-            new_summary = _message_content_to_text(summary_msg.content)
+            new_summary = sanitize_summary_text(_message_content_to_text(summary_msg.content))
 
             if self.mongo_store:
                 thread_id = state.get("thread_id")

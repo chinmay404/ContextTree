@@ -6,6 +6,7 @@ from app.agent.state import State
 from app.agent.prompts.prompt_formation import get_formated_prompt
 from langchain_core.messages import AIMessage, HumanMessage
 import json
+from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
@@ -22,6 +23,7 @@ MAX_RECENT_MESSAGE_CHARS = 1400
 MAX_SIMILAR_SNIPPET_CHARS = 320
 MAX_FILE_SNIPPET_CHARS = 900
 MAX_FILE_METADATA_CHARS = 220
+SIMILARITY_MIN_SCORE = max(0.0, float(getattr(settings, "SIMILARITY_MIN_SCORE", 0.2)))
 
 
 def _clip_text(value, max_chars: int) -> str:
@@ -146,6 +148,7 @@ class getGraphResponse():
 
             # Get existing summary from MongoDB for this thread
             existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+            existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
             context_snippets, external_context_str = self._build_retrieved_context(query, user_id, thread_id)
 
@@ -181,6 +184,7 @@ class getGraphResponse():
                         "thread_id": thread_id,
                         "messages": messages_input,
                         "summary": prompt_summary,
+                        "memory_facts": existing_memory_facts,
                         "context": context_snippets,
                         "external_context": external_context_str,
                         "model": config.get("configurable", {}).get("model"),
@@ -218,6 +222,16 @@ class getGraphResponse():
 
             if not is_duplicate:
                 try:
+                    updated_memory_facts = self._update_thread_memory_facts(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        previous_facts=existing_memory_facts,
+                        new_messages=[
+                            {"role": "user", "text": query},
+                            {"role": "assistant", "text": final_message},
+                        ],
+                    )
+
                     self.mongo_store.add_message(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -264,6 +278,7 @@ class getGraphResponse():
             initial_messages = self._hydrate_recent_messages(user_id, thread_id)
 
         existing_summary = self.mongo_store.get_thread_summary(user_id, thread_id)
+        existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
         prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
 
         prompt = get_formated_prompt(query, user_id)
@@ -291,13 +306,14 @@ class getGraphResponse():
             "thread_id": thread_id,
             "messages": messages_input,
             "summary": prompt_summary,
+            "memory_facts": existing_memory_facts,
             "context": context_snippets,
             "external_context": external_context_str,
             "model": config.get("configurable", {}).get("model"),
             "temperature": config.get("configurable", {}).get("temperature"),
         }
 
-        return graph_input, existing_summary, is_duplicate, query
+        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query
 
     def _hydrate_recent_messages(self, user_id: str, thread_id: str):
         recent_limit = max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6)))
@@ -326,6 +342,7 @@ class getGraphResponse():
                 thread_queries=thread_scope,
                 query_embeddings=query_embedding,
                 top_k=SIMILAR_CONTEXT_LIMIT,
+                min_score=SIMILARITY_MIN_SCORE,
             ) or []
             for idx, s in enumerate(sims):
                 score = s.get("score")
@@ -364,7 +381,7 @@ class getGraphResponse():
 
     async def get_stream_response(self, query: str, config: dict, user_id: str, thread_id: str, msg_id: str):
         try:
-            graph_input, existing_summary, is_duplicate, raw_query = self._prepare_stream_input(
+            graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
                 query, config, user_id, thread_id, msg_id
             )
 
@@ -405,6 +422,15 @@ class getGraphResponse():
             # Save messages to DB (both guarded by is_duplicate to prevent double-saves on retry)
             try:
                 if not is_duplicate:
+                    updated_memory_facts = self._update_thread_memory_facts(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        previous_facts=existing_memory_facts,
+                        new_messages=[
+                            {"role": "user", "text": raw_query},
+                            {"role": "assistant", "text": full_response},
+                        ],
+                    )
                     self.mongo_store.add_message(
                         user_id=user_id, thread_id=thread_id,
                         role="user", text=raw_query, message_id=msg_id,
@@ -431,3 +457,15 @@ class getGraphResponse():
         except Exception as e:
             logger.error(f"get_stream_response : {repr(e)}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    def _update_thread_memory_facts(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        previous_facts: dict | None,
+        new_messages: list[dict],
+    ) -> dict:
+        updated_memory_facts = extract_memory_facts(previous_facts, new_messages)
+        self.mongo_store.update_thread_memory_facts(user_id, thread_id, updated_memory_facts)
+        return updated_memory_facts

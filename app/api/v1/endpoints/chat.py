@@ -16,7 +16,9 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
 from app.agent.helpers.get_llm import get_llm, validate_model_access
+from app.agent.helpers.memory_model import get_summary_model_name
 from app.agent.main import getGraphResponse
+from app.agent.memory import extract_memory_facts, sanitize_summary_text
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
 from app.api.limiter import limiter
@@ -138,17 +140,21 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     if not should_init:
         return
 
-    # ── Gather parent history up to the fork point ────────────────────────────
-    existing_summary, messages_data = active_graph.mongo_store.get_messages_until(
-        chat_message.user_id,
-        chat_message.parent_thread_id,
-        chat_message.fork_at_message_id,
+    fork_source = active_graph.mongo_store.get_fork_inheritance_payload(
+        user_id=chat_message.user_id,
+        thread_id=chat_message.parent_thread_id,
+        message_id=chat_message.fork_at_message_id,
+        recent_limit=max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6))),
     )
+    existing_summary = sanitize_summary_text(fork_source.get("summary"))
+    parent_memory_facts = fork_source.get("memory_facts") or {}
+    messages_data = fork_source.get("messages") or []
     if messages_data:
         logger.info(
-            "Fork source scope resolved: parent=%s fork_at=%s returned_messages=%s last_message=%s",
+            "Fork source scope resolved: parent=%s fork_at=%s mode=%s returned_messages=%s last_message=%s",
             chat_message.parent_thread_id,
             chat_message.fork_at_message_id,
+            fork_source.get("mode"),
             len(messages_data),
             messages_data[-1]["message_id"],
         )
@@ -171,9 +177,10 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         buffer_messages = messages_data[-buffer_size:]
 
     new_summary = existing_summary
+    new_memory_facts = parent_memory_facts if fork_source.get("skip_resummarize") else extract_memory_facts({}, messages_data)
     new_summary_embedding = []
 
-    if messages_to_summarize:
+    if messages_to_summarize and not fork_source.get("skip_resummarize"):
         lc_messages = []
         for m in messages_to_summarize:
             if m["role"] == "user":
@@ -181,7 +188,8 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
             elif m["role"] in ("assistant", "ai"):
                 lc_messages.append(AIMessage(content=m["text"]))
 
-        llm = get_llm(chat_message.model_name, user_id=chat_message.user_id)
+        summary_model = get_summary_model_name(chat_message.model_name)
+        llm = get_llm(summary_model, user_id=chat_message.user_id)
         if llm:
             try:
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
@@ -191,7 +199,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
                         conversation_id=chat_message.conversation_id,
                         user_id=chat_message.user_id,
                         message_id=chat_message.message_id,
-                        model_name=chat_message.model_name,
+                        model_name=summary_model,
                         transport=transport,
                         node_name="fork-init",
                         parent_thread_id=chat_message.parent_thread_id,
@@ -199,14 +207,15 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
                         tags=["summary"],
                     )
                 ).invoke(prompt)
-                new_summary = summary_response.content
+                new_summary = sanitize_summary_text(summary_response.content)
                 new_summary_embedding = get_embedding(new_summary) or []
             except Exception as e:
                 logger.error(f"Fork summarisation failed: {e}")
     logger.info(
-        "Fork initialisation payload: new_thread=%s parent=%s buffer_messages=%s summarized_messages=%s summary_chars=%s",
+        "Fork initialisation payload: new_thread=%s parent=%s mode=%s buffer_messages=%s summarized_messages=%s summary_chars=%s",
         chat_message.conversation_id,
         chat_message.parent_thread_id,
+        fork_source.get("mode"),
         len(buffer_messages),
         len(messages_to_summarize),
         len(new_summary or ""),
@@ -220,6 +229,11 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         summary=new_summary,
         summary_embedding=new_summary_embedding,
         initial_messages=buffer_messages,
+    )
+    active_graph.mongo_store.update_thread_memory_facts(
+        chat_message.user_id,
+        chat_message.conversation_id,
+        new_memory_facts,
     )
     logger.info(
         f"Fork initialised: {chat_message.parent_thread_id} → {chat_message.conversation_id} "

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # ── LLM: NVIDIA NIM ────────────────────────────────────────────────────────
     NVIDIA_API_KEY: Optional[str] = None
     DEFAULT_NVIDIA_MODEL: str = "moonshotai/kimi-k2-instruct-0905"
+    SUMMARY_MODEL_NAME: str = "openai/gpt-oss-120b"
 
     # ── Observability: LangSmith ──────────────────────────────────────────────
     LANGSMITH_TRACING: bool = False
@@ -69,6 +70,8 @@ class Settings(BaseSettings):
     MAX_PREVIOUS_MESSAGES_TOKENS: int = 2000
     # Token budget kept free for the LLM's own response
     RESERVE_TOKENS: int = 1000
+    # Minimum semantic similarity score for message-to-message retrieval.
+    SIMILARITY_MIN_SCORE: float = 0.2
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod

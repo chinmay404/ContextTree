@@ -17,7 +17,7 @@ import os
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import psycopg2
@@ -213,6 +213,16 @@ class PostgresConversationStore:
         except Exception:
             return 0
 
+    def get_thread_created_at(self, thread_id: str) -> Optional[datetime]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT created_at FROM nodes WHERE id = %s", (thread_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
     def get_message_by_id(self, message_id: str) -> Optional[dict]:
         try:
             with self._get_conn() as conn:
@@ -287,6 +297,113 @@ class PostgresConversationStore:
                 return cur.rowcount > 0
         except Exception:
             return False
+
+    def get_thread_memory_facts(self, user_id: str, thread_id: str) -> dict[str, Any]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute("SELECT data FROM nodes WHERE id = %s", (thread_id,))
+                row = cur.fetchone()
+                data = row["data"] if row else {}
+                if not isinstance(data, dict):
+                    return {}
+                if isinstance(data.get("memoryFacts"), dict):
+                    return data.get("memoryFacts") or {}
+                nested = data.get("data")
+                if isinstance(nested, dict) and isinstance(nested.get("memoryFacts"), dict):
+                    return nested.get("memoryFacts") or {}
+                return {}
+        except Exception:
+            return {}
+
+    def update_thread_memory_facts(self, user_id: str, thread_id: str, memory_facts: dict[str, Any]) -> bool:
+        try:
+            payload = json.dumps(memory_facts or {})
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE nodes
+                    SET data = jsonb_set(
+                                jsonb_set(coalesce(data, '{}'::jsonb),
+                                    '{memoryFacts}', %s::jsonb, true),
+                                '{data,memoryFacts}', %s::jsonb, true)
+                    WHERE id = %s
+                    """,
+                    (payload, payload, thread_id),
+                )
+                return cur.rowcount > 0
+        except Exception:
+            return False
+
+    def get_fork_inheritance_payload(
+        self,
+        user_id: str,
+        thread_id: str,
+        message_id: str,
+        recent_limit: int,
+    ) -> dict[str, Any]:
+        summary = self.get_thread_summary(user_id, thread_id)
+        memory_facts = self.get_thread_memory_facts(user_id, thread_id)
+        msgs = self.get_thread_messages(user_id, thread_id)
+        ids = [m["message_id"] for m in msgs]
+        resolved = self._resolve_message_id(message_id, ids)
+        if resolved and resolved != message_id:
+            logger.info(
+                "Resolved fork message id for thread %s: requested=%s resolved=%s total_candidates=%s",
+                thread_id,
+                message_id,
+                resolved,
+                len(ids),
+            )
+
+        if not resolved:
+            logger.warning(
+                "Could not resolve fork message id for thread %s: requested=%s total_candidates=%s",
+                thread_id,
+                message_id,
+                len(ids),
+            )
+            return {
+                "summary": summary,
+                "memory_facts": memory_facts,
+                "messages": self.get_thread_recent_messages(user_id, thread_id, recent_limit),
+                "mode": "latest-parent-state-fallback",
+                "resolved_message_id": None,
+                "skip_resummarize": True,
+            }
+
+        target_message = next((message for message in msgs if message["message_id"] == resolved), None)
+        created_at = self.get_thread_created_at(thread_id)
+        target_timestamp = target_message.get("timestamp") if isinstance(target_message, dict) else None
+        is_inherited_buffer_message = bool(
+            created_at and target_timestamp and isinstance(target_timestamp, datetime) and target_timestamp < created_at
+        )
+        if is_inherited_buffer_message:
+            return {
+                "summary": summary,
+                "memory_facts": memory_facts,
+                "messages": self.get_thread_recent_messages(user_id, thread_id, recent_limit),
+                "mode": "latest-parent-state-from-buffer",
+                "resolved_message_id": resolved,
+                "skip_resummarize": True,
+            }
+
+        scoped_summary = summary if ids and resolved == ids[-1] else ""
+        target_msgs: List[dict] = []
+        for message in msgs:
+            target_msgs.append(message)
+            if message["message_id"] == resolved:
+                break
+
+        return {
+            "summary": scoped_summary,
+            "memory_facts": memory_facts if ids and resolved == ids[-1] else {},
+            "messages": target_msgs,
+            "mode": "scoped-fork-point",
+            "resolved_message_id": resolved,
+            "skip_resummarize": False,
+        }
 
     # ── Thread / ancestry ──────────────────────────────────────────────────────
 
@@ -375,6 +492,7 @@ class PostgresConversationStore:
         thread_queries: List[Tuple[str, Optional[str]]],
         query_embeddings: List[float],
         top_k: int = 3,
+        min_score: float = 0.0,
     ) -> List[dict]:
         """
         Vector similarity search scoped to the given thread ancestry.
@@ -401,6 +519,7 @@ class PostgresConversationStore:
 
                     if not allowed_ids:
                         return []
+                    allowed_ids = list(dict.fromkeys(allowed_ids))
 
                 if is_global:
                     user_email = self._resolve_user_email(cur, user_id)
@@ -410,10 +529,12 @@ class PostgresConversationStore:
                                (1 - (embedding <=> %s::vector)) as score
                         FROM messages
                         WHERE user_email = %s
+                          AND embedding IS NOT NULL
+                          AND (1 - (embedding <=> %s::vector)) >= %s
                         ORDER BY embedding <=> %s::vector
                         LIMIT %s
                         """,
-                        (query_embeddings, user_email, query_embeddings, top_k),
+                        (query_embeddings, user_email, query_embeddings, min_score, query_embeddings, top_k),
                     )
                 else:
                     # Use = ANY(%s::text[]) — correct for any list size
@@ -423,10 +544,12 @@ class PostgresConversationStore:
                                (1 - (embedding <=> %s::vector)) as score
                         FROM messages
                         WHERE id = ANY(%s::text[])
+                          AND embedding IS NOT NULL
+                          AND (1 - (embedding <=> %s::vector)) >= %s
                         ORDER BY embedding <=> %s::vector
                         LIMIT %s
                         """,
-                        (query_embeddings, allowed_ids, query_embeddings, top_k),
+                        (query_embeddings, allowed_ids, query_embeddings, min_score, query_embeddings, top_k),
                     )
 
                 return [dict(r) for r in cur.fetchall()]
