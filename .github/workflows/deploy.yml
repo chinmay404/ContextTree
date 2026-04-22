@@ -54,11 +54,18 @@ jobs:
           venv/bin/pip install --upgrade -r requirements.txt && \
           find app -type d -name '__pycache__' -prune -exec rm -rf {} + && \
           sudo systemctl restart api-service && \
-          sleep 3 && \
           systemctl is-active --quiet api-service"
 
         echo "Smoke testing deployed API..."
         ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} "\
-          curl -fsS http://127.0.0.1:8000/api/v1/health/ && \
+          for attempt in \$(seq 1 15); do \
+            if curl -fsS http://127.0.0.1:8000/api/v1/health/; then \
+              printf '\n--- recent service log ---\n' && \
+              sudo journalctl -u api-service -n 40 --no-pager; \
+              exit 0; \
+            fi; \
+            sleep 2; \
+          done; \
           printf '\n--- recent service log ---\n' && \
-          sudo journalctl -u api-service -n 40 --no-pager"
+          sudo journalctl -u api-service -n 80 --no-pager && \
+          exit 1"
