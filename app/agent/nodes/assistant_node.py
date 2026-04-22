@@ -10,6 +10,7 @@ from langchain_core.prompts import PromptTemplate
 from datetime import datetime
 
 from app.core.logger import logger
+from app.core.observability import build_langsmith_trace_config
 
 
 def _message_content_to_text(content) -> str:
@@ -108,7 +109,16 @@ class AgentNodes:
             if llm is None:
                 raise RuntimeError("LLM initialization failed for model: " + str(model))
 
-            ai_response: AIMessage = llm.invoke(input=messages)
+            ai_response: AIMessage = llm.with_config(
+                build_langsmith_trace_config(
+                    run_name="contexttree_assistant_llm",
+                    conversation_id=thread_id,
+                    user_id=user_id,
+                    model_name=model,
+                    node_name="assistant",
+                    tags=["chat-model"],
+                )
+            ).invoke(input=messages)
             normalized_content = _message_content_to_text(ai_response.content)
             if normalized_content != ai_response.content:
                 ai_response = AIMessage(
@@ -156,7 +166,16 @@ class AgentNodes:
                 logger.error("Summarization skipped: LLM init failed")
                 return {"messages": [], "summary": state.get("summary")}
 
-            summary_msg = llm.invoke(prompt)
+            summary_msg = llm.with_config(
+                build_langsmith_trace_config(
+                    run_name="contexttree_summary_llm",
+                    conversation_id=state.get("thread_id"),
+                    user_id=user_id,
+                    model_name=model,
+                    node_name="summary",
+                    tags=["summary", "chat-model"],
+                )
+            ).invoke(prompt)
             new_summary = _message_content_to_text(summary_msg.content)
 
             if self.mongo_store:
