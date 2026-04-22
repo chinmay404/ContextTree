@@ -69,6 +69,13 @@ def create_application() -> FastAPI:
             bool(settings.GOOGLE_API_KEY),
             bool(settings.NVIDIA_API_KEY),
         )
+        logger.info(
+            "LangSmith tracing: enabled=%s project=%s endpoint=%s api_key_configured=%s",
+            settings.LANGSMITH_TRACING,
+            settings.LANGSMITH_PROJECT or "default",
+            settings.LANGSMITH_ENDPOINT or "https://api.smith.langchain.com",
+            bool(settings.LANGSMITH_API_KEY),
+        )
 
     @application.get("/")
     async def root():

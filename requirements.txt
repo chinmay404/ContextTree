@@ -34,6 +34,7 @@ langchain_google_genai
 langchain_groq
 langchain-openai
 langchain-anthropic
+langsmith
 langchain
 pymongo
 slowapi

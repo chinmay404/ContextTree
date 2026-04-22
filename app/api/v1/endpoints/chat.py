@@ -22,6 +22,7 @@ from app.agent.utils.embeddings import get_embedding
 from app.api.limiter import limiter
 from app.core.config import settings
 from app.core.logger import logger
+from app.core.observability import build_langsmith_trace_config
 from app.schemas.item import ChatMessage
 
 router = APIRouter()
@@ -30,6 +31,27 @@ router = APIRouter()
 graph = None
 graph_init = False
 graph_error = None
+
+
+def _build_chat_run_config(chat_message: ChatMessage, transport: str) -> dict:
+    return {
+        **build_langsmith_trace_config(
+            run_name=f"contexttree_chat_{transport}",
+            conversation_id=chat_message.conversation_id,
+            user_id=chat_message.user_id,
+            message_id=chat_message.message_id,
+            model_name=chat_message.model_name,
+            transport=transport,
+            parent_thread_id=chat_message.parent_thread_id,
+            fork_at_message_id=chat_message.fork_at_message_id,
+            tags=["chat"],
+        ),
+        "configurable": {
+            "model": chat_message.model_name,
+            "temperature": chat_message.temperature,
+            "thread_id": chat_message.conversation_id,
+        },
+    }
 
 
 def _initialise_graph(force: bool = False) -> bool:
@@ -91,7 +113,7 @@ def _user_key(request: Request) -> str:
 
 # ── Fork initialisation (shared between sync and stream routes) ───────────────
 
-def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
+def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str) -> None:
     """
     On the first message of a branched node, seed the new thread with a
     compressed summary + a small verbatim buffer from the parent.
@@ -163,7 +185,20 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph) -> None:
         if llm:
             try:
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
-                summary_response = llm.invoke(prompt)
+                summary_response = llm.with_config(
+                    build_langsmith_trace_config(
+                        run_name="contexttree_fork_initial_summary",
+                        conversation_id=chat_message.conversation_id,
+                        user_id=chat_message.user_id,
+                        message_id=chat_message.message_id,
+                        model_name=chat_message.model_name,
+                        transport=transport,
+                        node_name="fork-init",
+                        parent_thread_id=chat_message.parent_thread_id,
+                        fork_at_message_id=chat_message.fork_at_message_id,
+                        tags=["summary"],
+                    )
+                ).invoke(prompt)
                 new_summary = summary_response.content
                 new_summary_embedding = get_embedding(new_summary) or []
             except Exception as e:
@@ -213,15 +248,9 @@ async def get_response(chat_message: ChatMessage, request: Request):
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph)
+        _init_fork_if_needed(chat_message, active_graph, "http")
 
-        config = {
-            "configurable": {
-                "model": chat_message.model_name,
-                "temperature": chat_message.temperature,
-                "thread_id": chat_message.conversation_id,
-            }
-        }
+        config = _build_chat_run_config(chat_message, "http")
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         res = active_graph.get_response(
@@ -266,15 +295,9 @@ async def stream_response(chat_message: ChatMessage, request: Request):
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph)
+        _init_fork_if_needed(chat_message, active_graph, "sse")
 
-        config = {
-            "configurable": {
-                "model": chat_message.model_name,
-                "temperature": chat_message.temperature,
-                "thread_id": chat_message.conversation_id,
-            }
-        }
+        config = _build_chat_run_config(chat_message, "sse")
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         return StreamingResponse(

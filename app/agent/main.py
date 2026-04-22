@@ -178,6 +178,7 @@ class getGraphResponse():
                 result = self.graph.invoke(
                     {
                         "user_id": user_id,
+                        "thread_id": thread_id,
                         "messages": messages_input,
                         "summary": prompt_summary,
                         "context": context_snippets,
@@ -287,6 +288,7 @@ class getGraphResponse():
 
         graph_input = {
             "user_id": user_id,
+            "thread_id": thread_id,
             "messages": messages_input,
             "summary": prompt_summary,
             "context": context_snippets,

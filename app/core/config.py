@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     NVIDIA_API_KEY: Optional[str] = None
     DEFAULT_NVIDIA_MODEL: str = "moonshotai/kimi-k2-instruct-0905"
 
+    # ── Observability: LangSmith ──────────────────────────────────────────────
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_ENDPOINT: Optional[str] = None
+    LANGSMITH_API_KEY: Optional[str] = None
+    LANGSMITH_PROJECT: Optional[str] = None
+
     # ── Secure BYOK storage ────────────────────────────────────────────────────
     BYOK_ENCRYPTION_SECRET: Optional[str] = None
 
