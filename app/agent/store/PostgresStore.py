@@ -203,6 +203,32 @@ class PostgresConversationStore:
             logger.error(f"Error getting recent thread messages: {e}")
             return []
 
+    def get_max_position_for_messages(self, thread_id: str, message_ids: List[str]) -> int:
+        """
+        Return the largest `position` among the given message ids on this
+        thread. Used by the summarizer to advance the watermark to the highest
+        position actually summarized — not just the index in LangGraph state,
+        which can drift from the DB.
+        """
+        if not message_ids:
+            return 0
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT COALESCE(MAX(position), 0)
+                    FROM messages
+                    WHERE node_id = %s AND id = ANY(%s::text[])
+                    """,
+                    (thread_id, list(message_ids)),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception as e:
+            logger.error(f"Error computing max position for messages: {e}")
+            return 0
+
     def get_thread_message_count(self, thread_id: str) -> int:
         try:
             with self._get_conn() as conn:
@@ -289,14 +315,87 @@ class PostgresConversationStore:
         except Exception:
             return ""
 
-    def update_thread_summary(self, user_id: str, thread_id: str, summary: str) -> bool:
+    def update_thread_summary(
+        self,
+        user_id: str,
+        thread_id: str,
+        summary: str,
+        summarized_up_to_position: Optional[int] = None,
+    ) -> bool:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("UPDATE nodes SET summary = %s WHERE id = %s", (summary, thread_id))
+                if summarized_up_to_position is None:
+                    cur.execute(
+                        "UPDATE nodes SET summary = %s WHERE id = %s",
+                        (summary, thread_id),
+                    )
+                else:
+                    # Watermark monotonically advances: never move it backwards even
+                    # if a stale summarize call arrives out of order.
+                    cur.execute(
+                        """
+                        UPDATE nodes
+                        SET summary = %s,
+                            summarized_up_to_position = GREATEST(summarized_up_to_position, %s)
+                        WHERE id = %s
+                        """,
+                        (summary, int(summarized_up_to_position), thread_id),
+                    )
                 return cur.rowcount > 0
         except Exception:
             return False
+
+    def get_thread_summary_state(self, user_id: str, thread_id: str) -> dict:
+        """Single-trip read of the bits hydration needs: summary text + watermark."""
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT summary, summarized_up_to_position FROM nodes WHERE id = %s",
+                    (thread_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"summary": "", "summarized_up_to_position": 0}
+                return {
+                    "summary": row[0] or "",
+                    "summarized_up_to_position": int(row[1] or 0),
+                }
+        except Exception:
+            return {"summary": "", "summarized_up_to_position": 0}
+
+    def get_thread_messages_after(
+        self,
+        user_id: str,
+        thread_id: str,
+        after_position: int,
+        limit: int,
+    ) -> List[dict]:
+        """
+        Return the most recent `limit` messages whose `position` is strictly
+        greater than `after_position`. Used to hydrate LangGraph state with only
+        the un-summarized tail of the conversation. Messages at or below the
+        watermark stay in the DB (the UI still needs them) but are not loaded
+        back into runtime state — their content lives in nodes.summary.
+        """
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    FROM messages
+                    WHERE node_id = %s AND position > %s
+                    ORDER BY timestamp DESC, position DESC
+                    LIMIT %s
+                    """,
+                    (thread_id, int(after_position or 0), limit),
+                )
+                return list(reversed([dict(r) for r in cur.fetchall()]))
+        except Exception as e:
+            logger.error(f"Error getting messages after position {after_position}: {e}")
+            return []
 
     def get_thread_memory_facts(self, user_id: str, thread_id: str) -> dict[str, Any]:
         try:
@@ -423,27 +522,54 @@ class PostgresConversationStore:
         The current thread has no limit. Each ancestor is scoped by the child
         node's forked_from_message_id so retrieval cannot see messages that were
         added to the parent after the branch was created.
+
+        Uses the materialized `ancestor_ids` column populated at fork time, so
+        this is a fixed two-query operation regardless of tree depth — no
+        recursive parent_node_id walk.
         """
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
-                ancestry: List[Tuple[str, Optional[str]]] = []
-                visited: set = set()
-                curr = thread_id
-                limit_message_id: Optional[str] = None
 
-                while curr and curr not in visited:
-                    visited.add(curr)
-                    ancestry.append((curr, limit_message_id))
-                    cur.execute(
-                        "SELECT parent_node_id, forked_from_message_id FROM nodes WHERE id = %s",
-                        (curr,),
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        break
-                    limit_message_id = row["forked_from_message_id"] or None
-                    curr = row["parent_node_id"] or None
+                cur.execute(
+                    "SELECT ancestor_ids FROM nodes WHERE id = %s",
+                    (thread_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return [(thread_id, None)]
+
+                ancestor_ids = list(row["ancestor_ids"] or [])
+                # Order in `ancestor_ids` is root → ... → immediate-parent.
+                # Caller expects current → root, so reverse and prepend self.
+                if not ancestor_ids:
+                    return [(thread_id, None)]
+
+                cur.execute(
+                    "SELECT id, forked_from_message_id FROM nodes WHERE id = ANY(%s::text[])",
+                    (ancestor_ids,),
+                )
+                fork_points = {r["id"]: r["forked_from_message_id"] for r in cur.fetchall()}
+
+                # Build (node, limit_msg_id) pairs current → root.
+                # `limit_message_id` for ancestor X is the fork point of X's
+                # immediate child on this lineage — i.e. the next node walking
+                # toward `thread_id`.
+                lineage = list(reversed(ancestor_ids)) + []  # immediate-parent → root
+                ancestry: List[Tuple[str, Optional[str]]] = [(thread_id, None)]
+                # Limit on the immediate parent is the fork point recorded on
+                # `thread_id` itself (already represents "where we branched off
+                # the parent").
+                cur.execute(
+                    "SELECT forked_from_message_id FROM nodes WHERE id = %s",
+                    (thread_id,),
+                )
+                self_row = cur.fetchone()
+                child_fork_point: Optional[str] = self_row["forked_from_message_id"] if self_row else None
+
+                for ancestor_id in lineage:
+                    ancestry.append((ancestor_id, child_fork_point))
+                    child_fork_point = fork_points.get(ancestor_id) or None
 
                 return ancestry
         except Exception as e:
@@ -568,59 +694,106 @@ class PostgresConversationStore:
         summary: str = None,
         summary_embedding: List[float] = None,
         initial_messages: List[dict] = [],
+        memory_facts: Optional[dict] = None,
     ) -> bool:
+        """
+        Atomically initialize a forked node.
+
+        All writes happen under a transaction-scoped advisory lock keyed on
+        `new_thread_id`, so concurrent first-message requests for the same fork
+        serialize and the second one observes `is_initialized=true` and exits
+        without redoing the work.
+
+        Memory facts are written here (not in a separate trip) so the whole
+        fork init is one atomic unit — we never end up with a node row that
+        has buffer messages but no facts, or vice versa.
+        """
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
                 now = datetime.utcnow()
                 user_email = self._resolve_user_email(cur, user_id)
 
+                # Serialize concurrent forks for the same target thread.
                 cur.execute(
-                    "SELECT canvas_id FROM nodes WHERE id = %s", (source_thread_id,)
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (new_thread_id,),
+                )
+
+                # Idempotency: if another request already finished this fork,
+                # bail out without touching anything.
+                cur.execute(
+                    "SELECT is_initialized FROM nodes WHERE id = %s",
+                    (new_thread_id,),
+                )
+                existing = cur.fetchone()
+                if existing and bool(existing[0]):
+                    logger.info(
+                        "fork_thread: %s already initialized; skipping redo",
+                        new_thread_id,
+                    )
+                    return True
+
+                cur.execute(
+                    "SELECT canvas_id, ancestor_ids FROM nodes WHERE id = %s",
+                    (source_thread_id,),
                 )
                 source = cur.fetchone()
                 if not source:
                     return False
                 canvas_id = source[0]
-
-                cur.execute("SELECT id FROM nodes WHERE id = %s", (new_thread_id,))
-                child_exists = cur.fetchone() is not None
-
-                if child_exists:
-                    if summary is not None:
-                        se = self._normalize_embedding(summary_embedding)
-                        if se:
-                            cur.execute(
-                                "UPDATE nodes SET summary = %s, summary_embedding = %s WHERE id = %s",
-                                (summary, se, new_thread_id),
-                            )
-                        else:
-                            cur.execute(
-                                "UPDATE nodes SET summary = %s WHERE id = %s",
-                                (summary, new_thread_id),
-                            )
-
-                    cur.execute(
-                        "SELECT COUNT(*) FROM messages WHERE node_id = %s", (new_thread_id,)
-                    )
-                    count = int((cur.fetchone() or [0])[0])
-                    if initial_messages and count <= 1:
-                        self._insert_buffer_messages(cur, new_thread_id, user_email, initial_messages, now)
-                    return True
+                parent_ancestors = list(source[1] or [])
+                child_ancestors = parent_ancestors + [source_thread_id]
 
                 se = self._normalize_embedding(summary_embedding)
-                cur.execute(
-                    """
-                    INSERT INTO nodes (
-                        id, canvas_id, user_email, parent_node_id,
-                        forked_from_message_id, summary, summary_embedding, created_at, is_primary
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        new_thread_id, canvas_id, user_email, source_thread_id,
-                        fork_at_message_id, summary, se, now, False,
-                    ),
-                )
+                facts_payload = json.dumps(memory_facts or {})
+
+                if existing:
+                    # Row exists but is_initialized=false (a previous attempt
+                    # crashed before completing). Take it over.
+                    cur.execute(
+                        """
+                        UPDATE nodes SET
+                            canvas_id = %s,
+                            user_email = %s,
+                            parent_node_id = %s,
+                            forked_from_message_id = %s,
+                            summary = %s,
+                            summary_embedding = %s,
+                            ancestor_ids = %s,
+                            is_initialized = true,
+                            data = jsonb_set(
+                                jsonb_set(coalesce(data, '{}'::jsonb),
+                                    '{memoryFacts}', %s::jsonb, true),
+                                '{data,memoryFacts}', %s::jsonb, true)
+                        WHERE id = %s
+                        """,
+                        (
+                            canvas_id, user_email, source_thread_id, fork_at_message_id,
+                            summary, se, child_ancestors,
+                            facts_payload, facts_payload,
+                            new_thread_id,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO nodes (
+                            id, canvas_id, user_email, parent_node_id,
+                            forked_from_message_id, summary, summary_embedding,
+                            ancestor_ids, is_initialized, created_at, is_primary,
+                            data
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, true, %s, false,
+                                  jsonb_build_object('memoryFacts', %s::jsonb,
+                                                     'data', jsonb_build_object('memoryFacts', %s::jsonb)))
+                        """,
+                        (
+                            new_thread_id, canvas_id, user_email, source_thread_id,
+                            fork_at_message_id, summary, se, child_ancestors, now,
+                            facts_payload, facts_payload,
+                        ),
+                    )
+
                 if initial_messages:
                     self._insert_buffer_messages(cur, new_thread_id, user_email, initial_messages, now)
                 return True
@@ -705,42 +878,76 @@ class PostgresConversationStore:
             )
 
     def get_related_file_context(
-        self, node_id: str, query_embedding: List[float], limit: int = 5
+        self,
+        node_id: str,
+        query_embedding: List[float],
+        limit: int = 5,
+        context_node_ids: Optional[List[str]] = None,
     ) -> List[dict]:
         """
-        Finds nearest file chunks connected to this node via edges.
-        Limit raised to 5 (was hardcoded to 3) for richer RAG context.
+        Find nearest file chunks for the given chat node.
+
+        When `context_node_ids` is provided, those IDs are the source of truth
+        for which external-context nodes are currently attached (the request
+        payload says so, regardless of what the canvas edges say). When None,
+        falls back to the persisted `edges` graph for backward compatibility.
+
+        Passing an empty list explicitly disables RAG over external context for
+        this turn.
         """
         if not query_embedding:
+            return []
+        if context_node_ids is not None and len(context_node_ids) == 0:
             return []
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
-                cur.execute(
-                    """
-                    WITH connected_files AS (
-                        SELECT n.id AS file_node_id
-                        FROM nodes n
-                        JOIN edges e ON (e.from_node = n.id OR e.to_node = n.id)
-                        WHERE (e.from_node = %s OR e.to_node = %s)
-                          AND n.id != %s
-                          AND n.type = 'externalContext'
+                if context_node_ids is None:
+                    # Legacy path: derive attached files from the canvas edges.
+                    cur.execute(
+                        """
+                        WITH connected_files AS (
+                            SELECT n.id AS file_node_id
+                            FROM nodes n
+                            JOIN edges e ON (e.from_node = n.id OR e.to_node = n.id)
+                            WHERE (e.from_node = %s OR e.to_node = %s)
+                              AND n.id != %s
+                              AND n.type = 'externalContext'
+                        )
+                        SELECT
+                            fc.chunk_text,
+                            fc.metadata,
+                            fc.chunk_index,
+                            (fc.embedding <=> %s::vector) AS distance,
+                            ef.file_name,
+                            ef.file_type
+                        FROM file_chunks fc
+                        JOIN external_files ef ON fc.file_id = ef.id
+                        JOIN connected_files cf ON ef.node_id = cf.file_node_id
+                        ORDER BY distance ASC
+                        LIMIT %s
+                        """,
+                        (node_id, node_id, node_id, np.array(query_embedding), limit),
                     )
-                    SELECT
-                        fc.chunk_text,
-                        fc.metadata,
-                        fc.chunk_index,
-                        (fc.embedding <=> %s::vector) AS distance,
-                        ef.file_name,
-                        ef.file_type
-                    FROM file_chunks fc
-                    JOIN external_files ef ON fc.file_id = ef.id
-                    JOIN connected_files cf ON ef.node_id = cf.file_node_id
-                    ORDER BY distance ASC
-                    LIMIT %s
-                    """,
-                    (node_id, node_id, node_id, np.array(query_embedding), limit),
-                )
+                else:
+                    # Runtime path: trust the request's active set.
+                    cur.execute(
+                        """
+                        SELECT
+                            fc.chunk_text,
+                            fc.metadata,
+                            fc.chunk_index,
+                            (fc.embedding <=> %s::vector) AS distance,
+                            ef.file_name,
+                            ef.file_type
+                        FROM file_chunks fc
+                        JOIN external_files ef ON fc.file_id = ef.id
+                        WHERE ef.node_id = ANY(%s::text[])
+                        ORDER BY distance ASC
+                        LIMIT %s
+                        """,
+                        (np.array(query_embedding), list(context_node_ids), limit),
+                    )
                 return [dict(row) for row in cur.fetchall()]
         except Exception as e:
             logger.error(f"Error fetching related file context: {e}")

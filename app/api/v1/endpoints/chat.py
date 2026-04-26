@@ -221,6 +221,10 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         len(new_summary or ""),
     )
 
+    # Single atomic fork: node row, buffer messages, and memory facts are
+    # written under a transaction-scoped advisory lock keyed on the new
+    # thread_id. Concurrent first-message requests for the same fork serialize
+    # at this point and the loser observes is_initialized=true and returns.
     active_graph.mongo_store.fork_thread(
         user_id=chat_message.user_id,
         source_thread_id=chat_message.parent_thread_id,
@@ -229,11 +233,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         summary=new_summary,
         summary_embedding=new_summary_embedding,
         initial_messages=buffer_messages,
-    )
-    active_graph.mongo_store.update_thread_memory_facts(
-        chat_message.user_id,
-        chat_message.conversation_id,
-        new_memory_facts,
+        memory_facts=new_memory_facts,
     )
     logger.info(
         f"Fork initialised: {chat_message.parent_thread_id} → {chat_message.conversation_id} "
@@ -273,6 +273,7 @@ async def get_response(chat_message: ChatMessage, request: Request):
             config=config,
             thread_id=chat_message.conversation_id,
             user_id=chat_message.user_id,
+            context_node_ids=chat_message.context_node_ids,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -321,6 +322,7 @@ async def stream_response(chat_message: ChatMessage, request: Request):
                 config=config,
                 thread_id=chat_message.conversation_id,
                 user_id=chat_message.user_id,
+                context_node_ids=chat_message.context_node_ids,
             ),
             media_type="text/event-stream",
         )

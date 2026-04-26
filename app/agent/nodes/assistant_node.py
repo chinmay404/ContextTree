@@ -187,25 +187,51 @@ class AgentNodes:
             ).invoke(prompt)
             new_summary = sanitize_summary_text(_message_content_to_text(summary_msg.content))
 
+            keep = getattr(settings, "KEEP_LAST_MESSAGES", 6)
+            messages_being_summarized = state["messages"][:-keep] if keep > 0 else state["messages"]
+
+            # Compute the watermark: the highest DB position of any message
+            # being folded into the summary. We look it up by message id, not
+            # by index, because LangGraph state may not preserve every DB row.
+            new_watermark = state.get("summarized_up_to_position") or 0
+            if self.mongo_store and messages_being_summarized:
+                thread_id = state.get("thread_id")
+                if thread_id:
+                    try:
+                        ids = [getattr(m, "id", None) for m in messages_being_summarized]
+                        ids = [i for i in ids if i]
+                        if ids:
+                            new_watermark = max(
+                                new_watermark,
+                                self.mongo_store.get_max_position_for_messages(thread_id, ids),
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to compute summary watermark: {e}")
+
             if self.mongo_store:
                 thread_id = state.get("thread_id")
-                messages = state.get("messages", [])
                 user_id = self._resolve_state_user_id(state)
-
                 if user_id and thread_id:
                     try:
+                        # Single UPDATE writes the new summary and advances the
+                        # watermark atomically. Watermark only ever moves forward.
                         self.mongo_store.update_thread_summary(
                             user_id=user_id,
                             thread_id=thread_id,
                             summary=new_summary,
+                            summarized_up_to_position=new_watermark,
                         )
                     except Exception as e:
                         logger.error(f"Failed to save summary for thread {thread_id}: {e}")
 
-            # Keep the last N messages as configured (not hardcoded to 3)
-            keep = getattr(settings, "KEEP_LAST_MESSAGES", 6)
-            messages_to_delete = [RemoveMessage(id=m.id) for m in state["messages"][:-keep]]
-            return {"messages": messages_to_delete, "summary": new_summary}
+            # Drop summarized messages from LangGraph state. The DB rows stay
+            # — the UI still needs them to render full history.
+            messages_to_delete = [RemoveMessage(id=m.id) for m in messages_being_summarized]
+            return {
+                "messages": messages_to_delete,
+                "summary": new_summary,
+                "summarized_up_to_position": new_watermark,
+            }
         except Exception as e:
             logger.error(f"Summarization node error: {e}")
             return {"messages": [], "summary": state.get("summary")}

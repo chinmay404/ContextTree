@@ -50,4 +50,14 @@ class ChatMessage(BaseModel):
         None, description="Temperature setting for the model")
     context: Optional[list] = Field(
         None, description="Context for the conversation")
+    context_node_ids: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "External-context node IDs the user has attached to this chat node "
+            "right now. When provided this is the source of truth for RAG; "
+            "passing [] disables external context for this turn. When None "
+            "the backend falls back to the persisted canvas edges."
+        ),
+        alias="contextNodeIds",
+    )
     user_id: Optional[str] = Field(None, description="User identifier")
