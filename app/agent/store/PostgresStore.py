@@ -723,16 +723,25 @@ class PostgresConversationStore:
                 # Idempotency: if another request already finished this fork,
                 # bail out without touching anything.
                 cur.execute(
-                    "SELECT is_initialized FROM nodes WHERE id = %s",
+                    """
+                    SELECT is_initialized, ancestor_ids
+                    FROM nodes
+                    WHERE id = %s
+                    """,
                     (new_thread_id,),
                 )
                 existing = cur.fetchone()
-                if existing and bool(existing[0]):
+                if existing and bool(existing[0]) and list(existing[1] or []):
                     logger.info(
                         "fork_thread: %s already initialized; skipping redo",
                         new_thread_id,
                     )
                     return True
+                if existing and bool(existing[0]) and not list(existing[1] or []):
+                    logger.warning(
+                        "fork_thread: %s was marked initialized without ancestry; repairing fork inheritance",
+                        new_thread_id,
+                    )
 
                 cur.execute(
                     "SELECT canvas_id, ancestor_ids FROM nodes WHERE id = %s",
