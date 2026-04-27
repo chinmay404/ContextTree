@@ -123,11 +123,37 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     This preserves the Context Tree guarantee: the branch starts with an
     accurate, scoped summary of the parent lineage — not a blank slate.
     """
-    if not (chat_message.parent_thread_id and chat_message.fork_at_message_id):
+    parent_thread_id = chat_message.parent_thread_id
+    fork_at_message_id = chat_message.fork_at_message_id
+    node_metadata = None
+
+    if chat_message.conversation_id:
+        node_metadata = active_graph.mongo_store.get_thread_fork_metadata(
+            chat_message.conversation_id
+        )
+        if node_metadata:
+            parent_thread_id = parent_thread_id or node_metadata.get("parent_node_id")
+            fork_at_message_id = fork_at_message_id or node_metadata.get("forked_from_message_id")
+
+            # Keep downstream tracing/config consistent even when the proxy did
+            # not include fork metadata in the request body.
+            chat_message.parent_thread_id = parent_thread_id
+            chat_message.fork_at_message_id = fork_at_message_id
+
+    if not (parent_thread_id and fork_at_message_id):
         return
 
     thread_exists = active_graph.mongo_store.thread_exists(chat_message.conversation_id)
-    should_init = not thread_exists
+    is_pending_fork = bool(
+        node_metadata
+        and parent_thread_id
+        and fork_at_message_id
+        and (
+            not bool(node_metadata.get("is_initialized"))
+            or not list(node_metadata.get("ancestor_ids") or [])
+        )
+    )
+    should_init = (not thread_exists) or is_pending_fork
 
     if thread_exists and not should_init:
         try:
@@ -142,8 +168,8 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
 
     fork_source = active_graph.mongo_store.get_fork_inheritance_payload(
         user_id=chat_message.user_id,
-        thread_id=chat_message.parent_thread_id,
-        message_id=chat_message.fork_at_message_id,
+        thread_id=parent_thread_id,
+        message_id=fork_at_message_id,
         recent_limit=max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6))),
     )
     existing_summary = sanitize_summary_text(fork_source.get("summary"))
@@ -152,8 +178,8 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     if messages_data:
         logger.info(
             "Fork source scope resolved: parent=%s fork_at=%s mode=%s returned_messages=%s last_message=%s",
-            chat_message.parent_thread_id,
-            chat_message.fork_at_message_id,
+            parent_thread_id,
+            fork_at_message_id,
             fork_source.get("mode"),
             len(messages_data),
             messages_data[-1]["message_id"],
@@ -163,7 +189,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         logger.warning("fork_at_message_id not found; falling back to last-K messages")
         messages_data = active_graph.mongo_store.get_thread_recent_messages(
             chat_message.user_id,
-            chat_message.parent_thread_id,
+            parent_thread_id,
             fallback_k,
         )
 
@@ -214,7 +240,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     logger.info(
         "Fork initialisation payload: new_thread=%s parent=%s mode=%s buffer_messages=%s summarized_messages=%s summary_chars=%s",
         chat_message.conversation_id,
-        chat_message.parent_thread_id,
+        parent_thread_id,
         fork_source.get("mode"),
         len(buffer_messages),
         len(messages_to_summarize),
@@ -227,17 +253,17 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     # at this point and the loser observes is_initialized=true and returns.
     active_graph.mongo_store.fork_thread(
         user_id=chat_message.user_id,
-        source_thread_id=chat_message.parent_thread_id,
+        source_thread_id=parent_thread_id,
         new_thread_id=chat_message.conversation_id,
-        fork_at_message_id=chat_message.fork_at_message_id,
+        fork_at_message_id=fork_at_message_id,
         summary=new_summary,
         summary_embedding=new_summary_embedding,
         initial_messages=buffer_messages,
         memory_facts=new_memory_facts,
     )
     logger.info(
-        f"Fork initialised: {chat_message.parent_thread_id} → {chat_message.conversation_id} "
-        f"at message {chat_message.fork_at_message_id}"
+        f"Fork initialised: {parent_thread_id} → {chat_message.conversation_id} "
+        f"at message {fork_at_message_id}"
     )
 
 

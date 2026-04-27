@@ -239,6 +239,28 @@ class PostgresConversationStore:
         except Exception:
             return 0
 
+    def get_thread_fork_metadata(self, thread_id: str) -> Optional[dict]:
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor(cursor_factory=DictCursor)
+                cur.execute(
+                    """
+                    SELECT
+                        parent_node_id,
+                        forked_from_message_id,
+                        is_initialized,
+                        ancestor_ids
+                    FROM nodes
+                    WHERE id = %s
+                    """,
+                    (thread_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error fetching fork metadata: {e}")
+            return None
+
     def get_thread_created_at(self, thread_id: str) -> Optional[datetime]:
         try:
             with self._get_conn() as conn:
