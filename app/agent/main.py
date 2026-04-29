@@ -143,6 +143,7 @@ class getGraphResponse():
         thread_id: str,
         msg_id: str,
         context_node_ids: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -210,6 +211,7 @@ class getGraphResponse():
                         "context_node_ids": context_node_ids,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
+                        "system_prompt": system_prompt,
                     },
                     config
                 )
@@ -287,7 +289,7 @@ class getGraphResponse():
             logger.error(f"get_graph_res : {e}")
             return False
 
-    def _prepare_stream_input(self, query, config, user_id, thread_id, msg_id, context_node_ids=None):
+    def _prepare_stream_input(self, query, config, user_id, thread_id, msg_id, context_node_ids=None, system_prompt=None):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
         current_state = self.graph.get_state(config)
@@ -341,6 +343,7 @@ class getGraphResponse():
             "context_node_ids": context_node_ids,
             "model": config.get("configurable", {}).get("model"),
             "temperature": config.get("configurable", {}).get("temperature"),
+            "system_prompt": system_prompt,
         }
 
         return graph_input, existing_summary, existing_memory_facts, is_duplicate, query
@@ -434,10 +437,11 @@ class getGraphResponse():
         thread_id: str,
         msg_id: str,
         context_node_ids: Optional[list] = None,
+        system_prompt: Optional[str] = None,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
-                query, config, user_id, thread_id, msg_id, context_node_ids=context_node_ids
+                query, config, user_id, thread_id, msg_id, context_node_ids=context_node_ids, system_prompt=system_prompt
             )
 
             full_response = ""

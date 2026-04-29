@@ -42,6 +42,8 @@ class ChatMessage(BaseModel):
         None, description="Conversation identifier", alias="nodeId")
     model_name: Optional[str] = Field(
         None, description="Name of the model used for the response", alias="model")
+    system_prompt: Optional[str] = Field(
+        None, description="Node-specific system prompt", alias="systemPrompt")
     parent_thread_id: Optional[str] = Field(
         None, description="Parent thread identifier", alias="parentNodeId")
     fork_at_message_id: Optional[str] = Field(

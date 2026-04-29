@@ -300,6 +300,7 @@ async def get_response(chat_message: ChatMessage, request: Request):
             thread_id=chat_message.conversation_id,
             user_id=chat_message.user_id,
             context_node_ids=chat_message.context_node_ids,
+            system_prompt=chat_message.system_prompt,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -349,6 +350,7 @@ async def stream_response(chat_message: ChatMessage, request: Request):
                 thread_id=chat_message.conversation_id,
                 user_id=chat_message.user_id,
                 context_node_ids=chat_message.context_node_ids,
+                system_prompt=chat_message.system_prompt,
             ),
             media_type="text/event-stream",
         )

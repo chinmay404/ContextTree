@@ -84,6 +84,7 @@ class AgentNodes:
             memory_facts = state.get("memory_facts", {})
             model = state.get("model", None)
             temperature = state.get("temperature", 0.9)
+            custom_system_prompt = str(state.get("system_prompt") or "").strip()
             history = state.get("messages", [])
             user_id = self._resolve_state_user_id(state)
 
@@ -111,7 +112,17 @@ class AgentNodes:
             messages = [
                 SystemMessage(content=system_content),
                 SystemMessage(content=memory_context),
-            ] + history
+            ]
+            if custom_system_prompt:
+                messages.append(
+                    SystemMessage(
+                        content=(
+                            "Node-specific custom system prompt. Apply these instructions "
+                            f"for this node and its branch:\n{custom_system_prompt}"
+                        )
+                    )
+                )
+            messages += history
 
             llm = get_llm(model, user_id=user_id)
             if llm is None:
@@ -149,6 +160,7 @@ class AgentNodes:
                 "memory_facts": memory_facts,
                 "model": model,
                 "temperature": temperature,
+                "system_prompt": custom_system_prompt,
             }
         except Exception as e:
             logger.error("Assistant node error: %s", e)
