@@ -144,6 +144,8 @@ class getGraphResponse():
         msg_id: str,
         context_node_ids: Optional[list] = None,
         system_prompt: Optional[str] = None,
+        last_k_messages: Optional[int] = None,
+        external_context_top_k: Optional[int] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -164,12 +166,15 @@ class getGraphResponse():
                     thread_id,
                     watermark,
                 )
-                initial_messages = self._hydrate_recent_messages(user_id, thread_id, watermark)
+                initial_messages = self._hydrate_recent_messages(
+                    user_id, thread_id, watermark, recent_limit_override=last_k_messages
+                )
 
             existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
             context_snippets, external_context_str = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
+                external_context_top_k=external_context_top_k,
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -211,6 +216,8 @@ class getGraphResponse():
                         "context_node_ids": context_node_ids,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
+                        "max_output_tokens": config.get("configurable", {}).get("max_output_tokens"),
+                        "last_k_messages": config.get("configurable", {}).get("last_k_messages"),
                         "system_prompt": system_prompt,
                     },
                     config
@@ -289,13 +296,25 @@ class getGraphResponse():
             logger.error(f"get_graph_res : {e}")
             return False
 
-    def _prepare_stream_input(self, query, config, user_id, thread_id, msg_id, context_node_ids=None, system_prompt=None):
+    def _prepare_stream_input(
+        self,
+        query,
+        config,
+        user_id,
+        thread_id,
+        msg_id,
+        context_node_ids=None,
+        system_prompt=None,
+        last_k_messages=None,
+        external_context_top_k=None,
+    ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
         current_state = self.graph.get_state(config)
         initial_messages = []
         context_snippets, external_context_str = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
+            external_context_top_k=external_context_top_k,
         )
 
         summary_state = self.mongo_store.get_thread_summary_state(user_id, thread_id)
@@ -306,7 +325,9 @@ class getGraphResponse():
         # Filter to messages past the summary watermark so already-summarized
         # turns aren't replayed through the LLM (they stay in the DB for UI).
         if not current_state.values or not current_state.values.get("messages"):
-            initial_messages = self._hydrate_recent_messages(user_id, thread_id, watermark)
+            initial_messages = self._hydrate_recent_messages(
+                user_id, thread_id, watermark, recent_limit_override=last_k_messages
+            )
 
         existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
         prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
@@ -343,12 +364,20 @@ class getGraphResponse():
             "context_node_ids": context_node_ids,
             "model": config.get("configurable", {}).get("model"),
             "temperature": config.get("configurable", {}).get("temperature"),
+            "max_output_tokens": config.get("configurable", {}).get("max_output_tokens"),
+            "last_k_messages": config.get("configurable", {}).get("last_k_messages"),
             "system_prompt": system_prompt,
         }
 
         return graph_input, existing_summary, existing_memory_facts, is_duplicate, query
 
-    def _hydrate_recent_messages(self, user_id: str, thread_id: str, watermark: int = 0):
+    def _hydrate_recent_messages(
+        self,
+        user_id: str,
+        thread_id: str,
+        watermark: int = 0,
+        recent_limit_override: Optional[int] = None,
+    ):
         """
         Pull recent messages out of the DB to seed LangGraph state.
 
@@ -357,7 +386,12 @@ class getGraphResponse():
         double-count tokens. The DB rows themselves are never deleted — the UI
         still loads full history through other endpoints.
         """
-        recent_limit = max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6)))
+        if recent_limit_override is None:
+            recent_limit = max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6)))
+        else:
+            recent_limit = max(0, min(50, int(recent_limit_override)))
+        if recent_limit == 0:
+            return []
         mongo_msgs = self.mongo_store.get_thread_messages_after(
             user_id, thread_id, after_position=int(watermark or 0), limit=recent_limit,
         )
@@ -376,6 +410,7 @@ class getGraphResponse():
         user_id: str,
         thread_id: str,
         context_node_ids: Optional[list] = None,
+        external_context_top_k: Optional[int] = None,
     ):
         query_embedding = get_embedding(query) or []
         if not _has_meaningful_embedding(query_embedding):
@@ -406,10 +441,13 @@ class getGraphResponse():
             logger.error(f"Similarity search failed: {e}")
 
         try:
+            file_context_limit = FILE_CONTEXT_LIMIT
+            if external_context_top_k is not None:
+                file_context_limit = max(0, min(10, int(external_context_top_k)))
             file_chunks = self.mongo_store.get_related_file_context(
                 node_id=thread_id,
                 query_embedding=query_embedding,
-                limit=FILE_CONTEXT_LIMIT,
+                limit=file_context_limit,
                 context_node_ids=context_node_ids,
             ) or []
             for idx, c in enumerate(file_chunks):
@@ -438,10 +476,20 @@ class getGraphResponse():
         msg_id: str,
         context_node_ids: Optional[list] = None,
         system_prompt: Optional[str] = None,
+        last_k_messages: Optional[int] = None,
+        external_context_top_k: Optional[int] = None,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
-                query, config, user_id, thread_id, msg_id, context_node_ids=context_node_ids, system_prompt=system_prompt
+                query,
+                config,
+                user_id,
+                thread_id,
+                msg_id,
+                context_node_ids=context_node_ids,
+                system_prompt=system_prompt,
+                last_k_messages=last_k_messages,
+                external_context_top_k=external_context_top_k,
             )
 
             full_response = ""

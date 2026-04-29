@@ -84,8 +84,16 @@ class AgentNodes:
             memory_facts = state.get("memory_facts", {})
             model = state.get("model", None)
             temperature = state.get("temperature", 0.9)
+            max_output_tokens = state.get("max_output_tokens", None)
             custom_system_prompt = str(state.get("system_prompt") or "").strip()
             history = state.get("messages", [])
+            last_k_messages = state.get("last_k_messages", None)
+            if last_k_messages is not None:
+                try:
+                    last_k = max(0, min(50, int(last_k_messages)))
+                    history = history[-last_k:] if last_k > 0 else []
+                except (TypeError, ValueError):
+                    pass
             user_id = self._resolve_state_user_id(state)
 
             template = load_prompt_from_yaml("SYSTEM_PROMPT")
@@ -124,7 +132,12 @@ class AgentNodes:
                 )
             messages += history
 
-            llm = get_llm(model, user_id=user_id)
+            llm = get_llm(
+                model,
+                user_id=user_id,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
             if llm is None:
                 raise RuntimeError("LLM initialization failed for model: " + str(model))
 
@@ -160,6 +173,8 @@ class AgentNodes:
                 "memory_facts": memory_facts,
                 "model": model,
                 "temperature": temperature,
+                "max_output_tokens": max_output_tokens,
+                "last_k_messages": last_k_messages,
                 "system_prompt": custom_system_prompt,
             }
         except Exception as e:

@@ -50,6 +50,12 @@ class ChatMessage(BaseModel):
         None, description="Fork point message identifier", alias="forkedFromMessageId")
     temperature: Optional[float] = Field(
         None, description="Temperature setting for the model")
+    max_output_tokens: Optional[int] = Field(
+        None, description="Maximum output tokens", alias="maxOutputTokens")
+    last_k_messages: Optional[int] = Field(
+        None, description="Override recent history window", alias="lastKMessages")
+    external_context_top_k: Optional[int] = Field(
+        None, description="External context chunk count", alias="externalContextTopK")
     context: Optional[list] = Field(
         None, description="Context for the conversation")
     context_node_ids: Optional[list[str]] = Field(

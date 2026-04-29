@@ -29,6 +29,26 @@ _ANTHROPIC_SENTINEL = {"None", "null", "default-model-name", "", None}
 _LITELLM_DEFAULT = os.getenv("DEFAULT_LITELLM_MODEL") or "openrouter/openai/gpt-oss-120b"
 _LITELLM_SENTINEL = {"None", "null", "default-model-name", "", "litellm/custom", None}
 
+
+def _clamp_temperature(value: float | int | None) -> float:
+    if value is None:
+        return 0.8
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.8
+    return max(0.0, min(2.0, numeric))
+
+
+def _clamp_max_output_tokens(value: int | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        numeric = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, min(32000, numeric))
+
 # ── Gemini model aliases ───────────────────────────────────────────────────────
 # Google currently returns `models/<id>` names from the official models list.
 _GEMINI_ALIASES: dict[str, str] = {
@@ -203,7 +223,11 @@ def validate_model_access(model_name: str | None, user_id: str | None = None) ->
     return None
 
 
-def get_gemini_llm(model_name: str | None = None):
+def get_gemini_llm(
+    model_name: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     """
     Returns a ChatGoogleGenerativeAI instance.
     model_name may be:
@@ -220,12 +244,16 @@ def get_gemini_llm(model_name: str | None = None):
 
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        llm = ChatGoogleGenerativeAI(
-            model=resolved,
-            google_api_key=api_key,
-            temperature=0.8,
-            max_retries=2,
-        )
+        kwargs = {
+            "model": resolved,
+            "google_api_key": api_key,
+            "temperature": _clamp_temperature(temperature),
+            "max_retries": 2,
+        }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_output_tokens"] = max_tokens
+        llm = ChatGoogleGenerativeAI(**kwargs)
         logger.info(f"Initialised Gemini LLM: {resolved}")
         return llm
     except Exception as e:
@@ -233,7 +261,12 @@ def get_gemini_llm(model_name: str | None = None):
         return None
 
 
-def get_openai_llm(model_name: str | None = None, user_id: str | None = None):
+def get_openai_llm(
+    model_name: str | None = None,
+    user_id: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     resolved = _normalize_openai_model_name(model_name)
     api_key = _resolve_provider_key("openai", "OPENAI_API_KEY", user_id)
     if not api_key:
@@ -243,12 +276,16 @@ def get_openai_llm(model_name: str | None = None, user_id: str | None = None):
     try:
         from langchain_openai import ChatOpenAI
 
-        llm = ChatOpenAI(
-            model=resolved,
-            api_key=api_key,
-            temperature=0.8,
-            max_retries=2,
-        )
+        kwargs = {
+            "model": resolved,
+            "api_key": api_key,
+            "temperature": _clamp_temperature(temperature),
+            "max_retries": 2,
+        }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        llm = ChatOpenAI(**kwargs)
         logger.info("Initialised OpenAI LLM: %s", resolved)
         return llm
     except Exception as e:
@@ -256,7 +293,11 @@ def get_openai_llm(model_name: str | None = None, user_id: str | None = None):
         return None
 
 
-def get_groq_llm(name: str | None = None):
+def get_groq_llm(
+    name: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     """Returns a ChatGroq instance, falling back to the default Groq model."""
     if name in _GROQ_SENTINEL:
         name = _GROQ_DEFAULT
@@ -268,18 +309,27 @@ def get_groq_llm(name: str | None = None):
 
     try:
         from langchain_groq import ChatGroq
-        llm = ChatGroq(
-            temperature=0.8,
-            api_key=str(api_key),
-            model_name=name,
-        )
+        kwargs = {
+            "temperature": _clamp_temperature(temperature),
+            "api_key": str(api_key),
+            "model_name": name,
+        }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        llm = ChatGroq(**kwargs)
         return llm
     except Exception as e:
         logger.error(f"Failed to initialise Groq LLM ({name}): {e}")
         return None
 
 
-def get_anthropic_llm(model_name: str | None = None, user_id: str | None = None):
+def get_anthropic_llm(
+    model_name: str | None = None,
+    user_id: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     resolved = _normalize_anthropic_model_name(model_name)
     api_key = _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id)
     if not api_key:
@@ -289,12 +339,16 @@ def get_anthropic_llm(model_name: str | None = None, user_id: str | None = None)
     try:
         from langchain_anthropic import ChatAnthropic
 
-        llm = ChatAnthropic(
-            model=resolved,
-            api_key=api_key,
-            temperature=0.8,
-            max_retries=2,
-        )
+        kwargs = {
+            "model": resolved,
+            "api_key": api_key,
+            "temperature": _clamp_temperature(temperature),
+            "max_retries": 2,
+        }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        llm = ChatAnthropic(**kwargs)
         logger.info("Initialised Anthropic LLM: %s", resolved)
         return llm
     except Exception as e:
@@ -302,7 +356,11 @@ def get_anthropic_llm(model_name: str | None = None, user_id: str | None = None)
         return None
 
 
-def get_nvidia_llm(model_name: str | None = None):
+def get_nvidia_llm(
+    model_name: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     """Returns a ChatOpenAI instance pointed at NVIDIA's OpenAI-compatible API."""
     model_name = _normalize_nvidia_model_name(model_name)
 
@@ -314,13 +372,17 @@ def get_nvidia_llm(model_name: str | None = None):
     try:
         from langchain_openai import ChatOpenAI
 
-        llm = ChatOpenAI(
-            model=model_name,
-            api_key=api_key,
-            base_url="https://integrate.api.nvidia.com/v1",
-            temperature=0.8,
-            max_retries=2,
-        )
+        kwargs = {
+            "model": model_name,
+            "api_key": api_key,
+            "base_url": "https://integrate.api.nvidia.com/v1",
+            "temperature": _clamp_temperature(temperature),
+            "max_retries": 2,
+        }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        llm = ChatOpenAI(**kwargs)
         logger.info(f"Initialised NVIDIA LLM: {model_name}")
         return llm
     except Exception as e:
@@ -328,7 +390,12 @@ def get_nvidia_llm(model_name: str | None = None):
         return None
 
 
-def get_litellm_llm(model_name: str | None = None, user_id: str | None = None):
+def get_litellm_llm(
+    model_name: str | None = None,
+    user_id: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     """Returns a ChatLiteLLM instance for user-supplied LiteLLM model strings."""
     resolved = _normalize_litellm_model_name(model_name)
     credentials = get_user_provider_credentials(user_id, "litellm") or {}
@@ -345,9 +412,12 @@ def get_litellm_llm(model_name: str | None = None, user_id: str | None = None):
 
         kwargs = {
             "model": resolved,
-            "temperature": 0.8,
+            "temperature": _clamp_temperature(temperature),
             "max_retries": 2,
         }
+        max_tokens = _clamp_max_output_tokens(max_output_tokens)
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if api_key:
             kwargs["api_key"] = api_key
         if api_base:
@@ -361,17 +431,31 @@ def get_litellm_llm(model_name: str | None = None, user_id: str | None = None):
         return None
 
 
-def _fallback_to_groq_default(original_model_name: str | None, provider_name: str):
+def _fallback_to_groq_default(
+    original_model_name: str | None,
+    provider_name: str,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     logger.warning(
         "%s init failed for '%s', falling back to Groq default '%s'",
         provider_name,
         original_model_name,
         _GROQ_DEFAULT,
     )
-    return get_groq_llm(name=_GROQ_DEFAULT)
+    return get_groq_llm(
+        name=_GROQ_DEFAULT,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )
 
 
-def get_llm(model_name: str | None = None, user_id: str | None = None):
+def get_llm(
+    model_name: str | None = None,
+    user_id: str | None = None,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
     """
     Unified LLM dispatcher.
 
@@ -386,33 +470,70 @@ def get_llm(model_name: str | None = None, user_id: str | None = None):
     Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
     if _is_litellm(model_name):
-        llm = get_litellm_llm(model_name, user_id=user_id)
+        llm = get_litellm_llm(
+            model_name,
+            user_id=user_id,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         if llm is not None:
             return llm
         return None
 
     if _is_openai_direct(model_name):
-        llm = get_openai_llm(model_name, user_id=user_id)
+        llm = get_openai_llm(
+            model_name,
+            user_id=user_id,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         if llm is not None:
             return llm
         return None
 
     if _is_anthropic(model_name):
-        llm = get_anthropic_llm(model_name, user_id=user_id)
+        llm = get_anthropic_llm(
+            model_name,
+            user_id=user_id,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         if llm is not None:
             return llm
         return None
 
     if _is_gemini(model_name):
-        llm = get_gemini_llm(model_name)
+        llm = get_gemini_llm(
+            model_name,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         if llm is not None:
             return llm
-        return _fallback_to_groq_default(model_name, "Gemini")
+        return _fallback_to_groq_default(
+            model_name,
+            "Gemini",
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
 
     if _is_nvidia(model_name):
-        llm = get_nvidia_llm(model_name)
+        llm = get_nvidia_llm(
+            model_name,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
         if llm is not None:
             return llm
-        return _fallback_to_groq_default(model_name, "NVIDIA")
+        return _fallback_to_groq_default(
+            model_name,
+            "NVIDIA",
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
 
-    return get_groq_llm(name=model_name)
+    return get_groq_llm(
+        name=model_name,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+    )

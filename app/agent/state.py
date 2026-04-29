@@ -21,5 +21,7 @@ class State(TypedDict):
     memory_facts: Optional[dict[str, Any]]
     model: Optional[str]
     temperature: Optional[float]
+    max_output_tokens: Optional[int]
+    last_k_messages: Optional[int]
     system_prompt: Optional[str]
     messages: Annotated[List[AnyMessage], add_messages]

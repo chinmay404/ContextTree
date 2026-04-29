@@ -51,6 +51,9 @@ def _build_chat_run_config(chat_message: ChatMessage, transport: str) -> dict:
         "configurable": {
             "model": chat_message.model_name,
             "temperature": chat_message.temperature,
+            "max_output_tokens": chat_message.max_output_tokens,
+            "last_k_messages": chat_message.last_k_messages,
+            "external_context_top_k": chat_message.external_context_top_k,
             "thread_id": chat_message.conversation_id,
         },
     }
@@ -301,6 +304,8 @@ async def get_response(chat_message: ChatMessage, request: Request):
             user_id=chat_message.user_id,
             context_node_ids=chat_message.context_node_ids,
             system_prompt=chat_message.system_prompt,
+            last_k_messages=chat_message.last_k_messages,
+            external_context_top_k=chat_message.external_context_top_k,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -351,6 +356,8 @@ async def stream_response(chat_message: ChatMessage, request: Request):
                 user_id=chat_message.user_id,
                 context_node_ids=chat_message.context_node_ids,
                 system_prompt=chat_message.system_prompt,
+                last_k_messages=chat_message.last_k_messages,
+                external_context_top_k=chat_message.external_context_top_k,
             ),
             media_type="text/event-stream",
         )
