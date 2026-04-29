@@ -49,6 +49,31 @@ def _clamp_max_output_tokens(value: int | None) -> int | None:
         return None
     return max(1, min(32000, numeric))
 
+
+# ── Reasoning-model detection ──────────────────────────────────────────────────
+# Reasoning models (GPT-5, o1/o3/o4 mini, R1) reject custom temperature and the
+# `max_tokens` field — they internalise sampling and use `max_completion_tokens`.
+# We strip those kwargs before initialising the LLM.
+_REASONING_PREFIXES = (
+    "gpt-5",
+    "openai/gpt-5",
+    "o1",
+    "openai/o1",
+    "o3",
+    "openai/o3",
+    "o4",
+    "openai/o4",
+    "deepseek-r1",
+    "deepseek-ai/deepseek-r1",
+)
+
+
+def _is_reasoning_model(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    lowered = model_name.lower()
+    return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
+
 # ── Gemini model aliases ───────────────────────────────────────────────────────
 # Google currently returns `models/<id>` names from the official models list.
 _GEMINI_ALIASES: dict[str, str] = {
@@ -273,20 +298,26 @@ def get_openai_llm(
         logger.error("No OpenAI credentials available for %s", resolved)
         return None
 
+    is_reasoning = _is_reasoning_model(resolved) or _is_reasoning_model(model_name)
+
     try:
         from langchain_openai import ChatOpenAI
 
-        kwargs = {
+        kwargs: dict = {
             "model": resolved,
             "api_key": api_key,
-            "temperature": _clamp_temperature(temperature),
             "max_retries": 2,
         }
+        if not is_reasoning:
+            kwargs["temperature"] = _clamp_temperature(temperature)
         max_tokens = _clamp_max_output_tokens(max_output_tokens)
         if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+            # Reasoning models use `max_completion_tokens`; chat models use `max_tokens`.
+            kwargs["max_completion_tokens" if is_reasoning else "max_tokens"] = max_tokens
         llm = ChatOpenAI(**kwargs)
-        logger.info("Initialised OpenAI LLM: %s", resolved)
+        logger.info(
+            "Initialised OpenAI LLM: %s (reasoning=%s)", resolved, is_reasoning
+        )
         return llm
     except Exception as e:
         logger.error(f"Failed to initialise OpenAI LLM ({resolved}): {e}")
@@ -396,7 +427,15 @@ def get_litellm_llm(
     temperature: float | None = None,
     max_output_tokens: int | None = None,
 ):
-    """Returns a ChatLiteLLM instance for user-supplied LiteLLM model strings."""
+    """
+    Returns a ChatLiteLLM instance for user-supplied LiteLLM model strings.
+
+    LiteLLM forwards calls to whatever upstream provider the user configured.
+    Some providers (e.g. OpenAI reasoning models, certain Bedrock/Vertex routes)
+    reject `temperature` or `max_tokens`. We try the full kwargs first, then
+    progressively drop the optional sampling fields if construction fails so
+    the route still works for restrictive providers.
+    """
     resolved = _normalize_litellm_model_name(model_name)
     credentials = get_user_provider_credentials(user_id, "litellm") or {}
     metadata = credentials.get("metadata") or {}
@@ -409,26 +448,53 @@ def get_litellm_llm(
 
     try:
         from langchain_litellm import ChatLiteLLM
-
-        kwargs = {
-            "model": resolved,
-            "temperature": _clamp_temperature(temperature),
-            "max_retries": 2,
-        }
-        max_tokens = _clamp_max_output_tokens(max_output_tokens)
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
-        if api_key:
-            kwargs["api_key"] = api_key
-        if api_base:
-            kwargs["api_base"] = api_base
-
-        llm = ChatLiteLLM(**kwargs)
-        logger.info("Initialised LiteLLM model: %s", resolved)
-        return llm
     except Exception as e:
-        logger.error(f"Failed to initialise LiteLLM ({resolved}): {e}")
+        logger.error("Failed to import langchain_litellm: %s", e)
         return None
+
+    base_kwargs: dict = {"model": resolved, "max_retries": 2}
+    if api_key:
+        base_kwargs["api_key"] = api_key
+    if api_base:
+        base_kwargs["api_base"] = api_base
+
+    max_tokens = _clamp_max_output_tokens(max_output_tokens)
+
+    # Try in descending strictness so a permissive upstream gets full controls,
+    # while a restrictive one still gets a working LLM with provider defaults.
+    attempts: list[tuple[str, dict]] = [
+        (
+            "with temperature + max_tokens",
+            {
+                **base_kwargs,
+                "temperature": _clamp_temperature(temperature),
+                **({"max_tokens": max_tokens} if max_tokens is not None else {}),
+            },
+        ),
+        (
+            "without max_tokens",
+            {**base_kwargs, "temperature": _clamp_temperature(temperature)},
+        ),
+        ("without sampling controls", base_kwargs),
+    ]
+
+    last_error: Exception | None = None
+    for label, kwargs in attempts:
+        try:
+            llm = ChatLiteLLM(**kwargs)
+            logger.info("Initialised LiteLLM model: %s (%s)", resolved, label)
+            return llm
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "LiteLLM init failed for %s %s: %s — retrying with fewer params",
+                resolved,
+                label,
+                e,
+            )
+
+    logger.error("Failed to initialise LiteLLM (%s): %s", resolved, last_error)
+    return None
 
 
 def _fallback_to_groq_default(
