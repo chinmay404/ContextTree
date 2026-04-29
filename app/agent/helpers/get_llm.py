@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from dotenv import load_dotenv
 
-from app.agent.helpers.byok import get_user_provider_api_key
+from app.agent.helpers.byok import get_user_provider_api_key, get_user_provider_credentials
 from app.core.logger import logger
 
 load_dotenv()
@@ -26,6 +26,8 @@ _NVIDIA_DEFAULT = os.getenv("DEFAULT_NVIDIA_MODEL") or "moonshotai/kimi-k2-instr
 _NVIDIA_SENTINEL = {"None", "null", "default-model-name", "", None}
 _ANTHROPIC_DEFAULT = os.getenv("DEFAULT_ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
 _ANTHROPIC_SENTINEL = {"None", "null", "default-model-name", "", None}
+_LITELLM_DEFAULT = os.getenv("DEFAULT_LITELLM_MODEL") or "openrouter/openai/gpt-oss-120b"
+_LITELLM_SENTINEL = {"None", "null", "default-model-name", "", "litellm/custom", None}
 
 # ── Gemini model aliases ───────────────────────────────────────────────────────
 # Google currently returns `models/<id>` names from the official models list.
@@ -114,6 +116,12 @@ def _is_nvidia(model_name: str | None) -> bool:
     return model_name.startswith(_NVIDIA_PREFIXES)
 
 
+def _is_litellm(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    return model_name.startswith("litellm/")
+
+
 def _normalize_openai_model_name(model_name: str | None) -> str:
     if model_name in _OPENAI_SENTINEL:
         return _OPENAI_DEFAULT
@@ -148,6 +156,17 @@ def _normalize_nvidia_model_name(model_name: str | None) -> str:
     return _NVIDIA_ALIASES.get(model_name or _NVIDIA_DEFAULT, model_name or _NVIDIA_DEFAULT)
 
 
+def _normalize_litellm_model_name(model_name: str | None) -> str:
+    if model_name in _LITELLM_SENTINEL:
+        return _LITELLM_DEFAULT
+
+    bare = model_name or _LITELLM_DEFAULT
+    if bare.startswith("litellm/"):
+        bare = bare[len("litellm/"):]
+
+    return bare or _LITELLM_DEFAULT
+
+
 def _resolve_provider_key(
     provider: str,
     env_key_name: str,
@@ -161,6 +180,16 @@ def _resolve_provider_key(
 
 
 def validate_model_access(model_name: str | None, user_id: str | None = None) -> str | None:
+    if _is_litellm(model_name):
+        credentials = get_user_provider_credentials(user_id, "litellm")
+        env_key = os.getenv("LITELLM_API_KEY")
+        env_api_base = os.getenv("LITELLM_API_BASE")
+        api_key = env_key or (credentials or {}).get("api_key")
+        api_base = env_api_base or ((credentials or {}).get("metadata") or {}).get("apiBase")
+        if api_key or api_base:
+            return None
+        return "Connect your LiteLLM credential or private endpoint to use custom models."
+
     if _is_openai_direct(model_name):
         if _resolve_provider_key("openai", "OPENAI_API_KEY", user_id):
             return None
@@ -299,6 +328,39 @@ def get_nvidia_llm(model_name: str | None = None):
         return None
 
 
+def get_litellm_llm(model_name: str | None = None, user_id: str | None = None):
+    """Returns a ChatLiteLLM instance for user-supplied LiteLLM model strings."""
+    resolved = _normalize_litellm_model_name(model_name)
+    credentials = get_user_provider_credentials(user_id, "litellm") or {}
+    metadata = credentials.get("metadata") or {}
+    api_key = os.getenv("LITELLM_API_KEY") or credentials.get("api_key")
+    api_base = os.getenv("LITELLM_API_BASE") or metadata.get("apiBase")
+
+    if not api_key and not api_base:
+        logger.error("No LiteLLM credentials or API base available for %s", resolved)
+        return None
+
+    try:
+        from langchain_litellm import ChatLiteLLM
+
+        kwargs = {
+            "model": resolved,
+            "temperature": 0.8,
+            "max_retries": 2,
+        }
+        if api_key:
+            kwargs["api_key"] = api_key
+        if api_base:
+            kwargs["api_base"] = api_base
+
+        llm = ChatLiteLLM(**kwargs)
+        logger.info("Initialised LiteLLM model: %s", resolved)
+        return llm
+    except Exception as e:
+        logger.error(f"Failed to initialise LiteLLM ({resolved}): {e}")
+        return None
+
+
 def _fallback_to_groq_default(original_model_name: str | None, provider_name: str):
     logger.warning(
         "%s init failed for '%s', falling back to Groq default '%s'",
@@ -316,12 +378,19 @@ def get_llm(model_name: str | None = None, user_id: str | None = None):
     Routes:
       - openai/* direct GPT ids  → OpenAI
       - anthropic/* direct ids   → Anthropic
+      - litellm/* custom ids     → LiteLLM
       - gemini/* or gemini-*  → Gemini
       - nvidia-hosted model ids → NVIDIA NIM
       - everything else        → Groq
 
     Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
+    if _is_litellm(model_name):
+        llm = get_litellm_llm(model_name, user_id=user_id)
+        if llm is not None:
+            return llm
+        return None
+
     if _is_openai_direct(model_name):
         llm = get_openai_llm(model_name, user_id=user_id)
         if llm is not None:

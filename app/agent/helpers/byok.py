@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import psycopg2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -63,6 +63,11 @@ def _resolve_user_email(user_id: Optional[str]) -> Optional[str]:
 
 
 def get_user_provider_api_key(user_id: Optional[str], provider: str) -> Optional[str]:
+    credentials = get_user_provider_credentials(user_id, provider)
+    return credentials.get("api_key") if credentials else None
+
+
+def get_user_provider_credentials(user_id: Optional[str], provider: str) -> Optional[dict[str, Any]]:
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
@@ -76,7 +81,7 @@ def get_user_provider_api_key(user_id: Optional[str], provider: str) -> Optional
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT encrypted_key
+                    SELECT encrypted_key, metadata
                     FROM user_api_keys
                     WHERE user_email = %s AND provider = %s
                     LIMIT 1
@@ -84,10 +89,14 @@ def get_user_provider_api_key(user_id: Optional[str], provider: str) -> Optional
                     (user_email, provider),
                 )
                 row = cur.fetchone()
-                if not row or not row[0]:
+                if not row:
                     return None
 
-                return decrypt_api_key(row[0])
+                metadata = row[1] or {}
+                return {
+                    "api_key": decrypt_api_key(row[0]) if row[0] else None,
+                    "metadata": metadata,
+                }
     except Exception as exc:
         logger.warning("Failed to load BYOK credentials for %s: %s", provider, exc)
         return None
