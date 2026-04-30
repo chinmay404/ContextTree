@@ -306,6 +306,7 @@ async def get_response(chat_message: ChatMessage, request: Request):
             system_prompt=chat_message.system_prompt,
             last_k_messages=chat_message.last_k_messages,
             external_context_top_k=chat_message.external_context_top_k,
+            regenerate_last_user=chat_message.regenerate_last_user,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -358,6 +359,7 @@ async def stream_response(chat_message: ChatMessage, request: Request):
                 system_prompt=chat_message.system_prompt,
                 last_k_messages=chat_message.last_k_messages,
                 external_context_top_k=chat_message.external_context_top_k,
+                regenerate_last_user=chat_message.regenerate_last_user,
             ),
             media_type="text/event-stream",
         )

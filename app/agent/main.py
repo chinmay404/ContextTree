@@ -146,6 +146,7 @@ class getGraphResponse():
         system_prompt: Optional[str] = None,
         last_k_messages: Optional[int] = None,
         external_context_top_k: Optional[int] = None,
+        regenerate_last_user: bool = False,
     ):
         try:
             # Check for existing state in LangGraph
@@ -179,28 +180,57 @@ class getGraphResponse():
 
             prompt = get_formated_prompt(query, user_id)
             timestamp = datetime.utcnow().isoformat()
-            user_msg = HumanMessage(
-                content=prompt,
-                id=msg_id,
-                metadata={"user_id": user_id,
-                          "thread_id": thread_id,
-                          "timestamp": timestamp}
-            )
 
-            # Combine hydrated history with new message
-            messages_input = initial_messages + [user_msg]
-            
-            # Deduplicate logic: If we hydrated from DB and the last message matches the current user message, don't append it again.
-            is_duplicate = False
-            if initial_messages:
-                last_msg = initial_messages[-1]
-
-                if _is_duplicate_hydrated_user_message(last_msg, msg_id):
-                    is_duplicate = True
-
-                if is_duplicate:
-                    logger.info(f"Duplicate message detected in hydration: {msg_id}. Using DB version.")
+            if regenerate_last_user:
+                # Forking from a user message: that message already lives at the
+                # tail of `initial_messages` (copied into the new branch by the
+                # fork-init buffer). Don't append a second copy — the model is
+                # being asked to answer the *existing* tail message.
+                if not initial_messages or not isinstance(initial_messages[-1], HumanMessage):
+                    logger.warning(
+                        "regenerate_last_user requested but buffer tail is not a user message; "
+                        "falling back to normal append for thread %s",
+                        thread_id,
+                    )
+                    user_msg = HumanMessage(
+                        content=prompt,
+                        id=msg_id,
+                        metadata={"user_id": user_id, "thread_id": thread_id, "timestamp": timestamp},
+                    )
+                    messages_input = initial_messages + [user_msg]
+                    is_duplicate = False
+                else:
+                    logger.info(
+                        "regenerate_last_user: replaying buffer tail as the prompt for thread %s",
+                        thread_id,
+                    )
                     messages_input = initial_messages
+                    # Treat as duplicate so the post-LLM code skips the user-msg
+                    # DB insert (it's already there from fork-init).
+                    is_duplicate = True
+            else:
+                user_msg = HumanMessage(
+                    content=prompt,
+                    id=msg_id,
+                    metadata={"user_id": user_id,
+                              "thread_id": thread_id,
+                              "timestamp": timestamp}
+                )
+
+                # Combine hydrated history with new message
+                messages_input = initial_messages + [user_msg]
+
+                # Deduplicate logic: If we hydrated from DB and the last message matches the current user message, don't append it again.
+                is_duplicate = False
+                if initial_messages:
+                    last_msg = initial_messages[-1]
+
+                    if _is_duplicate_hydrated_user_message(last_msg, msg_id):
+                        is_duplicate = True
+
+                    if is_duplicate:
+                        logger.info(f"Duplicate message detected in hydration: {msg_id}. Using DB version.")
+                        messages_input = initial_messages
 
             try:
                 result = self.graph.invoke(
@@ -250,7 +280,15 @@ class getGraphResponse():
             if final_message is None:
                 raise RuntimeError("Agent produced no output")
 
-            if not is_duplicate:
+            # Persistence decision matrix:
+            #   regenerate_last_user → user msg already in DB from fork-init;
+            #                          save only the AI response.
+            #   is_duplicate (retry) → both already in DB; save nothing.
+            #   normal               → save both.
+            should_save_user = (not is_duplicate) and (not regenerate_last_user)
+            should_save_assistant = regenerate_last_user or (not is_duplicate)
+
+            if should_save_user or should_save_assistant:
                 try:
                     updated_memory_facts = self._update_thread_memory_facts(
                         user_id=user_id,
@@ -262,31 +300,33 @@ class getGraphResponse():
                         ],
                     )
 
-                    self.mongo_store.add_message(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        role="user",
-                        text=query,
-                        message_id=msg_id,
-                        embedding=get_embedding(query) or [],
-                        summary=updated_summary,
-                        summarize_fn="None",
-                        embed_summary_fn=get_embedding,
-                        context_fn=[]
-                    )
+                    if should_save_user:
+                        self.mongo_store.add_message(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            role="user",
+                            text=query,
+                            message_id=msg_id,
+                            embedding=get_embedding(query) or [],
+                            summary=updated_summary,
+                            summarize_fn="None",
+                            embed_summary_fn=get_embedding,
+                            context_fn=[]
+                        )
 
-                    self.mongo_store.add_message(
-                        user_id=user_id,
-                        thread_id=thread_id,
-                        role="assistant",
-                        message_id=f"{msg_id}_ai",
-                        text=str(final_message) if not isinstance(final_message, str) else final_message,
-                        embedding=get_embedding(str(final_message)) or [],
-                        summary=updated_summary,
-                        summarize_fn="None",
-                        embed_summary_fn=get_embedding,
-                        context_fn=[]
-                    )
+                    if should_save_assistant:
+                        self.mongo_store.add_message(
+                            user_id=user_id,
+                            thread_id=thread_id,
+                            role="assistant",
+                            message_id=f"{msg_id}_ai",
+                            text=str(final_message) if not isinstance(final_message, str) else final_message,
+                            embedding=get_embedding(str(final_message)) or [],
+                            summary=updated_summary,
+                            summarize_fn="None",
+                            embed_summary_fn=get_embedding,
+                            context_fn=[]
+                        )
                 except Exception as e:
                     logger.error(f"getGraphResponse Convo save : {e}")
                     return False
@@ -307,6 +347,7 @@ class getGraphResponse():
         system_prompt=None,
         last_k_messages=None,
         external_context_top_k=None,
+        regenerate_last_user: bool = False,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -334,23 +375,49 @@ class getGraphResponse():
 
         prompt = get_formated_prompt(query, user_id)
         timestamp = datetime.utcnow().isoformat()
-        user_msg = HumanMessage(
-            content=prompt,
-            id=msg_id,
-            metadata={"user_id": user_id, "thread_id": thread_id, "timestamp": timestamp}
-        )
 
-        messages_input = initial_messages + [user_msg]
-
-        # Deduplicate
-        is_duplicate = False
-        if initial_messages:
-            last_msg = initial_messages[-1]
-            if _is_duplicate_hydrated_user_message(last_msg, msg_id):
-                is_duplicate = True
-            if is_duplicate:
-                logger.info(f"Duplicate message detected in stream hydration: {msg_id}.")
+        if regenerate_last_user:
+            # Forking from a user message: the buffer already ends with that
+            # user message. Don't append a duplicate — replay the buffer tail
+            # as the prompt and persist only the assistant's reply.
+            if not initial_messages or not isinstance(initial_messages[-1], HumanMessage):
+                logger.warning(
+                    "regenerate_last_user requested but stream buffer tail is not a user "
+                    "message; falling back to normal append for thread %s",
+                    thread_id,
+                )
+                user_msg = HumanMessage(
+                    content=prompt,
+                    id=msg_id,
+                    metadata={"user_id": user_id, "thread_id": thread_id, "timestamp": timestamp},
+                )
+                messages_input = initial_messages + [user_msg]
+                is_duplicate = False
+            else:
+                logger.info(
+                    "regenerate_last_user (stream): replaying buffer tail for thread %s",
+                    thread_id,
+                )
                 messages_input = initial_messages
+                is_duplicate = True
+        else:
+            user_msg = HumanMessage(
+                content=prompt,
+                id=msg_id,
+                metadata={"user_id": user_id, "thread_id": thread_id, "timestamp": timestamp}
+            )
+
+            messages_input = initial_messages + [user_msg]
+
+            # Deduplicate
+            is_duplicate = False
+            if initial_messages:
+                last_msg = initial_messages[-1]
+                if _is_duplicate_hydrated_user_message(last_msg, msg_id):
+                    is_duplicate = True
+                if is_duplicate:
+                    logger.info(f"Duplicate message detected in stream hydration: {msg_id}.")
+                    messages_input = initial_messages
 
         graph_input = {
             "user_id": user_id,
@@ -478,6 +545,7 @@ class getGraphResponse():
         system_prompt: Optional[str] = None,
         last_k_messages: Optional[int] = None,
         external_context_top_k: Optional[int] = None,
+        regenerate_last_user: bool = False,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
@@ -490,6 +558,7 @@ class getGraphResponse():
                 system_prompt=system_prompt,
                 last_k_messages=last_k_messages,
                 external_context_top_k=external_context_top_k,
+                regenerate_last_user=regenerate_last_user,
             )
 
             full_response = ""
@@ -526,9 +595,15 @@ class getGraphResponse():
                 logger.error("Agent produced no output in stream")
                 return
 
-            # Save messages to DB (both guarded by is_duplicate to prevent double-saves on retry)
+            # Persistence decision matrix (mirrors the sync get_response):
+            #   regenerate_last_user → user msg already in DB from fork-init;
+            #                          save only the AI response.
+            #   is_duplicate (retry) → both already in DB; save nothing.
+            #   normal               → save both.
+            should_save_user = (not is_duplicate) and (not regenerate_last_user)
+            should_save_assistant = regenerate_last_user or (not is_duplicate)
             try:
-                if not is_duplicate:
+                if should_save_user or should_save_assistant:
                     updated_memory_facts = self._update_thread_memory_facts(
                         user_id=user_id,
                         thread_id=thread_id,
@@ -538,21 +613,23 @@ class getGraphResponse():
                             {"role": "assistant", "text": full_response},
                         ],
                     )
-                    self.mongo_store.add_message(
-                        user_id=user_id, thread_id=thread_id,
-                        role="user", text=raw_query, message_id=msg_id,
-                        embedding=get_embedding(raw_query) or [],
-                        summary=updated_summary, summarize_fn="None",
-                        embed_summary_fn=get_embedding, context_fn=[]
-                    )
-                    self.mongo_store.add_message(
-                        user_id=user_id, thread_id=thread_id,
-                        role="assistant", message_id=f"{msg_id}_ai",
-                        text=full_response,
-                        embedding=get_embedding(full_response) or [],
-                        summary=updated_summary, summarize_fn="None",
-                        embed_summary_fn=get_embedding, context_fn=[]
-                    )
+                    if should_save_user:
+                        self.mongo_store.add_message(
+                            user_id=user_id, thread_id=thread_id,
+                            role="user", text=raw_query, message_id=msg_id,
+                            embedding=get_embedding(raw_query) or [],
+                            summary=updated_summary, summarize_fn="None",
+                            embed_summary_fn=get_embedding, context_fn=[]
+                        )
+                    if should_save_assistant:
+                        self.mongo_store.add_message(
+                            user_id=user_id, thread_id=thread_id,
+                            role="assistant", message_id=f"{msg_id}_ai",
+                            text=full_response,
+                            embedding=get_embedding(full_response) or [],
+                            summary=updated_summary, summarize_fn="None",
+                            embed_summary_fn=get_embedding, context_fn=[]
+                        )
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
 

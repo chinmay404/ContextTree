@@ -68,4 +68,15 @@ class ChatMessage(BaseModel):
         ),
         alias="contextNodeIds",
     )
+    regenerate_last_user: bool = Field(
+        default=False,
+        description=(
+            "Set to true when forking from a user message and immediately "
+            "asking the model to answer it again in the new branch. The fork "
+            "buffer already ends with the user message; the backend skips "
+            "appending a new HumanMessage and skips the user-message DB write, "
+            "and only persists the assistant's fresh reply."
+        ),
+        alias="regenerateLastUser",
+    )
     user_id: Optional[str] = Field(None, description="User identifier")
