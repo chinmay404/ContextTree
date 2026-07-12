@@ -4,16 +4,17 @@ Chat endpoints.
 POST /       — synchronous (returns full response JSON)
 POST /stream — streaming (Server-Sent Events)
 
-Rate limit: 60 messages/minute per authenticated user_id.
-If user_id is not present in the body (shouldn't happen in normal use),
-falls back to remote IP to avoid crashing.
+Identity comes from the verified service JWT (app/api/auth.py), never from
+the request body. Rate limit: 60 messages/minute per verified user id.
 """
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
+
+from app.api.auth import get_current_user_id
 
 from app.agent.helpers.get_llm import get_llm, validate_model_access
 from app.agent.helpers.memory_model import get_summary_model_name
@@ -35,12 +36,12 @@ graph_init = False
 graph_error = None
 
 
-def _build_chat_run_config(chat_message: ChatMessage, transport: str) -> dict:
+def _build_chat_run_config(chat_message: ChatMessage, transport: str, user_id: str) -> dict:
     return {
         **build_langsmith_trace_config(
             run_name=f"contexttree_chat_{transport}",
             conversation_id=chat_message.conversation_id,
-            user_id=chat_message.user_id,
+            user_id=user_id,
             message_id=chat_message.message_id,
             model_name=chat_message.model_name,
             transport=transport,
@@ -100,25 +101,23 @@ def _require_graph():
 _initialise_graph()
 
 
-# ── Rate-limit key: prefer user_id from body, fall back to IP ─────────────────
+# ── Rate-limit key: the VERIFIED user id (set by get_current_user_id) ────────
 def _user_key(request: Request) -> str:
     """
-    SlowAPI key function.  We want per-user limits, not per-IP, so that users
-    behind the same NAT/proxy don't block each other.
-    The user_id is injected into the request body by the Next.js proxy before
-    forwarding, so we can read it here.  Body parsing is done lazily via state
-    set by the dependency injection route function.
+    SlowAPI key function. Per-user limits, not per-IP, so users behind the
+    same NAT don't block each other. request.state.user_id is set by the
+    auth dependency from the verified JWT — it cannot be spoofed via the body.
     """
     uid = getattr(request.state, "user_id", None)
     if uid:
         return uid
-    # Fallback — shouldn't happen in production
+    # Unauthenticated requests (will be rejected by the dependency anyway)
     return request.client.host if request.client else "unknown"
 
 
 # ── Fork initialisation (shared between sync and stream routes) ───────────────
 
-def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str) -> None:
+def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str, user_id: str) -> None:
     """
     On the first message of a branched node, seed the new thread with a
     compressed summary + a small verbatim buffer from the parent.
@@ -170,7 +169,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         return
 
     fork_source = active_graph.mongo_store.get_fork_inheritance_payload(
-        user_id=chat_message.user_id,
+        user_id=user_id,
         thread_id=parent_thread_id,
         message_id=fork_at_message_id,
         recent_limit=max(2, int(getattr(settings, "KEEP_LAST_MESSAGES", 6))),
@@ -191,7 +190,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
         logger.warning("fork_at_message_id not found; falling back to last-K messages")
         messages_data = active_graph.mongo_store.get_thread_recent_messages(
-            chat_message.user_id,
+            user_id,
             parent_thread_id,
             fallback_k,
         )
@@ -218,7 +217,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
                 lc_messages.append(AIMessage(content=m["text"]))
 
         summary_model = get_summary_model_name(chat_message.model_name)
-        llm = get_llm(summary_model, user_id=chat_message.user_id)
+        llm = get_llm(summary_model, user_id=user_id)
         if llm:
             try:
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
@@ -226,7 +225,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
                     build_langsmith_trace_config(
                         run_name="contexttree_fork_initial_summary",
                         conversation_id=chat_message.conversation_id,
-                        user_id=chat_message.user_id,
+                        user_id=user_id,
                         message_id=chat_message.message_id,
                         model_name=summary_model,
                         transport=transport,
@@ -255,7 +254,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     # thread_id. Concurrent first-message requests for the same fork serialize
     # at this point and the loser observes is_initialized=true and returns.
     active_graph.mongo_store.fork_thread(
-        user_id=chat_message.user_id,
+        user_id=user_id,
         source_thread_id=parent_thread_id,
         new_thread_id=chat_message.conversation_id,
         fork_at_message_id=fork_at_message_id,
@@ -274,7 +273,11 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
 
 @router.post("/")
 @limiter.limit("60/minute", key_func=_user_key)
-async def get_response(chat_message: ChatMessage, request: Request):
+async def get_response(
+    chat_message: ChatMessage,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
     active_graph = _require_graph()
 
     if not chat_message.conversation_id:
@@ -283,17 +286,14 @@ async def get_response(chat_message: ChatMessage, request: Request):
             detail="nodeId (conversation_id) is required",
         )
 
-    # Store user_id on request.state so _user_key can read it
-    request.state.user_id = chat_message.user_id or request.client.host
-
     try:
-        access_error = validate_model_access(chat_message.model_name, chat_message.user_id)
+        access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "http")
+        _init_fork_if_needed(chat_message, active_graph, "http", user_id)
 
-        config = _build_chat_run_config(chat_message, "http")
+        config = _build_chat_run_config(chat_message, "http", user_id)
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         res = active_graph.get_response(
@@ -301,7 +301,7 @@ async def get_response(chat_message: ChatMessage, request: Request):
             msg_id=chat_message.message_id,
             config=config,
             thread_id=chat_message.conversation_id,
-            user_id=chat_message.user_id,
+            user_id=user_id,
             context_node_ids=chat_message.context_node_ids,
             system_prompt=chat_message.system_prompt,
             last_k_messages=chat_message.last_k_messages,
@@ -312,7 +312,7 @@ async def get_response(chat_message: ChatMessage, request: Request):
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
 
         summary = active_graph.mongo_store.get_thread_summary(
-            chat_message.user_id, chat_message.conversation_id
+            user_id, chat_message.conversation_id
         )
         return {"message": res, "summary": summary or ""}
 
@@ -327,7 +327,11 @@ async def get_response(chat_message: ChatMessage, request: Request):
 
 @router.post("/stream")
 @limiter.limit("60/minute", key_func=_user_key)
-async def stream_response(chat_message: ChatMessage, request: Request):
+async def stream_response(
+    chat_message: ChatMessage,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
     active_graph = _require_graph()
 
     if not chat_message.conversation_id:
@@ -336,16 +340,14 @@ async def stream_response(chat_message: ChatMessage, request: Request):
             detail="nodeId (conversation_id) is required",
         )
 
-    request.state.user_id = chat_message.user_id or request.client.host
-
     try:
-        access_error = validate_model_access(chat_message.model_name, chat_message.user_id)
+        access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "sse")
+        _init_fork_if_needed(chat_message, active_graph, "sse", user_id)
 
-        config = _build_chat_run_config(chat_message, "sse")
+        config = _build_chat_run_config(chat_message, "sse", user_id)
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         return StreamingResponse(
@@ -354,7 +356,7 @@ async def stream_response(chat_message: ChatMessage, request: Request):
                 msg_id=chat_message.message_id,
                 config=config,
                 thread_id=chat_message.conversation_id,
-                user_id=chat_message.user_id,
+                user_id=user_id,
                 context_node_ids=chat_message.context_node_ids,
                 system_prompt=chat_message.system_prompt,
                 last_k_messages=chat_message.last_k_messages,

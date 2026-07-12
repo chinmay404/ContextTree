@@ -1,0 +1,3 @@
+# Optional providers — install where prebuilt wheels exist (Linux / py<=3.12).
+# The app imports these lazily and degrades gracefully without them.
+langchain-litellm

@@ -4,8 +4,10 @@ import logging
 import tempfile
 import os
 from typing import List, Optional, Tuple
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
+
+from app.api.auth import get_current_user_id
 from langchain_community.document_loaders import CSVLoader, Docx2txtLoader, PyPDFLoader, TextLoader, UnstructuredMarkdownLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -17,9 +19,10 @@ router = APIRouter()
 
 class IngestRequest(BaseModel):
     file_id: str
-    user_email: str
     node_id: Optional[str] = None
     canvas_id: Optional[str] = None
+    # Identity comes from the verified service JWT (app/api/auth.py),
+    # never from the request body.
 
 def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tuple[List[str], List[dict], str, Optional[str]]:
     """
@@ -186,10 +189,14 @@ def process_file_background(request: IngestRequest):
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
-async def ingest_file(request: IngestRequest, background_tasks: BackgroundTasks):
+async def ingest_file(
+    request: IngestRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user_id),
+):
     """
     Triggers background ingestion of a file already stored in DB.
     """
-    logger.info(f"Ingest request received for file_id: {request.file_id} user: {request.user_email}")
+    logger.info(f"Ingest request received for file_id: {request.file_id} user: {user_id}")
     background_tasks.add_task(process_file_background, request)
     return {"status": "processing_started", "file_id": request.file_id}

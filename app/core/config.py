@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # ── Secure BYOK storage ────────────────────────────────────────────────────
     BYOK_ENCRYPTION_SECRET: Optional[str] = None
 
+    # ── Service-to-service auth ────────────────────────────────────────────────
+    # Shared secret with the Next.js proxy; it mints a short-lived HS256 JWT
+    # per request (sub = user id). No secret configured → all requests refused.
+    BACKEND_JWT_SECRET: Optional[str] = None
+
     # ── Conversation memory ────────────────────────────────────────────────────
     # Trigger summarisation after this many assistant turns per node
     MAX_MESSAGES_BEFORE_SUMMARY: int = 10

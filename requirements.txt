@@ -34,17 +34,16 @@ langchain_google_genai
 langchain_groq
 langchain-openai
 langchain-anthropic
-langchain-litellm
+# langchain-litellm → requirements-extras.txt (optional provider; its build
+# needs a Rust toolchain on Python 3.13+, and get_llm imports it lazily)
 langsmith
-langchain
-pymongo
 slowapi
-IPython
-pyppeteer
 psycopg2-binary
 pgvector
-langgraph-checkpoint-redis
 cryptography
+# Removed (V2 cut list): pymongo (Postgres-only since April),
+# langgraph-checkpoint-redis (PostgresSaver only), pyppeteer + IPython
+# (dev scratch; pyppeteer is unmaintained and breaks installs).
 
 
 
@@ -57,3 +56,5 @@ tiktoken
 openai 
 langchain-google-genai
 langchain-text-splitters
+
+PyJWT>=2.8.0

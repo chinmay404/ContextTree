@@ -79,4 +79,6 @@ class ChatMessage(BaseModel):
         ),
         alias="regenerateLastUser",
     )
-    user_id: Optional[str] = Field(None, description="User identifier")
+    # NOTE (V2 security): user identity is NEVER accepted from the request
+    # body. It comes exclusively from the verified service JWT — see
+    # app/api/auth.py:get_current_user_id.
