@@ -1,0 +1,38 @@
+# Render blueprint — deploy the ContextTree FastAPI backend.
+#
+# One-time setup: render.com → New → Blueprint → connect this repo →
+# pick branch `main`. Then paste the env vars marked sync:false in the
+# dashboard (values live in your local .env). Deploys on every push.
+
+services:
+  - type: web
+    name: contexttree-api
+    runtime: python
+    region: frankfurt            # co-located with Supabase eu-west-1
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt -r requirements-extras.txt
+    # migrate.py is idempotent + advisory-locked; runs once per deploy
+    startCommand: python scripts/migrate.py && uvicorn app.api.server:app --host 0.0.0.0 --port $PORT --workers 2
+    healthCheckPath: /api/v1/health/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DATABASE_URL
+        sync: false              # paste from ContextTree/.env
+      - key: BACKEND_JWT_SECRET
+        sync: false              # same value as Vercel
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false              # embeddings (768-dim) + Gemini
+      - key: BYOK_ENCRYPTION_SECRET
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LANGSMITH_TRACING
+        value: "false"
+      - key: DAILY_MESSAGE_LIMIT
+        value: "500"
