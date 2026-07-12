@@ -87,6 +87,15 @@ class PostgresConversationStore:
             pass
         return user_id
 
+    def resolve_user_email(self, user_id: str) -> str:
+        """Public wrapper: map a user id (uuid or email) to the user_email key."""
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                return self._resolve_user_email(cur, user_id)
+        except Exception:
+            return user_id
+
     def _get_default_canvas(self, cur, user_email: str) -> str:
         cur.execute("SELECT id FROM canvases WHERE user_email = %s LIMIT 1", (user_email,))
         row = cur.fetchone()
@@ -170,14 +179,15 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
+                user_email = self._resolve_user_email(cur, user_id)
                 cur.execute(
                     """
                     SELECT id as message_id, role, content as text, timestamp, position, embedding
                     FROM messages
-                    WHERE node_id = %s
+                    WHERE node_id = %s AND user_email = %s
                     ORDER BY timestamp, position
                     """,
-                    (thread_id,),
+                    (thread_id, user_email),
                 )
                 return [dict(r) for r in cur.fetchall()]
         except Exception as e:
@@ -188,15 +198,16 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
+                user_email = self._resolve_user_email(cur, user_id)
                 cur.execute(
                     """
                     SELECT id as message_id, role, content as text, timestamp, position, embedding
                     FROM messages
-                    WHERE node_id = %s
+                    WHERE node_id = %s AND user_email = %s
                     ORDER BY timestamp DESC, position DESC
                     LIMIT %s
                     """,
-                    (thread_id, limit),
+                    (thread_id, user_email, limit),
                 )
                 return list(reversed([dict(r) for r in cur.fetchall()]))
         except Exception as e:
@@ -331,7 +342,11 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT summary FROM nodes WHERE id = %s", (thread_id,))
+                user_email = self._resolve_user_email(cur, user_id)
+                cur.execute(
+                    "SELECT summary FROM nodes WHERE id = %s AND user_email = %s",
+                    (thread_id, user_email),
+                )
                 row = cur.fetchone()
                 return row[0] if row else ""
         except Exception:
@@ -347,10 +362,11 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
+                user_email = self._resolve_user_email(cur, user_id)
                 if summarized_up_to_position is None:
                     cur.execute(
-                        "UPDATE nodes SET summary = %s WHERE id = %s",
-                        (summary, thread_id),
+                        "UPDATE nodes SET summary = %s WHERE id = %s AND user_email = %s",
+                        (summary, thread_id, user_email),
                     )
                 else:
                     # Watermark monotonically advances: never move it backwards even
@@ -360,9 +376,9 @@ class PostgresConversationStore:
                         UPDATE nodes
                         SET summary = %s,
                             summarized_up_to_position = GREATEST(summarized_up_to_position, %s)
-                        WHERE id = %s
+                        WHERE id = %s AND user_email = %s
                         """,
-                        (summary, int(summarized_up_to_position), thread_id),
+                        (summary, int(summarized_up_to_position), thread_id, user_email),
                     )
                 return cur.rowcount > 0
         except Exception:
@@ -373,9 +389,10 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
+                user_email = self._resolve_user_email(cur, user_id)
                 cur.execute(
-                    "SELECT summary, summarized_up_to_position FROM nodes WHERE id = %s",
-                    (thread_id,),
+                    "SELECT summary, summarized_up_to_position FROM nodes WHERE id = %s AND user_email = %s",
+                    (thread_id, user_email),
                 )
                 row = cur.fetchone()
                 if not row:
@@ -404,15 +421,16 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
+                user_email = self._resolve_user_email(cur, user_id)
                 cur.execute(
                     """
                     SELECT id as message_id, role, content as text, timestamp, position, embedding
                     FROM messages
-                    WHERE node_id = %s AND position > %s
+                    WHERE node_id = %s AND user_email = %s AND position > %s
                     ORDER BY timestamp DESC, position DESC
                     LIMIT %s
                     """,
-                    (thread_id, int(after_position or 0), limit),
+                    (thread_id, user_email, int(after_position or 0), limit),
                 )
                 return list(reversed([dict(r) for r in cur.fetchall()]))
         except Exception as e:
@@ -423,7 +441,11 @@ class PostgresConversationStore:
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
-                cur.execute("SELECT data FROM nodes WHERE id = %s", (thread_id,))
+                user_email = self._resolve_user_email(cur, user_id)
+                cur.execute(
+                    "SELECT data FROM nodes WHERE id = %s AND user_email = %s",
+                    (thread_id, user_email),
+                )
                 row = cur.fetchone()
                 data = row["data"] if row else {}
                 if not isinstance(data, dict):
@@ -527,6 +549,22 @@ class PostgresConversationStore:
         }
 
     # ── Thread / ancestry ──────────────────────────────────────────────────────
+
+    def get_thread_owner(self, thread_id: str) -> Optional[str]:
+        """
+        Return the owning user_email of a thread/node, or None if the thread
+        does not exist. Used by the API layer's ownership gate: a request for
+        a thread owned by someone else is rejected before any work happens.
+        """
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT user_email FROM nodes WHERE id = %s", (thread_id,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error resolving thread owner: {e}")
+            return None
 
     def thread_exists(self, thread_id: str) -> bool:
         try:

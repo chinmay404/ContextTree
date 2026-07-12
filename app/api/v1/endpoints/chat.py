@@ -115,6 +115,29 @@ def _user_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# ── Ownership gate (tenancy: the launch-blocker check) ────────────────────────
+
+def _assert_thread_access(active_graph, user_id: str, thread_id: Optional[str]) -> None:
+    """
+    403 if the thread exists and belongs to someone else. A nonexistent
+    thread is allowed — first message on a new node creates it, owned by
+    the caller. Defense-in-depth: every store read is ALSO user-scoped,
+    but this gate fails loudly instead of returning empty data.
+    """
+    if not thread_id:
+        return
+    owner = active_graph.mongo_store.get_thread_owner(thread_id)
+    if owner is None:
+        return
+    resolved = active_graph.mongo_store.resolve_user_email(user_id)
+    if owner != resolved:
+        logger.warning(f"Cross-tenant access denied: user={user_id} thread={thread_id}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this conversation",
+        )
+
+
 # ── Fork initialisation (shared between sync and stream routes) ───────────────
 
 def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str, user_id: str) -> None:
@@ -287,6 +310,9 @@ async def get_response(
         )
 
     try:
+        _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
+        _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
@@ -341,6 +367,9 @@ async def stream_response(
         )
 
     try:
+        _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
+        _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
