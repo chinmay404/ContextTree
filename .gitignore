@@ -166,3 +166,8 @@ cython_debug/
 /.venv
 .venv/
 .env 
+
+# V2 hygiene
+*.pem
+*.log
+res.json
