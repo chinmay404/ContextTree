@@ -115,6 +115,22 @@ def _user_key(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+# ── Daily quota (durable, Postgres-backed — survives restarts/workers) ────────
+
+def _enforce_daily_quota(active_graph, user_id: str) -> None:
+    try:
+        count = active_graph.mongo_store.increment_daily_quota(user_id)
+    except Exception as e:
+        # Quota accounting must never take chat down; log and allow.
+        logger.error(f"Quota accounting failed (allowing request): {e}")
+        return
+    if count > settings.DAILY_MESSAGE_LIMIT:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Daily message limit reached ({settings.DAILY_MESSAGE_LIMIT}/day). Resets at midnight UTC.",
+        )
+
+
 # ── Ownership gate (tenancy: the launch-blocker check) ────────────────────────
 
 def _assert_thread_access(active_graph, user_id: str, thread_id: Optional[str]) -> None:
@@ -312,6 +328,7 @@ async def get_response(
     try:
         _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
         _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        _enforce_daily_quota(active_graph, user_id)
 
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
@@ -369,6 +386,7 @@ async def stream_response(
     try:
         _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
         _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        _enforce_daily_quota(active_graph, user_id)
 
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:

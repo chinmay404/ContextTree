@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # per request (sub = user id). No secret configured → all requests refused.
     BACKEND_JWT_SECRET: Optional[str] = None
 
+    # ── Quotas ─────────────────────────────────────────────────────────────────
+    # Durable daily message cap per verified user (Postgres-backed, survives
+    # restarts/workers). Generous default; plan-based tiers come with billing.
+    DAILY_MESSAGE_LIMIT: int = 500
+
     # ── Conversation memory ────────────────────────────────────────────────────
     # Trigger summarisation after this many assistant turns per node
     MAX_MESSAGES_BEFORE_SUMMARY: int = 10

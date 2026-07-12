@@ -110,3 +110,12 @@ def test_owner_gate_resolves_owner(store_and_data):
     store, _alice, bob, _a_node, b_node = store_and_data
     assert store.get_thread_owner(b_node) == bob
     assert store.get_thread_owner("does_not_exist") is None
+
+
+def test_daily_quota_increments_and_isolates(store_and_data):
+    store, alice, bob, _a, _b = store_and_data
+    a1 = store.increment_daily_quota(alice)
+    a2 = store.increment_daily_quota(alice)
+    b1 = store.increment_daily_quota(bob)
+    assert a2 == a1 + 1
+    assert b1 < a2  # bob's bucket is independent of alice's

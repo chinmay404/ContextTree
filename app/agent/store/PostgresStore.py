@@ -550,6 +550,26 @@ class PostgresConversationStore:
 
     # ── Thread / ancestry ──────────────────────────────────────────────────────
 
+    def increment_daily_quota(self, user_key: str) -> int:
+        """
+        Atomically increment today's message count for a verified user and
+        return the new count. One statement — safe across workers.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO quotas (user_key, day, msg_count)
+                VALUES (%s, CURRENT_DATE, 1)
+                ON CONFLICT (user_key, day)
+                DO UPDATE SET msg_count = quotas.msg_count + 1,
+                              updated_at = now()
+                RETURNING msg_count
+                """,
+                (user_key,),
+            )
+            return int(cur.fetchone()[0])
+
     def get_thread_owner(self, thread_id: str) -> Optional[str]:
         """
         Return the owning user_email of a thread/node, or None if the thread
