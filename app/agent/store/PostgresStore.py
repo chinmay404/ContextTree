@@ -267,7 +267,30 @@ class PostgresConversationStore:
                     (thread_id,),
                 )
                 row = cur.fetchone()
-                return dict(row) if row else None
+                meta = dict(row) if row else None
+
+                # Racing canvas saves have been observed nulling the lineage
+                # columns. The edge the canvas draws is ground truth — fall
+                # back to it so forks can ALWAYS find their parent.
+                if meta is None or not meta.get("parent_node_id"):
+                    cur.execute(
+                        "SELECT from_node FROM edges WHERE to_node = %s LIMIT 1",
+                        (thread_id,),
+                    )
+                    edge = cur.fetchone()
+                    if edge and edge[0]:
+                        meta = meta or {
+                            "forked_from_message_id": None,
+                            "is_initialized": False,
+                            "ancestor_ids": [],
+                        }
+                        meta["parent_node_id"] = edge[0]
+                        logger.info(
+                            "Fork metadata repaired from edges: %s -> parent %s",
+                            thread_id,
+                            edge[0],
+                        )
+                return meta
         except Exception as e:
             logger.error(f"Error fetching fork metadata: {e}")
             return None

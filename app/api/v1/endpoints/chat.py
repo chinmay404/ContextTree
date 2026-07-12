@@ -181,14 +181,17 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
             chat_message.parent_thread_id = parent_thread_id
             chat_message.fork_at_message_id = fork_at_message_id
 
-    if not (parent_thread_id and fork_at_message_id):
+    # Parent is mandatory; a missing fork-point message id is NOT — the
+    # inheritance payload falls back to latest-parent-state in that case
+    # (racing canvas saves have nulled forked_from_message_id in prod).
+    if not parent_thread_id:
         return
+    fork_at_message_id = fork_at_message_id or ""
 
     thread_exists = active_graph.mongo_store.thread_exists(chat_message.conversation_id)
     is_pending_fork = bool(
         node_metadata
         and parent_thread_id
-        and fork_at_message_id
         and (
             not bool(node_metadata.get("is_initialized"))
             or not list(node_metadata.get("ancestor_ids") or [])
