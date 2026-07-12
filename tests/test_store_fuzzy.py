@@ -1,4 +1,4 @@
-import unittest
+﻿import unittest
 import uuid
 import os
 import sys
@@ -12,7 +12,7 @@ load_dotenv()
 from app.agent.store.PostgresStore import PostgresConversationStore
 
 def mock_get_embedding(text: str):
-    return [0.1] * 1536
+    return [0.1] * 768
 
 class TestPostgresStoreFuzzy(unittest.TestCase):
     @classmethod

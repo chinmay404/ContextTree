@@ -1,9 +1,9 @@
-import unittest
+﻿import unittest
 import uuid
 import os
 import sys
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 # Ensure app modules can be imported
@@ -14,9 +14,9 @@ from app.agent.store.PostgresStore import PostgresConversationStore
 
 # Mock embedding function to avoid API calls during DB tests
 def mock_get_embedding(text: str):
-    # Return a random normalized vector of dimension 1536
+    # Return a random normalized vector of dimension 768
     import random
-    vec = [random.random() for _ in range(1536)]
+    vec = [random.random() for _ in range(768)]
     norm = sum(x*x for x in vec) ** 0.5
     return [x/norm for x in vec]
 
@@ -128,7 +128,11 @@ class TestPostgresStore(unittest.TestCase):
         print(f"--- Passed: vector_search found 1 match with score {results[0].get('score')} ---")
 
     def test_3_fork_thread(self):
-        """Test forking a thread from a specific message."""
+        """Test forking a thread: node init + verbatim buffer carried over.
+
+        fork_thread does NOT copy source history; the caller passes the
+        rolling summary plus a small verbatim buffer (initial_messages).
+        """
         # 1. Create a root thread with 3 messages
         msg_ids = [str(uuid.uuid4()) for _ in range(3)]
         for i, mid in enumerate(msg_ids):
@@ -140,30 +144,40 @@ class TestPostgresStore(unittest.TestCase):
                 text=f"Message {i}",
                 embedding=mock_get_embedding(f"Message {i}")
             )
-            
-        # 2. Fork at the second message (index 1)
+
+        # 2. Fork at the second message, carrying the first two as buffer
         new_thread_id = str(uuid.uuid4())
         fork_point = msg_ids[1]
-        
+        base_ts = datetime.now()
+        buffer_messages = [
+            {
+                "role": "user",
+                "text": f"Message {i}",
+                "embedding": mock_get_embedding(f"Message {i}"),
+                "timestamp": base_ts + timedelta(seconds=i),
+            }
+            for i in range(2)
+        ]
+
         success = self.store.fork_thread(
             user_id=self.test_email,
             source_thread_id=self.thread_id,
             new_thread_id=new_thread_id,
             fork_at_message_id=fork_point,
-            summary="Forked Summary"
+            summary="Forked Summary",
+            initial_messages=buffer_messages,
         )
-        
+
         self.assertTrue(success)
-        
-        # 3. Verify new thread history
-        # Should contain Message 0 and Message 1, but NOT Message 2
+
+        # 3. New thread holds exactly the buffer (fresh IDs, same content)
         new_history = self.store.get_thread_messages(self.test_email, new_thread_id)
-        
+
         self.assertEqual(len(new_history), 2)
-        self.assertEqual(new_history[0]['message_id'], msg_ids[0])
-        self.assertEqual(new_history[1]['message_id'], msg_ids[1])
-        
-        print(f"--- Passed: fork_thread verified history containment ---")
+        self.assertEqual(new_history[0]['text'], "Message 0")
+        self.assertEqual(new_history[1]['text'], "Message 1")
+
+        print(f"--- Passed: fork_thread verified buffer containment ---")
 
 if __name__ == '__main__':
     unittest.main()

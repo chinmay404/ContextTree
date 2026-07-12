@@ -535,6 +535,23 @@ def get_llm(
 
     Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
+    # No model chosen → NVIDIA NIM default (widest catalog, larger context
+    # window than free-tier Groq). Groq stays as the cross-provider fallback.
+    if model_name in _NVIDIA_SENTINEL:
+        llm = get_nvidia_llm(
+            None,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+        if llm is not None:
+            return llm
+        return _fallback_to_groq_default(
+            model_name,
+            "NVIDIA",
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
+
     if _is_litellm(model_name):
         llm = get_litellm_llm(
             model_name,
