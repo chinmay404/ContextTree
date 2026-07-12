@@ -196,13 +196,36 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     )
     should_init = (not thread_exists) or is_pending_fork
 
-    if thread_exists and not should_init:
+    own_message_count = 0
+    if thread_exists:
         try:
-            count = active_graph.mongo_store.get_thread_message_count(chat_message.conversation_id)
-            if count <= 1:
-                should_init = True
+            own_message_count = active_graph.mongo_store.get_thread_message_count(
+                chat_message.conversation_id
+            )
         except Exception as e:
             logger.warning(f"Could not check message count for fork init: {e}")
+
+    if thread_exists and not should_init and own_message_count <= 1:
+        should_init = True
+
+    # Self-heal: branches stamped initialized while their parent had nothing
+    # to give (e.g. the parent's replies weren't persisted at fork time) have
+    # no summary. Re-run inheritance so they finally learn their lineage.
+    if thread_exists and not should_init:
+        try:
+            own_summary = sanitize_summary_text(
+                active_graph.mongo_store.get_thread_summary(
+                    user_id, chat_message.conversation_id
+                )
+            )
+            if not own_summary:
+                logger.info(
+                    "Fork %s has no inherited summary — re-running inheritance",
+                    chat_message.conversation_id,
+                )
+                should_init = True
+        except Exception as e:
+            logger.warning(f"Could not check summary for fork re-init: {e}")
 
     if not should_init:
         return
@@ -243,11 +266,21 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         messages_to_summarize = messages_data[:-buffer_size]
         buffer_messages = messages_data[-buffer_size:]
 
+    # Re-initialising a branch that already has its own conversation: buffer
+    # messages can't be inserted (they'd get present-day timestamps and
+    # scramble order), so the summary must carry EVERYTHING — summarize the
+    # full parent scope, not just the pre-buffer portion, and do it even in
+    # skip_resummarize fallback modes (the whole point of the re-init is that
+    # this branch has no summary yet).
+    force_summarize = own_message_count > 1 and bool(messages_data)
+    if force_summarize:
+        messages_to_summarize = messages_data
+
     new_summary = existing_summary
     new_memory_facts = parent_memory_facts if fork_source.get("skip_resummarize") else extract_memory_facts({}, messages_data)
     new_summary_embedding = []
 
-    if messages_to_summarize and not fork_source.get("skip_resummarize"):
+    if messages_to_summarize and (force_summarize or not fork_source.get("skip_resummarize")):
         lc_messages = []
         for m in messages_to_summarize:
             if m["role"] == "user":
@@ -288,6 +321,25 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         len(new_summary or ""),
     )
 
+    # If the parent had NOTHING to inherit (no messages, no summary — e.g. the
+    # parent's own replies failed to persist at the time), do NOT run the fork
+    # write: fork_thread would stamp is_initialized=true and this branch would
+    # be permanently frozen as a blank slate. Leaving it uninitialized lets the
+    # NEXT message retry inheritance once the parent actually has content.
+    if not buffer_messages and not (new_summary or "").strip():
+        logger.warning(
+            "Fork inheritance EMPTY for %s (parent=%s): nothing to seed — "
+            "leaving fork uninitialized so a later message can retry",
+            chat_message.conversation_id,
+            parent_thread_id,
+        )
+        return
+
+    # When re-initializing a branch that already has its own conversation,
+    # seed the summary/facts only — inserting buffer messages now would give
+    # them present-day timestamps and scramble message order.
+    seed_messages = buffer_messages if own_message_count <= 1 else []
+
     # Single atomic fork: node row, buffer messages, and memory facts are
     # written under a transaction-scoped advisory lock keyed on the new
     # thread_id. Concurrent first-message requests for the same fork serialize
@@ -299,12 +351,13 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         fork_at_message_id=fork_at_message_id,
         summary=new_summary,
         summary_embedding=new_summary_embedding,
-        initial_messages=buffer_messages,
+        initial_messages=seed_messages,
         memory_facts=new_memory_facts,
     )
     logger.info(
         f"Fork initialised: {parent_thread_id} → {chat_message.conversation_id} "
-        f"at message {fork_at_message_id}"
+        f"at message {fork_at_message_id} "
+        f"(buffer={len(buffer_messages)}, summary_chars={len(new_summary or '')})"
     )
 
 
