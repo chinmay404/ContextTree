@@ -130,6 +130,23 @@ def async_postgres_saver():
         return None
 
 
+async def ensure_async_pool_open() -> bool:
+    """Open the shared async pool inside a running event loop.
+
+    The pool is created with open=False at startup (no loop yet); psycopg_pool
+    does NOT open lazily, so streaming must await this once per process before
+    using the async saver. Opening an already-open pool is a no-op.
+    """
+    if _async_pg_pool is None:
+        return False
+    try:
+        await _async_pg_pool.open(wait=True, timeout=10)
+        return True
+    except Exception as e:
+        print(f"Async pool open failed: {e}")
+        return False
+
+
 def _safe_close_pool(pool):
     try:
         if pool:

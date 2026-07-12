@@ -22,7 +22,7 @@ _GROQ_DEFAULT = os.getenv("DEFAULT_GROQ_MODEL") or "openai/gpt-oss-120b"
 _GROQ_SENTINEL = {"None", "null", "default-model-name", "", None}
 _OPENAI_DEFAULT = os.getenv("DEFAULT_OPENAI_MODEL") or "gpt-5"
 _OPENAI_SENTINEL = {"None", "null", "default-model-name", "", None}
-_NVIDIA_DEFAULT = os.getenv("DEFAULT_NVIDIA_MODEL") or "moonshotai/kimi-k2-instruct-0905"
+_NVIDIA_DEFAULT = os.getenv("DEFAULT_NVIDIA_MODEL") or "z-ai/glm-5.2"
 _NVIDIA_SENTINEL = {"None", "null", "default-model-name", "", None}
 _ANTHROPIC_DEFAULT = os.getenv("DEFAULT_ANTHROPIC_MODEL") or "claude-sonnet-4-20250514"
 _ANTHROPIC_SENTINEL = {"None", "null", "default-model-name", "", None}
@@ -115,16 +115,24 @@ _ANTHROPIC_ALIASES: dict[str, str] = {
     "anthropic/claude-opus-4-1": "claude-opus-4-1-20250805",
 }
 
+# NIM rotated its catalog (July 2026): deepseek v3.x -> v4, glm 4.7 -> 5.2;
+# kimi ids are listed but not invocable on our key (404), so they alias to
+# GLM-5.2 — old nodes keep responding instead of dying. Verified working:
+# z-ai/glm-5.2, mistralai/mistral-large-3-675b-instruct-2512.
 _NVIDIA_ALIASES: dict[str, str] = {
-    "moonshotai/kimi-k2-instruct": "moonshotai/kimi-k2-instruct",
-    "moonshotai/kimi-k2-instruct-0905": "moonshotai/kimi-k2-instruct-0905",
-    "z-ai/glm-4.7": "z-ai/glm4.7",
-    "z-ai/glm4.7": "z-ai/glm4.7",
-    "z-ai/glm4_7": "z-ai/glm4.7",
-    "deepseek-ai/deepseek-v3.1": "deepseek-ai/deepseek-v3.1",
-    "deepseek-ai/deepseek-v3_1": "deepseek-ai/deepseek-v3.1",
-    "deepseek-ai/deepseek-v3.2": "deepseek-ai/deepseek-v3.2",
-    "deepseek-ai/deepseek-v3_2": "deepseek-ai/deepseek-v3.2",
+    "moonshotai/kimi-k2-instruct": "z-ai/glm-5.2",
+    "moonshotai/kimi-k2-instruct-0905": "z-ai/glm-5.2",
+    "moonshotai/kimi-k2.6": "z-ai/glm-5.2",
+    "z-ai/glm-4.7": "z-ai/glm-5.2",
+    "z-ai/glm4.7": "z-ai/glm-5.2",
+    "z-ai/glm4_7": "z-ai/glm-5.2",
+    "z-ai/glm-5.2": "z-ai/glm-5.2",
+    "deepseek-ai/deepseek-v3.1": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v3_1": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v3.2": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v3_2": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash",
+    "deepseek-ai/deepseek-v4-pro": "deepseek-ai/deepseek-v4-pro",
     "mistralai/mistral-large-3-675b-instruct-2512": "mistralai/mistral-large-3-675b-instruct-2512",
 }
 

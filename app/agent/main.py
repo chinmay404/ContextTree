@@ -569,6 +569,9 @@ class getGraphResponse():
             stream_graph = self.async_graph if self.async_graph else None
             if stream_graph:
                 try:
+                    from app.agent.utils.saver import ensure_async_pool_open
+                    if not await ensure_async_pool_open():
+                        raise RuntimeError("async checkpoint pool unavailable")
                     async for event in stream_graph.astream_events(graph_input, config, version="v1"):
                         kind = event["event"]
                         if kind == "on_chat_model_stream":

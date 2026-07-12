@@ -43,7 +43,7 @@ class Settings(BaseSettings):
 
     # ── LLM: NVIDIA NIM ────────────────────────────────────────────────────────
     NVIDIA_API_KEY: Optional[str] = None
-    DEFAULT_NVIDIA_MODEL: str = "moonshotai/kimi-k2-instruct-0905"
+    DEFAULT_NVIDIA_MODEL: str = "z-ai/glm-5.2"
     SUMMARY_MODEL_NAME: str = "openai/gpt-oss-120b"
 
     # ── Observability: LangSmith ──────────────────────────────────────────────
