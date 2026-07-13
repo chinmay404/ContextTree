@@ -179,5 +179,36 @@ class TestPostgresStore(unittest.TestCase):
 
         print(f"--- Passed: fork_thread verified buffer containment ---")
 
+    def test_positions_are_populated_and_monotonic(self):
+        """add_message must assign sequential, non-NULL positions per node."""
+        for i in range(3):
+            self.store.add_message(
+                user_id=self.test_email,
+                thread_id=self.thread_id,
+                message_id=str(uuid.uuid4()),
+                role="user" if i % 2 == 0 else "assistant",
+                text=f"message {i}",
+                embedding=mock_get_embedding(f"message {i}"),
+            )
+        rows = self.store.get_thread_messages(self.test_email, self.thread_id)
+        positions = [r["position"] for r in rows]
+        self.assertEqual(len(positions), 3)
+        self.assertTrue(all(p is not None for p in positions), "positions must not be NULL")
+        self.assertEqual(sorted(positions), [1, 2, 3], "positions must be 1..N monotonic")
+
+    def test_get_messages_after_watermark_zero_returns_new_rows(self):
+        """The fork-hydration query must see freshly inserted rows (position > 0)."""
+        self.store.add_message(
+            user_id=self.test_email,
+            thread_id=self.thread_id,
+            message_id=str(uuid.uuid4()),
+            role="user",
+            text="hydrate me",
+            embedding=mock_get_embedding("hydrate me"),
+        )
+        after = self.store.get_thread_messages_after(self.test_email, self.thread_id, 0, 10)
+        self.assertEqual(len(after), 1, "watermark=0 must return the new message")
+        self.assertEqual(after[0]["text"], "hydrate me")
+
 if __name__ == '__main__':
     unittest.main()

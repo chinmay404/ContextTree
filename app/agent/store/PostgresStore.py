@@ -168,11 +168,12 @@ class PostgresConversationStore:
             emb = self._normalize_embedding(embedding)
             cur.execute(
                 """
-                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
+                SELECT %s, %s, %s, %s, %s, %s, %s,
+                       COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0) + 1
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (message_id, thread_id, role, text, emb, now, user_email),
+                (message_id, thread_id, role, text, emb, now, user_email, thread_id),
             )
 
     def get_thread_messages(self, user_id: str, thread_id: str) -> List[dict]:
@@ -932,8 +933,9 @@ class PostgresConversationStore:
 
             cur.execute(
                 """
-                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
+                SELECT %s, %s, %s, %s, %s, %s, %s,
+                       COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0) + 1
                 """,
                 (
                     str(uuid.uuid4()),
@@ -943,6 +945,7 @@ class PostgresConversationStore:
                     emb,
                     timestamp,
                     user_email,
+                    node_id,
                 ),
             )
 
