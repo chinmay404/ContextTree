@@ -18,6 +18,7 @@ _LEADING_SUMMARY_PREFIX_RE = re.compile(
 _USER_NAME_PATTERNS = (
     re.compile(r"\bmy name is\s+([A-Za-z][\w.-]{1,39}(?:\s+[A-Za-z][\w.-]{1,39})?)", re.IGNORECASE),
     re.compile(r"\bcall me\s+([A-Za-z][\w.-]{1,39}(?:\s+[A-Za-z][\w.-]{1,39})?)", re.IGNORECASE),
+    re.compile(r"\b[Ii](?:'?m| am)\s+([A-Z][\w.-]{1,39})"),
 )
 _ASSISTANT_NAME_PATTERNS = (
     re.compile(r"\bi(?: would|'d)? like to call you\s+([A-Za-z][\w.-]{1,39})", re.IGNORECASE),
