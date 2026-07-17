@@ -28,25 +28,29 @@ def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tup
     """
     Returns chunks, metadatas, full_text (for preview), and error message if any.
     """
-    suffix = ""
-    # Determine suffix based on mime_type (robust priority) or extension
-    if mime_type == "text/csv" or file_name.endswith(".csv"):
-        suffix = ".csv"
-    elif mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or file_name.endswith(".docx"):
+    import pathlib
+
+    # Allowlist (owner decision 2026-07-17): documents only. Anything else
+    # errors loudly instead of falling back to TextLoader garbage — the
+    # error lands on the node via update_node_processing_error.
+    lower = (file_name or "").lower()
+    if mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" or lower.endswith(".docx"):
         suffix = ".docx"
-    elif mime_type == "application/pdf" or file_name.endswith(".pdf"):
+    elif mime_type == "application/pdf" or lower.endswith(".pdf"):
         suffix = ".pdf"
-    elif mime_type == "text/markdown" or file_name.endswith(".md"):
+    elif mime_type == "text/markdown" or lower.endswith(".md"):
         suffix = ".md"
+    elif mime_type == "text/plain" or lower.endswith(".txt"):
+        suffix = ".txt"
+    elif lower.endswith(".doc"):
+        raise ValueError(
+            "Legacy .doc format can't be parsed — save it as .docx or PDF and re-upload."
+        )
     else:
-        # Default fallback
-        if file_name.endswith(".txt") or mime_type == "text/plain":
-            suffix = ".txt"
-        else:
-            # If unknown, try assuming txt or check extension strictly
-            import pathlib
-            ext = pathlib.Path(file_name).suffix
-            suffix = ext if ext else ".txt"
+        ext = pathlib.Path(lower).suffix or "(none)"
+        raise ValueError(
+            f"Unsupported file type {ext}. Allowed: PDF, TXT, MD, DOCX."
+        )
 
     tmp_path = ""
     try:
@@ -55,10 +59,7 @@ def load_and_split_documents(data: bytes, mime_type: str, file_name: str) -> Tup
             tmp_path = tmp.name
 
         docs = []
-        if suffix == ".csv":
-            loader = CSVLoader(file_path=tmp_path)
-            docs = loader.load()
-        elif suffix == ".docx":
+        if suffix == ".docx":
             loader = Docx2txtLoader(tmp_path)
             docs = loader.load()
         elif suffix == ".pdf":
