@@ -185,6 +185,15 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     # inheritance payload falls back to latest-parent-state in that case
     # (racing canvas saves have nulled forked_from_message_id in prod).
     if not parent_thread_id:
+        # No parent in the request body, the node row, or the edges table.
+        # This node will be created as a ROOT — if it was meant to be a fork,
+        # that lineage is lost. Log loudly: this path was invisible in prod.
+        logger.warning(
+            "Fork init skipped for %s: no parent resolvable (body=%s, node_row=%s)",
+            chat_message.conversation_id,
+            chat_message.parent_thread_id,
+            bool(node_metadata),
+        )
         return
     fork_at_message_id = fork_at_message_id or ""
 

@@ -30,6 +30,23 @@ MAX_FILE_METADATA_CHARS = 220
 SIMILARITY_MIN_SCORE = max(0.0, float(getattr(settings, "SIMILARITY_MIN_SCORE", 0.2)))
 
 
+def _content_to_text(content) -> str:
+    """LangChain message content is a str OR a list of parts (Gemini sends
+    [{'type':'text','text':...}, ...]). Normalize to plain text — string
+    concatenation with a list part crashed async streaming to sync fallback."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if isinstance(part, str):
+                out.append(part)
+            elif isinstance(part, dict):
+                out.append(str(part.get("text") or ""))
+        return "".join(out)
+    return str(content or "")
+
+
 def _clip_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
     if len(text) <= max_chars:
@@ -86,6 +103,19 @@ def _build_memory_saver():
 class getGraphResponse():
     def __init__(self):
         self.memory = postgres_saver()
+        if self.memory is None:
+            # Boot can race the deploy-overlap window when the outgoing
+            # instance still holds session-pooler slots (EMAXCONNSESSION).
+            # Retry before accepting the in-memory fallback — that fallback
+            # silently loses conversation state and never recovers.
+            import time as _time
+
+            for attempt in range(1, 4):
+                _time.sleep(5)
+                self.memory = postgres_saver()
+                if self.memory is not None:
+                    logger.info("PostgresSaver recovered on retry %d", attempt)
+                    break
         if self.memory is None:
             logger.warning(
                 "PostgresSaver unavailable; falling back to in-memory checkpointing."
@@ -598,7 +628,7 @@ class getGraphResponse():
                     async for event in stream_graph.astream_events(graph_input, config, version="v1"):
                         kind = event["event"]
                         if kind == "on_chat_model_stream":
-                            content = event["data"]["chunk"].content
+                            content = _content_to_text(event["data"]["chunk"].content)
                             if content:
                                 full_response += content
                                 yield f"data: {json.dumps({'message': content})}\n\n"
@@ -613,7 +643,7 @@ class getGraphResponse():
                 ai_messages = result.get("messages", []) if result else []
                 ai_responses = [msg for msg in ai_messages if isinstance(msg, AIMessage)]
                 if ai_responses:
-                    full_response = str(ai_responses[-1].content)
+                    full_response = _content_to_text(ai_responses[-1].content)
                     yield f"data: {json.dumps({'message': full_response})}\n\n"
                 updated_summary = result.get("summary", existing_summary) if result else existing_summary
 
