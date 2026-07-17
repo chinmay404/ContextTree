@@ -236,7 +236,7 @@ class getGraphResponse():
 
             existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
-            context_snippets, external_context_str = self._build_retrieved_context(
+            context_snippets, external_context_str, _web_hits = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
                 web_search=web_search,
@@ -418,7 +418,7 @@ class getGraphResponse():
         # Check for existing state in LangGraph
         current_state = self.graph.get_state(config)
         initial_messages = []
-        context_snippets, external_context_str = self._build_retrieved_context(
+        context_snippets, external_context_str, web_hits = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
             web_search=web_search,
@@ -502,7 +502,7 @@ class getGraphResponse():
             "system_prompt": system_prompt,
         }
 
-        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query
+        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits
 
     def _hydrate_recent_messages(
         self,
@@ -548,6 +548,7 @@ class getGraphResponse():
     ):
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
+        web_hits: list[dict] = []
 
         # Web search is embedding-independent: it must work even when the
         # embedding provider is down, and it never blocks the turn.
@@ -564,7 +565,7 @@ class getGraphResponse():
         query_embedding = get_embedding(query) or []
         if not _has_meaningful_embedding(query_embedding):
             web_only = "\n\n".join(external_context_snippets) if external_context_snippets else None
-            return [], web_only
+            return [], web_only, web_hits
 
         try:
             thread_scope = self.mongo_store.get_thread_ancestry_scopes(thread_id)
@@ -612,7 +613,7 @@ class getGraphResponse():
             logger.error(f"File context search failed: {e}")
 
         external_context_str = "\n\n".join(external_context_snippets) if external_context_snippets else None
-        return context_snippets, external_context_str
+        return context_snippets, external_context_str, web_hits
 
     async def get_stream_response(
         self,
@@ -629,7 +630,7 @@ class getGraphResponse():
         web_search: bool = False,
     ):
         try:
-            graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
+            graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits = self._prepare_stream_input(
                 query,
                 config,
                 user_id,
@@ -646,6 +647,12 @@ class getGraphResponse():
             full_response = ""
             updated_summary = existing_summary
             streamed = False
+
+            # Preamble: tell the client what the web search found BEFORE the
+            # tokens start, so the UI can render "Searched the web · N
+            # sources" chips while the model is still thinking.
+            if web_hits:
+                yield f"data: {json.dumps({'web_search': {'results': [{'title': h.get('title'), 'url': h.get('url')} for h in web_hits]}})}\n\n"
 
             # Try async streaming with async graph first
             stream_graph = self.async_graph if self.async_graph else None
