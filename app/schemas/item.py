@@ -68,6 +68,15 @@ class ChatMessage(BaseModel):
         ),
         alias="contextNodeIds",
     )
+    web_search: bool = Field(
+        default=False,
+        description=(
+            "When true, run a free DuckDuckGo search on the query and inject "
+            "the top snippets into <EXTERNAL_CONTEXT> for this turn only. "
+            "Search failures never block the turn."
+        ),
+        alias="webSearch",
+    )
     regenerate_last_user: bool = Field(
         default=False,
         description=(

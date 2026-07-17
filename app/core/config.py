@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # Carry forward this many messages as verbatim buffer when forking
     FORK_BUFFER_MESSAGES: int = 2
 
+    # ── Web search (free, DuckDuckGo via ddgs — no API key) ────────────────────
+    # Kill switch; per-turn opt-in still comes from ChatMessage.web_search
+    WEB_SEARCH_ENABLED: bool = True
+
     # ── Context assembly ───────────────────────────────────────────────────────
     # Max tokens reserved for rolling summary
     MAX_SUMMARY_TOKENS: int = 500

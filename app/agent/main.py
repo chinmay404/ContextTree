@@ -11,6 +11,7 @@ from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
+from app.agent.helpers.web_search import search_web, format_web_snippets
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -19,6 +20,8 @@ from fastapi import HTTPException
 
 SIMILAR_CONTEXT_LIMIT = 3
 FILE_CONTEXT_LIMIT = 3
+WEB_CONTEXT_LIMIT = 3
+MAX_WEB_SNIPPET_CHARS = 600
 MAX_SUMMARY_CHARS = 2400
 MAX_RECENT_MESSAGE_CHARS = 1400
 MAX_SIMILAR_SNIPPET_CHARS = 320
@@ -147,6 +150,7 @@ class getGraphResponse():
         last_k_messages: Optional[int] = None,
         external_context_top_k: Optional[int] = None,
         regenerate_last_user: bool = False,
+        web_search: bool = False,
     ):
         try:
             # Check for existing state in LangGraph
@@ -176,6 +180,7 @@ class getGraphResponse():
             context_snippets, external_context_str = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
+                web_search=web_search,
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -348,6 +353,7 @@ class getGraphResponse():
         last_k_messages=None,
         external_context_top_k=None,
         regenerate_last_user: bool = False,
+        web_search: bool = False,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -356,6 +362,7 @@ class getGraphResponse():
         context_snippets, external_context_str = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
+            web_search=web_search,
         )
 
         summary_state = self.mongo_store.get_thread_summary_state(user_id, thread_id)
@@ -478,13 +485,27 @@ class getGraphResponse():
         thread_id: str,
         context_node_ids: Optional[list] = None,
         external_context_top_k: Optional[int] = None,
+        web_search: bool = False,
     ):
-        query_embedding = get_embedding(query) or []
-        if not _has_meaningful_embedding(query_embedding):
-            return [], None
-
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
+
+        # Web search is embedding-independent: it must work even when the
+        # embedding provider is down, and it never blocks the turn.
+        if web_search and getattr(settings, "WEB_SEARCH_ENABLED", True):
+            web_hits = search_web(query, max_results=WEB_CONTEXT_LIMIT)
+            if web_hits:
+                logger.info(
+                    "Web search injected %s snippets for thread %s", len(web_hits), thread_id
+                )
+            external_context_snippets.extend(
+                format_web_snippets(web_hits, MAX_WEB_SNIPPET_CHARS)
+            )
+
+        query_embedding = get_embedding(query) or []
+        if not _has_meaningful_embedding(query_embedding):
+            web_only = "\n\n".join(external_context_snippets) if external_context_snippets else None
+            return [], web_only
 
         try:
             thread_scope = self.mongo_store.get_thread_ancestry_scopes(thread_id)
@@ -546,6 +567,7 @@ class getGraphResponse():
         last_k_messages: Optional[int] = None,
         external_context_top_k: Optional[int] = None,
         regenerate_last_user: bool = False,
+        web_search: bool = False,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query = self._prepare_stream_input(
@@ -559,6 +581,7 @@ class getGraphResponse():
                 last_k_messages=last_k_messages,
                 external_context_top_k=external_context_top_k,
                 regenerate_last_user=regenerate_last_user,
+                web_search=web_search,
             )
 
             full_response = ""

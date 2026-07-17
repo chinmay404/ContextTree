@@ -58,3 +58,4 @@ langchain-google-genai
 langchain-text-splitters
 
 PyJWT>=2.8.0
+ddgs

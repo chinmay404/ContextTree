@@ -406,6 +406,7 @@ async def get_response(
             last_k_messages=chat_message.last_k_messages,
             external_context_top_k=chat_message.external_context_top_k,
             regenerate_last_user=chat_message.regenerate_last_user,
+            web_search=chat_message.web_search,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -465,6 +466,7 @@ async def stream_response(
                 last_k_messages=chat_message.last_k_messages,
                 external_context_top_k=chat_message.external_context_top_k,
                 regenerate_last_user=chat_message.regenerate_last_user,
+                web_search=chat_message.web_search,
             ),
             media_type="text/event-stream",
         )
