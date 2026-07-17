@@ -30,6 +30,35 @@ MAX_FILE_METADATA_CHARS = 220
 SIMILARITY_MIN_SCORE = max(0.0, float(getattr(settings, "SIMILARITY_MIN_SCORE", 0.2)))
 
 
+def _split_reasoning(chunk) -> tuple[str, str]:
+    """Separate a model chunk into (reasoning, answer) text.
+
+    Providers deliver "thinking" three ways: inline <think> tags in content
+    (already handled by the UI), a separate additional_kwargs field
+    (NIM/Groq/OpenAI: reasoning_content or reasoning), or thought-flagged
+    parts in a content list (Gemini). The stream re-frames the out-of-band
+    kinds as inline <think> tags so the UI's live Thinking block works for
+    every provider.
+    """
+    ak = getattr(chunk, "additional_kwargs", None) or {}
+    reasoning = str(ak.get("reasoning_content") or ak.get("reasoning") or "")
+
+    content = getattr(chunk, "content", None)
+    if isinstance(content, list):
+        answer_parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                answer_parts.append(part)
+            elif isinstance(part, dict):
+                text = str(part.get("text") or part.get("thinking") or "")
+                if part.get("thought") or part.get("type") in ("thinking", "reasoning"):
+                    reasoning += text
+                else:
+                    answer_parts.append(text)
+        return reasoning, "".join(answer_parts)
+    return reasoning, _content_to_text(content)
+
+
 def _content_to_text(content) -> str:
     """LangChain message content is a str OR a list of parts (Gemini sends
     [{'type':'text','text':...}, ...]). Normalize to plain text — string
@@ -625,13 +654,30 @@ class getGraphResponse():
                     from app.agent.utils.saver import ensure_async_pool_open
                     if not await ensure_async_pool_open():
                         raise RuntimeError("async checkpoint pool unavailable")
+                    in_think = False
                     async for event in stream_graph.astream_events(graph_input, config, version="v1"):
                         kind = event["event"]
                         if kind == "on_chat_model_stream":
-                            content = _content_to_text(event["data"]["chunk"].content)
+                            reasoning, content = _split_reasoning(event["data"]["chunk"])
+                            out = ""
+                            if reasoning:
+                                if not in_think:
+                                    out += "<think>"
+                                    in_think = True
+                                out += reasoning
                             if content:
-                                full_response += content
-                                yield f"data: {json.dumps({'message': content})}\n\n"
+                                if in_think:
+                                    out += "</think>"
+                                    in_think = False
+                                out += content
+                            if out:
+                                full_response += out
+                                yield f"data: {json.dumps({'message': out})}\n\n"
+                    if in_think:
+                        # model ended while "thinking" — close the tag so the
+                        # UI collapses the block instead of spinning forever
+                        full_response += "</think>"
+                        yield f"data: {json.dumps({'message': '</think>'})}\n\n"
                     streamed = True
                 except (NotImplementedError, Exception) as e:
                     logger.warning(f"Async streaming failed, using sync fallback: {e}")
@@ -643,7 +689,10 @@ class getGraphResponse():
                 ai_messages = result.get("messages", []) if result else []
                 ai_responses = [msg for msg in ai_messages if isinstance(msg, AIMessage)]
                 if ai_responses:
-                    full_response = _content_to_text(ai_responses[-1].content)
+                    reasoning, answer = _split_reasoning(ai_responses[-1])
+                    full_response = (
+                        f"<think>{reasoning}</think>" if reasoning else ""
+                    ) + answer
                     yield f"data: {json.dumps({'message': full_response})}\n\n"
                 updated_summary = result.get("summary", existing_summary) if result else existing_summary
 
