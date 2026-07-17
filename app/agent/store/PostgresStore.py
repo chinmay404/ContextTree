@@ -37,8 +37,10 @@ _pool: Optional[pg_pool.ThreadedConnectionPool] = None
 def _get_pool(db_url: str) -> pg_pool.ThreadedConnectionPool:
     global _pool
     if _pool is None:
-        _pool = pg_pool.ThreadedConnectionPool(minconn=2, maxconn=20, dsn=db_url)
-        logger.info("PostgreSQL connection pool created (min=2, max=20)")
+        # Supabase session pooler allows only 15 clients TOTAL; deploys run
+        # two instances during overlap. Keep the idle footprint tiny.
+        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=4, dsn=db_url)
+        logger.info("PostgreSQL connection pool created (min=1, max=4)")
     return _pool
 
 

@@ -44,7 +44,8 @@ def postgres_saver():
         if _pg_pool is None:
             pool = ConnectionPool(
                 conninfo=db_url,
-                max_size=20,
+                min_size=1,  # psycopg_pool defaults min_size=4 — that alone
+                max_size=3,  # nearly fills the 15-slot session pooler x2 workers
                 kwargs=connection_kwargs,
                 open=False,  # Don't connect on creation; open below with error handling
             )
@@ -117,7 +118,8 @@ def async_postgres_saver():
         if _async_pg_pool is None:
             _async_pg_pool = AsyncConnectionPool(
                 conninfo=db_url,
-                max_size=20,
+                min_size=1,  # keep idle footprint tiny (15-slot session pooler)
+                max_size=4,
                 kwargs=connection_kwargs,
                 open=False,  # Don't open immediately; let it open lazily
             )
