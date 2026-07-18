@@ -123,7 +123,7 @@ CREATE TABLE IF NOT EXISTS external_files (
     file_type   text,
     file_size   bigint,
     content     text,
-    data        jsonb,
+    data        bytea,
     mime_type   text,
     processed   boolean DEFAULT false,
     created_at  timestamptz NOT NULL DEFAULT now(),
