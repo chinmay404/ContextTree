@@ -52,10 +52,11 @@ class TestPostgresStoreFuzzy(unittest.TestCase):
         # Frontend asks for "base_id-u"
         frontend_id = f"{base_id}-u"
         summary, msgs = self.store.get_messages_until(self.test_email, self.thread_id, frontend_id)
-        
+
         self.assertTrue(len(msgs) > 0, "Should find message despite suffix mismatch")
-        self.assertEqual(msgs[-1]['message_id'], base_id)
-        print("Success: Mapped -u request to base ID")
+        # add_message stores the canonical "<base>_u" form now.
+        self.assertEqual(msgs[-1]['message_id'], f"{base_id}_u")
+        print("Success: Mapped -u request to canonical _u ID")
 
         # Case 2: DB has _ai ID, Frontend asks for -a ID
         ai_base_id = str(uuid.uuid4())
@@ -75,8 +76,9 @@ class TestPostgresStoreFuzzy(unittest.TestCase):
         summary, msgs = self.store.get_messages_until(self.test_email, self.thread_id, frontend_ai_id)
 
         self.assertTrue(len(msgs) > 0, "Should find AI message despite suffix mismatch")
-        self.assertEqual(msgs[-1]['message_id'], db_ai_id)
-        print("Success: Mapped -a request to _ai ID")
+        # "_ai" input is stored canonically as "<base>_a".
+        self.assertEqual(msgs[-1]['message_id'], f"{ai_base_id}_a")
+        print("Success: Mapped -a request to canonical _a ID")
 
 if __name__ == "__main__":
     unittest.main()

@@ -181,9 +181,18 @@ def test_fork_seeds_summary_buffer_and_ancestry(env):
 
     buffer = s.get_thread_messages(env.alice, env.child_a)
     assert len(buffer) == 2, "FORK_BUFFER(2) messages must be copied verbatim"
-    assert [b["position"] for b in buffer] == [1, 2], (
+    positions = [b["position"] for b in buffer]
+    assert all(p is not None for p in positions) and positions == sorted(positions), (
         "buffer messages must get monotonic non-NULL positions "
         "(NULL positions silently break all hydration — migration 004)"
+    )
+    assert all(p < 1 for p in positions), (
+        "inherited buffer rows must sit BELOW native positions (1, 2, …) so "
+        "they order before anything the user types into the branch"
+    )
+    assert all(b["inherited"] for b in buffer), (
+        "buffer copies must carry the explicit inherited flag — visibility is "
+        "no longer inferred from timestamps"
     )
     assert buffer[-1]["text"] == "kyoto food itinerary"  # up to fork point m2
 
@@ -247,7 +256,11 @@ def test_retrieval_before_fork_point_is_visible(env):
     hits = s.find_similar_by_message_id(
         env.alice, scopes, unit_emb(0), top_k=10, min_score=0.5
     )
-    assert env.m[0] in {h["message_id"] for h in hits}, (
+    # add_message stores canonical ids ("<base>_u"/"<base>_a") so both writers
+    # converge on one row per message.
+    from app.agent.store.PostgresStore import canonical_message_id
+
+    assert canonical_message_id(env.m[0], "user") in {h["message_id"] for h in hits}, (
         "pre-fork-point ancestor message must be retrievable from the branch"
     )
 

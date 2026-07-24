@@ -44,6 +44,38 @@ def _get_pool(db_url: str) -> pg_pool.ThreadedConnectionPool:
     return _pool
 
 
+# ── Canonical message identity ─────────────────────────────────────────────────
+# Two writers persist chat messages into the shared `messages` table: this
+# backend (after every reply) and the Next.js frontend (fire-and-forget saves).
+# They historically used DIFFERENT id suffixes for the same logical message —
+# backend "<base>" / "<base>_ai", frontend "<base>_u" / "<base>_a" — so the
+# primary key never deduplicated and every turn accumulated up to four rows.
+# Both writers now derive ONE canonical id per (base, role):
+# "<base>_u" for user rows, "<base>_a" for assistant rows.
+ASSISTANT_ID_SUFFIXES = ("_assistant", "-assistant", "_ai", "_a", "-a")
+USER_ID_SUFFIXES = ("_user", "-user", "_u", "-u")
+
+
+def strip_message_id_suffixes(message_id: Optional[str]) -> str:
+    value = str(message_id or "").strip()
+    changed = True
+    while changed and value:
+        changed = False
+        for suffix in ASSISTANT_ID_SUFFIXES + USER_ID_SUFFIXES:
+            if value.endswith(suffix):
+                value = value[: -len(suffix)]
+                changed = True
+                break
+    return value
+
+
+def canonical_message_id(message_id: Optional[str], role: str) -> str:
+    base = strip_message_id_suffixes(message_id)
+    if not base:
+        base = uuid.uuid4().hex
+    return f"{base}_a" if role in ("assistant", "ai") else f"{base}_u"
+
+
 class PostgresConversationStore:
     def __init__(self, db_url: Optional[str] = None, embedding_dim: int = 768):
         self.db_url = db_url or os.getenv("DATABASE_URL")
@@ -168,14 +200,17 @@ class PostgresConversationStore:
                 )
 
             emb = self._normalize_embedding(embedding)
+            # Canonical id: converge with the frontend's copy of the same
+            # message so the PK dedupes instead of storing twin rows.
+            msg_id = canonical_message_id(message_id, role)
             cur.execute(
                 """
                 INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
                 SELECT %s, %s, %s, %s, %s, %s, %s,
-                       COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0) + 1
+                       GREATEST(COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0), 0) + 1
                 ON CONFLICT (id) DO NOTHING
                 """,
-                (message_id, thread_id, role, text, emb, now, user_email, thread_id),
+                (msg_id, thread_id, role, text, emb, now, user_email, thread_id),
             )
 
     def get_thread_messages(self, user_id: str, thread_id: str) -> List[dict]:
@@ -183,12 +218,17 @@ class PostgresConversationStore:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
                 user_email = self._resolve_user_email(cur, user_id)
+                # Position is the ordering truth. Timestamps come from three
+                # different clocks (browser, backend, Postgres) and sorting by
+                # them interleaved turns wrong — answers rendered before their
+                # questions and fork buffers inherited that inversion.
                 cur.execute(
                     """
-                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding,
+                           COALESCE(inherited, false) as inherited
                     FROM messages
                     WHERE node_id = %s AND user_email = %s
-                    ORDER BY timestamp, position
+                    ORDER BY position ASC NULLS LAST, timestamp ASC
                     """,
                     (thread_id, user_email),
                 )
@@ -204,10 +244,11 @@ class PostgresConversationStore:
                 user_email = self._resolve_user_email(cur, user_id)
                 cur.execute(
                     """
-                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding,
+                           COALESCE(inherited, false) as inherited
                     FROM messages
                     WHERE node_id = %s AND user_email = %s
-                    ORDER BY timestamp DESC, position DESC
+                    ORDER BY position DESC NULLS LAST, timestamp DESC
                     LIMIT %s
                     """,
                     (thread_id, user_email, limit),
@@ -226,6 +267,13 @@ class PostgresConversationStore:
         """
         if not message_ids:
             return 0
+        # LangGraph state ids may carry any historical suffix convention while
+        # rows are stored canonically — match on every equivalent form.
+        candidates: List[str] = []
+        for mid in message_ids:
+            base = strip_message_id_suffixes(mid)
+            candidates.extend([str(mid), base, f"{base}_u", f"{base}_a"])
+        candidates = list(dict.fromkeys(c for c in candidates if c))
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
@@ -235,7 +283,7 @@ class PostgresConversationStore:
                     FROM messages
                     WHERE node_id = %s AND id = ANY(%s::text[])
                     """,
-                    (thread_id, list(message_ids)),
+                    (thread_id, candidates),
                 )
                 row = cur.fetchone()
                 return int(row[0]) if row and row[0] is not None else 0
@@ -346,7 +394,7 @@ class PostgresConversationStore:
             with self._get_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT id FROM messages WHERE node_id = %s ORDER BY timestamp, position",
+                    "SELECT id FROM messages WHERE node_id = %s ORDER BY position ASC NULLS LAST, timestamp",
                     (thread_id,),
                 )
                 ids = [row[0] for row in cur.fetchall()]
@@ -448,15 +496,22 @@ class PostgresConversationStore:
             with self._get_conn() as conn:
                 cur = conn.cursor(cursor_factory=DictCursor)
                 user_email = self._resolve_user_email(cur, user_id)
+                # Fork-buffer rows sit at negative positions (before all native
+                # rows). While nothing has been summarized yet (watermark <= 0)
+                # they must still hydrate — their content is not represented in
+                # the node summary until the first summarize pass runs.
+                watermark = int(after_position or 0)
                 cur.execute(
                     """
-                    SELECT id as message_id, role, content as text, timestamp, position, embedding
+                    SELECT id as message_id, role, content as text, timestamp, position, embedding,
+                           COALESCE(inherited, false) as inherited
                     FROM messages
-                    WHERE node_id = %s AND user_email = %s AND position > %s
-                    ORDER BY timestamp DESC, position DESC
+                    WHERE node_id = %s AND user_email = %s
+                      AND (position > %s OR (COALESCE(inherited, false) AND %s <= 0))
+                    ORDER BY position DESC NULLS LAST, timestamp DESC
                     LIMIT %s
                     """,
-                    (thread_id, user_email, int(after_position or 0), limit),
+                    (thread_id, user_email, watermark, watermark, limit),
                 )
                 return list(reversed([dict(r) for r in cur.fetchall()]))
         except Exception as e:
@@ -543,11 +598,16 @@ class PostgresConversationStore:
             }
 
         target_message = next((message for message in msgs if message["message_id"] == resolved), None)
-        created_at = self.get_thread_created_at(thread_id)
-        target_timestamp = target_message.get("timestamp") if isinstance(target_message, dict) else None
-        is_inherited_buffer_message = bool(
-            created_at and target_timestamp and isinstance(target_timestamp, datetime) and target_timestamp < created_at
-        )
+        # Explicit provenance flag. Legacy rows predating the flag fall back to
+        # the old timestamp heuristic (buffer copies are older than the node).
+        if isinstance(target_message, dict) and target_message.get("inherited") is not None:
+            is_inherited_buffer_message = bool(target_message.get("inherited"))
+        else:
+            created_at = self.get_thread_created_at(thread_id)
+            target_timestamp = target_message.get("timestamp") if isinstance(target_message, dict) else None
+            is_inherited_buffer_message = bool(
+                created_at and target_timestamp and isinstance(target_timestamp, datetime) and target_timestamp < created_at
+            )
         if is_inherited_buffer_message:
             return {
                 "summary": summary,
@@ -910,15 +970,46 @@ class PostgresConversationStore:
                     )
 
                 if initial_messages:
-                    self._insert_buffer_messages(cur, new_thread_id, user_email, initial_messages, now)
+                    self._insert_buffer_messages(
+                        cur, new_thread_id, user_email, initial_messages, now,
+                        fork_at_message_id=fork_at_message_id,
+                    )
                 return True
         except Exception as e:
             logger.error(f"Error forking thread: {e}")
             return False
 
-    def _insert_buffer_messages(self, cur, node_id: str, user_email: str, messages: list, now):
-        """Insert copied buffer messages with fresh IDs (messages are independent in new branch)."""
-        for msg in messages:
+    def _insert_buffer_messages(
+        self, cur, node_id: str, user_email: str, messages: list, now,
+        fork_at_message_id: str = "",
+    ):
+        """
+        Insert copied parent messages into a fresh branch.
+
+        - Rows are marked inherited=true: they are LLM context, not visible
+          history. Visibility is this explicit flag — never a timestamp
+          comparison (browser, backend, and Postgres clocks all differ).
+        - Positions are assigned BELOW the node's current minimum, so inherited
+          context always orders before anything the user has already typed into
+          the branch (the first native message can land before fork init runs).
+        - Exception: when the fork point is the last buffered USER message
+          (the "re-ask in a branch" flow), that copy is native — the branch
+          should visibly start with its own question. It gets a canonical
+          `_u` id so later frontend re-saves upsert onto the same row.
+        """
+        if not messages:
+            return
+        cur.execute(
+            "SELECT LEAST(COALESCE(MIN(position), 1), 1) FROM messages WHERE node_id = %s",
+            (node_id,),
+        )
+        floor = cur.fetchone()[0] or 1
+        start = floor - len(messages)
+
+        fork_base = strip_message_id_suffixes(fork_at_message_id)
+        last_idx = len(messages) - 1
+
+        for idx, msg in enumerate(messages):
             emb = self._normalize_embedding(msg.get("embedding"))
             content = msg.get("text", "") or msg.get("content", "")
             if isinstance(content, (dict, list)):
@@ -933,21 +1024,34 @@ class PostgresConversationStore:
             if not isinstance(timestamp, datetime):
                 timestamp = now
 
+            role = msg.get("role")
+            is_native_seed = bool(
+                idx == last_idx
+                and role == "user"
+                and fork_base
+                and strip_message_id_suffixes(msg.get("message_id") or msg.get("id")) == fork_base
+            )
+            row_id = (
+                canonical_message_id(f"fork{uuid.uuid4().hex[:12]}", role)
+                if is_native_seed
+                else f"buf_{uuid.uuid4().hex}"
+            )
+
             cur.execute(
                 """
-                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
-                SELECT %s, %s, %s, %s, %s, %s, %s,
-                       COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0) + 1
+                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position, inherited)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    str(uuid.uuid4()),
+                    row_id,
                     node_id,
-                    msg.get("role"),
+                    role,
                     content,
                     emb,
                     timestamp,
                     user_email,
-                    node_id,
+                    start + idx,
+                    not is_native_seed,
                 ),
             )
 
