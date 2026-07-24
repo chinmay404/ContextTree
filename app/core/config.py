@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     # ── Web search (free, DuckDuckGo via ddgs — no API key) ────────────────────
     # Kill switch; per-turn opt-in still comes from ChatMessage.web_search
     WEB_SEARCH_ENABLED: bool = True
+    # Webpage parser: fetch user-pasted URLs into external context
+    # (SSRF-guarded + char-capped; see app/agent/helpers/web_fetch.py).
+    WEB_FETCH_ENABLED: bool = True
 
     # ── Context assembly ───────────────────────────────────────────────────────
     # Max tokens reserved for rolling summary

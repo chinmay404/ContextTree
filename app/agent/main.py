@@ -12,6 +12,7 @@ from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
 from app.agent.helpers.web_search import search_web, format_web_snippets
+from app.agent.helpers.web_fetch import extract_urls, fetch_pages, format_page_snippets
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -561,6 +562,24 @@ class getGraphResponse():
             external_context_snippets.extend(
                 format_web_snippets(web_hits, MAX_WEB_SNIPPET_CHARS)
             )
+
+        # Webpage parser: URLs the user pasted are fetched directly (SSRF-
+        # guarded, size- and char-capped in web_fetch) regardless of the web
+        # search toggle — pasting a link means "read this". Pages join
+        # web_hits so the UI source chips show them.
+        if getattr(settings, "WEB_FETCH_ENABLED", True):
+            pasted_urls = extract_urls(query)
+            if pasted_urls:
+                pages = fetch_pages(pasted_urls)
+                if pages:
+                    logger.info(
+                        "URL fetch injected %s pages for thread %s", len(pages), thread_id
+                    )
+                    external_context_snippets.extend(format_page_snippets(pages))
+                    web_hits = list(web_hits) + [
+                        {"title": p.get("title"), "url": p.get("url"), "snippet": ""}
+                        for p in pages
+                    ]
 
         query_embedding = get_embedding(query) or []
         if not _has_meaningful_embedding(query_embedding):
