@@ -235,3 +235,49 @@ def test_messages_of_source_is_400(api):
     b = make_board(api); n = _src(api, b["id"])
     r = api.get(f"/boards/{b['id']}/cards/{n['id']}/messages")
     assert r.status_code == 400 and r.json()["error"] == "invalid"
+
+
+def test_patch_chat_advanced_merges_one_level(api):
+    b = make_board(api); bid = b["id"]; q1 = f"{bid}_q1"
+    r = api.patch(f"/boards/{bid}/cards/{q1}", json={"data": {"advanced": {"lastKMessages": 3}, "name": "N"}})
+    assert r.status_code == 200
+    d = r.json()["data"]
+    assert d["advanced"] == {**DEFAULT_ADVANCED, "lastKMessages": 3} and d["name"] == "N"
+    assert d["model"] == DEFAULT_MODEL
+
+
+def test_patch_status_on_chat_is_400(api):
+    b = make_board(api)
+    r = api.patch(f"/boards/{b['id']}/cards/{b['id']}_q1", json={"status": "ready"})
+    assert r.status_code == 400 and r.json()["error"] == "invalid"
+
+
+def test_patch_null_data_or_status_is_400(api):
+    b = make_board(api); c = _src(api, b["id"])
+    url = f"/boards/{b['id']}/cards/{c['id']}"
+    assert api.patch(url, json={"data": None}).status_code == 400
+    assert api.patch(url, json={"status": None}).status_code == 400
+
+
+def test_repost_own_deleted_card_is_409(api, db):
+    b = make_board(api); c = _src(api, b["id"])
+    with db.cursor() as cur:
+        cur.execute("UPDATE nodes SET deleted_at = now() WHERE id = %s", (c["id"],))
+    r = api.post(f"/boards/{b['id']}/cards", json={"id": c["id"], "kind": "source", "sourceType": "note",
+                 "x": 0, "y": 0, "data": {}})
+    assert r.status_code == 409 and r.json()["error"] == "duplicate"
+
+
+def test_patch_response_strips_memory_facts(api, db):
+    b = make_board(api); c = _src(api, b["id"])
+    with db.cursor() as cur:
+        cur.execute("""UPDATE nodes SET data = data || '{"memoryFacts": ["f"]}'::jsonb WHERE id = %s""", (c["id"],))
+    r = api.patch(f"/boards/{b['id']}/cards/{c['id']}", json={"data": {"a": 1, "memoryFacts": ["z"]}})
+    assert r.status_code == 200 and "memoryFacts" not in r.json()["data"] and r.json()["data"]["a"] == 1
+
+
+def test_source_with_parent_is_400(api):
+    b = make_board(api)
+    r = api.post(f"/boards/{b['id']}/cards", json={"id": new_id("c"), "kind": "source", "sourceType": "note",
+                 "x": 0, "y": 0, "parentId": f"{b['id']}_q1", "data": {}})
+    assert r.status_code == 400 and r.json()["error"] == "invalid"

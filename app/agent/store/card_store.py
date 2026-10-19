@@ -22,6 +22,7 @@ from app.agent.store.board_store import (
 from app.api.errors import ApiError
 from app.schemas.board import (
     MAX_CARDS_PER_BOARD,
+    MAX_POSITIONS,
     CardCreate,
     CardPatch,
     Position,
@@ -76,21 +77,33 @@ def _chat_data(data: dict) -> dict:
     return merged
 
 
+def _existing_own(cur, user_email: str, board_id: str, card_id: str) -> Optional[dict]:
+    """The caller's live card with this id on this board; 409 if the id is taken otherwise."""
+    cur.execute(
+        "SELECT canvas_id, user_email, kind, deleted_at FROM nodes WHERE id = %s", (card_id,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    if (row["user_email"] == user_email and row["canvas_id"] == board_id
+            and row["kind"] is not None and row["deleted_at"] is None):
+        return fetch_card_json(cur, board_id, card_id)
+    raise ApiError(409, "duplicate", "card id is not available")
+
+
 def create_card(cur, user_email: str, board_id: str, body: CardCreate) -> tuple[dict, bool]:
     _validate_create(body)
     require_board(cur, board_id, user_email)
 
-    cur.execute(
-        "SELECT canvas_id, user_email, kind, deleted_at FROM nodes WHERE id = %s", (body.id,)
-    )
-    existing = cur.fetchone()
-    if existing:
-        if (existing["user_email"] == user_email and existing["canvas_id"] == board_id
-                and existing["kind"] is not None and existing["deleted_at"] is None):
-            return fetch_card_json(cur, board_id, body.id), False
-        raise ApiError(409, "duplicate", "card id is not available")
+    existing = _existing_own(cur, user_email, board_id, body.id)
+    if existing is not None:
+        return existing, False
 
     lock_board(cur, board_id)
+    # a concurrent POST of the same id may have committed while we waited for the lock
+    existing = _existing_own(cur, user_email, board_id, body.id)
+    if existing is not None:
+        return existing, False
     if live_card_count(cur, board_id) >= MAX_CARDS_PER_BOARD:
         raise ApiError(409, "card_limit", f"a board holds at most {MAX_CARDS_PER_BOARD} cards")
 
@@ -145,7 +158,7 @@ def create_card(cur, user_email: str, board_id: str, body: CardCreate) -> tuple[
 
 def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatch) -> dict:
     require_board(cur, board_id, user_email)
-    require_card(cur, board_id, card_id, user_email)
+    card = require_card(cur, board_id, card_id, user_email)
     fields = body.model_fields_set
     sets: list[str] = []
     args: list = []
@@ -160,6 +173,8 @@ def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatc
         sets.append("pile_id = %s")
         args.append(body.pile_id)
     if "status" in fields:
+        if card["kind"] == "chat":
+            raise ApiError(400, "invalid", "a chat has no status")
         if body.status is None:
             raise ApiError(400, "invalid", "status cannot be null")
         sets.append("status = %s")
@@ -167,8 +182,18 @@ def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatc
     if "data" in fields:
         if body.data is None:
             raise ApiError(400, "invalid", "data cannot be null")
-        sets.append("data = coalesce(data, '{}'::jsonb) || %s::jsonb")
-        args.append(json.dumps(_public_data(body.data)))
+        patch = _public_data(body.data)
+        if card["kind"] == "chat" and isinstance(patch.get("advanced"), dict):
+            # advanced merges one level deep so a partial patch keeps the other keys
+            sets.append(
+                "data = jsonb_set(coalesce(data, '{}'::jsonb) || (%s::jsonb - 'advanced'), "
+                "'{advanced}', coalesce(data->'advanced', '{}'::jsonb) || %s::jsonb)"
+            )
+            args.append(json.dumps(patch))
+            args.append(json.dumps(patch["advanced"]))
+        else:
+            sets.append("data = coalesce(data, '{}'::jsonb) || %s::jsonb")
+            args.append(json.dumps(patch))
     if sets:
         cur.execute(
             f"UPDATE nodes SET {', '.join(sets)}, updated_at = now() "
@@ -194,12 +219,10 @@ def save_positions(cur, user_email: str, board_id: str, positions: list[Position
         "FROM (VALUES %s) AS v(id, x, y) " + scope,
         [(p.id, p.x, p.y) for p in positions],
         template="(%s, %s::double precision, %s::double precision)",
-        page_size=MAX_POSITIONS_PAGE,
+        page_size=MAX_POSITIONS,  # one page, so rowcount covers every row
     )
     return cur.rowcount
 
-
-MAX_POSITIONS_PAGE = 200
 
 
 def list_messages(cur, chat_id: str, user_email: str) -> list[dict]:
