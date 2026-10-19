@@ -177,10 +177,17 @@ def _init_fork_if_needed(
     chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary"
 ) -> None:
     """
-    On the first message of a branched node, seed the new thread with a
-    compressed summary + a small verbatim buffer from the parent.
+    On the first message of a branched node, seed the new thread from the parent.
 
-    This preserves the Context Tree guarantee: the branch starts with an
+    carry modes (spec 5.4):
+      summary (default) - compressed summary of the lineage + the last
+                          FORK_BUFFER_MESSAGES verbatim; unknown values map here.
+      whole             - the parent's messages up to the fork point copied as
+                          inherited rows (last 40 / 48 000 chars); anything older is
+                          summarised, or the parent's stored summary is kept verbatim.
+      fresh             - nothing inherited; lineage columns and is_initialized only.
+
+    For summary this preserves the Context Tree guarantee: the branch starts with an
     accurate, scoped summary of the parent lineage — not a blank slate.
     """
     if carry not in ("summary", "whole", "fresh"):
@@ -265,7 +272,7 @@ def _init_fork_if_needed(
 
     if carry == "fresh":
         # Lineage columns + is_initialized only; nothing inherited, no LLM.
-        active_graph.mongo_store.fork_thread(
+        ok = active_graph.mongo_store.fork_thread(
             user_id=user_id,
             source_thread_id=parent_thread_id,
             new_thread_id=chat_message.conversation_id,
@@ -275,9 +282,10 @@ def _init_fork_if_needed(
             initial_messages=[],
             memory_facts={},
         )
-        logger.info(
-            "Fork initialised (fresh): %s → %s", parent_thread_id, chat_message.conversation_id
-        )
+        if ok:
+            logger.info(
+                "Fork initialised (fresh): %s → %s", parent_thread_id, chat_message.conversation_id
+            )
         return
 
     fork_source = active_graph.mongo_store.get_fork_inheritance_payload(
@@ -289,7 +297,7 @@ def _init_fork_if_needed(
     existing_summary = sanitize_summary_text(fork_source.get("summary"))
     parent_memory_facts = fork_source.get("memory_facts") or {}
     messages_data = fork_source.get("messages") or []
-    if messages_data:
+    if messages_data and carry != "whole":
         logger.info(
             "Fork source scope resolved: parent=%s fork_at=%s mode=%s returned_messages=%s last_message=%s",
             parent_thread_id,
@@ -301,6 +309,13 @@ def _init_fork_if_needed(
     if carry == "whole":
         if fork_source.get("mode") != "scoped-fork-point":
             messages_data = active_graph.mongo_store.get_thread_messages(user_id, parent_thread_id)
+        logger.info(
+            "Fork source (whole): parent=%s fork_at=%s mode=%s returned_messages=%s",
+            parent_thread_id,
+            fork_at_message_id,
+            fork_source.get("mode"),
+            len(messages_data),
+        )
     elif not messages_data:
         fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
         logger.warning("fork_at_message_id not found; falling back to last-K messages")
@@ -314,7 +329,6 @@ def _init_fork_if_needed(
     buffer_size = getattr(settings, "FORK_BUFFER_MESSAGES", 2)
     if carry == "whole":
         messages_to_summarize, buffer_messages = _whole_carry_split(messages_data)
-        existing_summary = existing_summary if messages_to_summarize else ""
     elif len(messages_data) <= buffer_size:
         messages_to_summarize = []
         buffer_messages = messages_data

@@ -31,6 +31,11 @@ def env(db, user, monkeypatch):
         child = seed_card(db, user, board, kind="chat", parent_id=parent)
         return parent, child, texts
 
+    def set_fork_point(parent, child, idx):
+        mid = store.get_thread_messages(user, parent)[idx]["message_id"]
+        with db.cursor() as cur:
+            cur.execute("UPDATE nodes SET forked_from_message_id=%s WHERE id=%s", (mid, child))
+
     def run(child, carry=None):
         from app.schemas.item import ChatMessage
         msg = ChatMessage(message="hi", message_id=new_id("m"), nodeId=child)
@@ -50,7 +55,7 @@ def env(db, user, monkeypatch):
                         (child,))
             return cur.fetchone()
 
-    return SimpleNamespace(chat=chat, store=store, user=user, make_parent=make_parent,
+    return SimpleNamespace(chat=chat, store=store, user=user, make_parent=make_parent, set_fork_point=set_fork_point,
                            run=run, rows=rows, node=node, monkeypatch=monkeypatch)
 
 
@@ -63,10 +68,40 @@ def test_summary_mode_unchanged_default(env):
 
 
 def test_unknown_carry_is_summary(env):
-    parent, child, texts = env.make_parent(2)
-    env.monkeypatch.setattr(env.chat, "get_llm", raising_llm)
+    parent, child, texts = env.make_parent(5)
+    env.set_fork_point(parent, child, 4)
+    llm = FakeLLM("SUMMARISED")
+    env.monkeypatch.setattr(env.chat, "get_llm", lambda *a, **k: llm)
     env.run(child, "bogus")
+    assert [r[0] for r in env.rows(child)] == texts[-2:]
+    assert env.node(child)[0] == "SUMMARISED"
+    assert len(llm.calls) == 1
+
+
+def test_whole_keeps_parent_stored_summary_without_llm(env, db):
+    parent, child, texts = env.make_parent(4)
+    with db.cursor() as cur:
+        cur.execute("UPDATE nodes SET summary=%s WHERE id=%s", ("PARENT SUMMARY", parent))
+    env.monkeypatch.setattr(env.chat, "get_llm", raising_llm)
+    env.run(child, "whole")
     assert [r[0] for r in env.rows(child)] == texts
+    assert env.node(child)[0] == "PARENT SUMMARY"
+
+
+def test_whole_with_resolved_fork_point(env):
+    parent, child, texts = env.make_parent(5)
+    env.set_fork_point(parent, child, 2)
+    env.monkeypatch.setattr(env.chat, "get_llm", raising_llm)
+    env.run(child, "whole")
+    assert [r[0] for r in env.rows(child)] == texts[:3]
+
+
+def test_whole_empty_parent_stays_uninitialised(env):
+    parent, child, _ = env.make_parent(0)
+    env.monkeypatch.setattr(env.chat, "get_llm", raising_llm)
+    env.run(child, "whole")
+    assert env.node(child)[1] is False
+    assert env.rows(child) == []
 
 
 def test_whole_copies_parent_messages_no_summary(env):
