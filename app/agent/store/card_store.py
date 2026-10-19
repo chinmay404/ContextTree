@@ -250,7 +250,9 @@ def list_messages(cur, chat_id: str, user_email: str) -> list[dict]:
 def delete_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:
     """Soft-delete a card (a chat takes its live subtree) under one shared stamp."""
     require_board(cur, board_id, user_email)
+    lock_board(cur, board_id)  # a concurrent child create cannot land under a chat being deleted
     card = require_card(cur, board_id, card_id, user_email)
+    # deleted_at stamp uniqueness relies on one transaction per request (now() is the tx start)
     cur.execute("SELECT now() AS t")
     stamp = cur.fetchone()["t"]
     if card["kind"] == "chat":
@@ -281,6 +283,7 @@ def delete_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:
 def restore_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:
     """Undo exactly the delete that stamped this card (cards and edges sharing deleted_at)."""
     require_board(cur, board_id, user_email)
+    lock_board(cur, board_id)  # a parent delete cannot slip in during a restore
     cur.execute(
         "SELECT * FROM nodes WHERE id = %s AND canvas_id = %s AND user_email = %s "
         "AND kind IS NOT NULL",
@@ -299,7 +302,6 @@ def restore_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]
         parent = cur.fetchone()
         if parent and parent["deleted_at"] is not None:
             raise ApiError(409, "not_allowed", "restore the parent chat first")
-    lock_board(cur, board_id)
     cur.execute(
         "SELECT id FROM nodes WHERE canvas_id = %s AND user_email = %s AND deleted_at = %s "
         "AND kind IS NOT NULL AND (id = %s OR ancestor_ids @> ARRAY[%s]::text[])",
