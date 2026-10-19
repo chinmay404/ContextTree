@@ -108,9 +108,17 @@ def estimate_tokens(card: CardRow, g: BoardGraph, top_k: int) -> int:
     return 0
 
 
+def _top_k(data: dict) -> int:
+    adv = data.get("advanced")
+    raw = adv.get("externalContextTopK") if isinstance(adv, dict) else None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw != raw:
+        return 5
+    return max(0, min(10, int(raw)))
+
+
 def compute_reads(g: BoardGraph, chat_id: str) -> Reads:
     chat = g.cards[chat_id]
-    top_k = int((chat.data.get("advanced") or {}).get("externalContextTopK") or 5)
+    top_k = _top_k(chat.data)
 
     def item(card, how, via):
         if card.kind == "chat":
@@ -147,14 +155,14 @@ def compute_reads(g: BoardGraph, chat_id: str) -> Reads:
         items = own(c)
         parent = g.cards.get(c.parent_id or "")
         if (parent and parent.kind == "chat" and c.data.get("inheritDesk", True) is not False
-                and parent.id not in seen):
+                and parent.id not in seen and parent.id != c.id):
             have = {i.card_id for i in items}
             items += [replace(i, inherited=True)
                       for i in effective(parent, seen | {c.id}) if i.card_id not in have]
         hide = set(c.data.get("hide") or [])
 
-        def is_hidden(i):  # a hidden pile hides all its members
-            return i.card_id in hide or (g.cards[i.card_id].pile_id or "") in hide
+        def is_hidden(i):  # hide applies to inherited items only; a hidden pile hides its members
+            return i.inherited and (i.card_id in hide or (g.cards[i.card_id].pile_id or "") in hide)
 
         if keep_hidden:  # only the asking chat lists its hidden items
             return [replace(i, hidden=is_hidden(i)) for i in items]
@@ -165,7 +173,7 @@ def compute_reads(g: BoardGraph, chat_id: str) -> Reads:
     return Reads(chat_id, items, total)
 
 
-def load_board_graph(cur, board_id: str, user_email: str) -> BoardGraph:
+def load_board_graph(cur, user_email: str, board_id: str) -> BoardGraph:
     """Four queries: live cards, live strings, assistant-message lengths, chunk chars."""
     g = BoardGraph()
     cur.execute(
@@ -224,5 +232,5 @@ def resolve_reads(store, user_email: str, board_id: str, chat_id: str) -> Reads:
         card = require_card(cur, board_id, chat_id, user_email)
         if card["kind"] != "chat":
             raise ApiError(400, "invalid", "reads are defined for chats only")
-        g = load_board_graph(cur, board_id, user_email)
+        g = load_board_graph(cur, user_email, board_id)
     return compute_reads(g, chat_id)

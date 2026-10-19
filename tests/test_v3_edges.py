@@ -146,11 +146,20 @@ def test_delete_edge_takes_board_lock_and_keeps_existing_stamp(db, user, g):
         lock_board(holder, g.b)
         t = threading.Thread(target=run)
         t.start()
-        time.sleep(0.5)
-        blocked = "r" not in outcome
+        deadline = time.time() + 5
+        waiting = False
+        while time.time() < deadline and not waiting:  # poll until a backend waits on the advisory lock
+            with db.cursor() as cur:
+                cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                            "AND wait_event = 'advisory' AND datname = current_database()")
+                waiting = cur.fetchone()[0] > 0
+            if not waiting:
+                time.sleep(0.05)
+        blocked = waiting and "r" not in outcome
         with db.cursor() as cur:  # delete_card stamps the edge while the lock is held
             cur.execute("UPDATE edges SET deleted_at = '2026-01-01' WHERE id = %s", (eid,))
     t.join(5)
+    assert not t.is_alive()
     assert blocked, "delete_edge did not wait for the board lock"
     assert outcome["r"] == 404
     with db.cursor() as cur:

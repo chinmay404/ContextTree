@@ -163,3 +163,49 @@ def test_reads_route_other_user_404(api, db, user):
             for t in ("messages", "edges", "nodes", "canvases"):
                 cur.execute(f"DELETE FROM {t} WHERE user_email = %s", (other,))
             cur.execute("DELETE FROM users WHERE email = %s", (other,))
+
+
+def test_hide_never_hides_own_items():
+    g = prototype_graph(hide={"main": ["pdf", "interviews"], "second": ["interviews"]},
+                        extra_wires=[("iv1", "second")])
+    r = compute_reads(g, "main")
+    pdf = [i for i in r.items if i.card_id == "pdf"][0]
+    assert not pdf.hidden and pdf.tokens > 0 and pdf.tokens <= r.total_tokens
+    r2 = compute_reads(g, "second")
+    iv1 = [i for i in r2.items if i.card_id == "iv1"]
+    assert len(iv1) == 1 and iv1[0].how == "desk" and not iv1[0].hidden  # own desk member, pile id in hide
+    g3 = prototype_graph(hide={"deep": ["interviews"]}, extra_wires=[("iv1", "deep")])
+    [w] = [i for i in compute_reads(g3, "deep").items if i.card_id == "iv1"]
+    assert (w.how, w.inherited, w.hidden) == ("wire", False, False)
+
+
+def test_top_k_defensive():
+    from app.agent.reads import _top_k
+    assert _top_k({}) == 5 and _top_k({"advanced": "x"}) == 5
+    assert _top_k({"advanced": {"externalContextTopK": "abc"}}) == 5
+    assert _top_k({"advanced": {"externalContextTopK": None}}) == 5
+    assert _top_k({"advanced": {"externalContextTopK": 0}}) == 0
+    assert _top_k({"advanced": {"externalContextTopK": 99}}) == 10
+    assert _top_k({"advanced": {"externalContextTopK": -3}}) == 0
+
+
+def _reparent(g, cid, parent):
+    from dataclasses import replace
+    g.cards[cid] = replace(g.cards[cid], parent_id=parent)
+
+
+def test_broken_lineage_terminates():
+    g = prototype_graph()
+    _reparent(g, "main", "main")  # self-parent
+    assert [i.card_id for i in compute_reads(g, "main").items] == ["video", "pdf", "note"]
+    g = prototype_graph()
+    _reparent(g, "main", "second")  # main -> second -> main cycle
+    r = compute_reads(g, "main")
+    ids_ = [i.card_id for i in r.items]
+    assert len(ids_) == len(set(ids_)) and {"video", "pdf", "note"} <= set(ids_)
+    g = prototype_graph()
+    _reparent(g, "second", "pdf")  # parent is not a chat
+    assert [i.card_id for i in compute_reads(g, "second").items] == ["web", "iv1", "iv2", "iv3", "iv4"]
+    g = prototype_graph()
+    _reparent(g, "second", "gone")  # missing/deleted parent
+    assert [i.card_id for i in compute_reads(g, "second").items] == ["web", "iv1", "iv2", "iv3", "iv4"]
