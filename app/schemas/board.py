@@ -100,5 +100,5 @@ class LinkCreate(_Model):
     url: str = Field(min_length=1, max_length=2048)
     x: float
     y: float
-    desk_id: Optional[str] = None
-    desc: Optional[str] = None
+    desk_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
+    desc: Optional[str] = Field(default=None, max_length=2000)

@@ -185,6 +185,7 @@ def _embed_and_finish(card_id, file_id, user_email, chunks, metas, overview_text
         overview_emb = embs[0]
     excerpts = pick_key_passages(chunks, metas, embs, overview_emb)
     if not _write_chunks(file_id, user_email, chunks, embs, metas):
+        _fail(card_id, user_email, "File not found")  # no-op if the card was deleted
         return
     set_card_status(store, card_id, "ready", {**patch, "summary": summary, "excerpts": excerpts},
                     user_email)

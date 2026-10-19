@@ -5,7 +5,7 @@ from app.agent import ingest
 from app.agent.ingest import (
     add_locators, make_overview, parse_csv, pick_key_passages, _clip_text,
 )
-from tests.v3_support import FakeLLM, db, requires_db, seed_board, seed_card, unit_emb, user  # noqa: F401
+from tests.v3_support import FakeLLM, db, requires_db, seed_board, seed_card, unit_emb, user, api  # noqa: F401
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
@@ -330,3 +330,19 @@ def test_no_connection_held_during_embed_or_llm(db, user, monkeypatch):
     assert _node(db, card)[0] == "ready"
     assert {k for k, _ in state["seen"]} == {"embed", "embed1", "llm"}
     assert all(n == 0 for _, n in state["seen"])
+
+
+@requires_db
+def test_write_chunks_false_marks_card_failed(api, db, monkeypatch):
+    from app.agent import ingest
+    from tests.v3_support import make_board, seed_card, unit_emb
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="doc", status="processing")
+    monkeypatch.setattr(ingest, "get_embeddings", lambda cs: [unit_emb(0) for _ in cs])
+    monkeypatch.setattr(ingest, "get_embedding", lambda t: unit_emb(0))
+    monkeypatch.setattr(ingest, "make_overview", lambda t, e: "sum")
+    monkeypatch.setattr(ingest, "_write_chunks", lambda *a: False)
+    ingest._embed_and_finish(cid, "file_gone", api.email, ["a"], [{}], "a", {})
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM nodes WHERE id = %s", (cid,))
+        assert cur.fetchone()[0] == "failed"
