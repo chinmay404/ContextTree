@@ -23,7 +23,7 @@ from app.agent.memory import extract_memory_facts, sanitize_summary_text
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
 from app.agent.reads import _top_k as card_top_k, resolve_reads
-from app.agent.store.board_store import get_card_row, store as board_store
+from app.agent.store.board_store import store as board_store
 from app.api.errors import ApiError
 from app.api.limiter import limiter, user_key
 from app.core.config import settings
@@ -426,50 +426,53 @@ def _init_fork_if_needed(
 
 # ── V3 card gate ──────────────────────────────────────────────────────────────
 
-def _resolve_v3_card(user_id: str, chat_message: ChatMessage) -> Optional[dict]:
+def _resolve_v3_card(user_id: str, chat_message: ChatMessage) -> Optional[tuple[dict, str]]:
     """
-    None for V2 turns; the live chat-card row for V3 turns (row["_user_email"] holds
-    the resolved owner email so callers do not resolve it again).
+    None for V2 turns; (live chat-card row, owner email) for V3 turns.
 
     A turn is V3 when the body carries boardId or the node row has kind NOT NULL.
     Missing / deleted / foreign / other-board / non-V3-board -> 404; not a chat -> 400.
-    Never creates a row.
+    Never creates a row. Each step uses its own short tx: the email is resolved with
+    no connection held (the pool is small), and a DB error here fails the turn closed.
     """
     node_id = chat_message.conversation_id
     board_id = chat_message.board_id
     with board_store.tx() as cur:
-        row = get_card_row(cur, node_id)
-        if not board_id and not (row and row.get("kind") is not None):
-            return None
-        email = board_store.resolve_user_email(user_id)
-        if (not row or row.get("kind") is None or row.get("deleted_at") is not None
-                or row.get("user_email") != email
-                or (board_id and row.get("canvas_id") != board_id)):
-            raise ApiError(404, "not_found")
+        cur.execute("SELECT kind FROM nodes WHERE id = %s", (node_id,))
+        probe = cur.fetchone()
+    if not board_id and not (probe and probe["kind"] is not None):
+        return None
+    email = board_store.resolve_user_email(user_id)
+    with board_store.tx() as cur:
         cur.execute(
-            "SELECT 1 FROM canvases WHERE id = %s AND user_email = %s "
-            "AND board_version = 3 AND deleted_at IS NULL",
-            (row["canvas_id"], email),
+            "SELECT n.id, n.kind, n.canvas_id, n.parent_node_id, n.forked_from_message_id, n.data "
+            "FROM nodes n JOIN canvases c ON c.id = n.canvas_id "
+            "WHERE n.id = %s AND n.user_email = %s AND n.kind IS NOT NULL "
+            "AND n.deleted_at IS NULL AND c.user_email = %s AND c.board_version = 3 "
+            "AND c.deleted_at IS NULL AND (%s::text IS NULL OR n.canvas_id = %s)",
+            (node_id, email, email, board_id, board_id),
         )
-        if not cur.fetchone():
-            raise ApiError(404, "not_found")
+        row = cur.fetchone()
+    if not row:
+        raise ApiError(404, "not_found")
     if row["kind"] != "chat":
         raise ApiError(400, "invalid", "only chat cards can be chatted with")
-    return {**row, "_user_email": email}
+    return row, email
 
 
-def _v3_gate(user_id: str, chat_message: ChatMessage) -> tuple[Optional[dict], str]:
-    """(card, carry). For V3 the card row wins over the body for lineage."""
-    card = _resolve_v3_card(user_id, chat_message)
-    if card is None:
-        return None, "summary"
+def _v3_gate(user_id: str, chat_message: ChatMessage) -> tuple[Optional[dict], Optional[str], str]:
+    """(card, email, carry). For V3 the card row wins over the body for lineage."""
+    resolved = _resolve_v3_card(user_id, chat_message)
+    if resolved is None:
+        return None, None, "summary"
+    card, email = resolved
     chat_message.parent_thread_id = card.get("parent_node_id")
     chat_message.fork_at_message_id = card.get("forked_from_message_id")
     carry = (card.get("data") or {}).get("carry")
-    return card, carry if isinstance(carry, str) else "summary"
+    return card, email, carry if isinstance(carry, str) else "summary"
 
 
-def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], carry: str) -> dict:
+def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], email: Optional[str], carry: str) -> dict:
     """Per-turn context kwargs: V2 passes the body through; V3 uses the server read set."""
     if card is None:
         return dict(
@@ -486,11 +489,11 @@ def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], carry: str) -
         last_k = 50
     return dict(
         context_node_ids=None,
-        board_reads=resolve_reads(board_store, card["_user_email"], card["canvas_id"], card["id"]),
+        board_reads=resolve_reads(board_store, email, card["canvas_id"], card["id"]),
         budget_tokens=budget if isinstance(budget, int) and not isinstance(budget, bool) else None,
         last_k_messages=last_k,
         external_context_top_k=card_top_k(data),
-        user_email=card["_user_email"],
+        user_email=email,
     )
 
 
@@ -512,7 +515,7 @@ async def get_response(
         )
 
     try:
-        card, carry = _v3_gate(user_id, chat_message)
+        card, v3_email, carry = _v3_gate(user_id, chat_message)
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
@@ -523,7 +526,7 @@ async def get_response(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry)
-        graph_kw = _graph_kwargs(chat_message, card, carry)
+        graph_kw = _graph_kwargs(chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
@@ -572,7 +575,7 @@ async def stream_response(
         )
 
     try:
-        card, carry = _v3_gate(user_id, chat_message)
+        card, v3_email, carry = _v3_gate(user_id, chat_message)
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
@@ -583,7 +586,7 @@ async def stream_response(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry)
-        graph_kw = _graph_kwargs(chat_message, card, carry)
+        graph_kw = _graph_kwargs(chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")

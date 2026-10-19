@@ -164,17 +164,73 @@ def test_v3_non_whole_carry_keeps_body_last_k(api, db, user, env, route):
     assert env.captured["last_k_messages"] == 7
 
 
-def test_v2_chat_without_board_id_unchanged(api, db, user, env):
+@pytest.mark.parametrize("route", [STREAM, SYNC])
+def test_v2_chat_without_board_id_unchanged(api, db, user, env, route):
     v2 = seed_board(db, user, version=2)
     nid = new_id("n")
     with db.cursor() as cur:
         cur.execute("INSERT INTO nodes (id, canvas_id, user_email, data) VALUES (%s,%s,%s,'{}'::jsonb)",
                     (nid, v2, user))
-    r = api.post(STREAM, json=body(nid, contextNodeIds=["f1"]))
-    assert r.status_code == 200
+    r = api.post(route, json=body(nid, contextNodeIds=["f1"]))
+    assert r.status_code == 200, r.text
     assert env.captured["context_node_ids"] == ["f1"]
     assert env.captured["board_reads"] is None
     assert env.forks[0]["carry"] == "summary"
+
+
+def test_v2_new_node_id_still_reaches_graph(api, db, user, env):
+    nid = new_id("n")
+    r = api.post(STREAM, json=body(nid))
+    assert r.status_code == 200
+    assert env.captured["context_node_ids"] is None and env.captured["board_reads"] is None
+    assert env.captured["thread_id"] == nid
+    assert count(db, nid) == 0  # the (faked) graph creates it, the gate never does
+
+
+@pytest.mark.parametrize("route", [STREAM, SYNC])
+def test_v3_other_users_card_without_board_id_is_404(api, db, user, env, route):
+    other = other_user(db)
+    bid = seed_board(db, other)
+    c = seed_card(db, other, bid, kind="chat")
+    r = api.post(route, json=body(c))
+    assert r.status_code == 404 and r.json()["error"] == "not_found"
+    assert env.captured == {}
+
+
+def test_v3_gate_never_holds_two_connections(api, db, user, env, monkeypatch):
+    from contextlib import contextmanager
+    from app.agent.store.board_store import store as bs
+
+    real = bs._get_conn
+    state = {"open": 0, "max": 0, "email_open": None}
+
+    @contextmanager
+    def tracked():
+        state["open"] += 1
+        state["max"] = max(state["max"], state["open"])
+        try:
+            with real() as conn:
+                yield conn
+        finally:
+            state["open"] -= 1
+
+    real_resolve = type(bs).resolve_user_email
+
+    def resolve(self, uid):
+        state["email_open"] = state["open"]
+        return real_resolve(self, uid)
+
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    monkeypatch.setattr(bs, "_get_conn", tracked)
+    monkeypatch.setattr(type(bs), "resolve_user_email", resolve)
+    from app.api.v1.endpoints import chat
+    from app.schemas.item import ChatMessage
+    msg = ChatMessage(message="hi", message_id=new_id("m"), nodeId=c, boardId=bid)
+    row, email = chat._resolve_v3_card(user, msg)
+    assert row["id"] == c and email == user
+    assert state["email_open"] == 0
+    assert state["max"] == 1
 
 
 def test_v3_sync_route_same_gate(api, db, user, env):
