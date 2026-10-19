@@ -12,7 +12,9 @@ from langchain_community.document_loaders import CSVLoader, Docx2txtLoader, PyPD
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.agent.store.PostgresStore import PostgresConversationStore
+from app.agent.store.board_store import store as board_store
 from app.agent.utils.embeddings import get_embeddings
+from app.api.errors import ApiError
 from app.core.logger import logger
 
 router = APIRouter()
@@ -199,5 +201,11 @@ async def ingest_file(
     Triggers background ingestion of a file already stored in DB.
     """
     logger.info(f"Ingest request received for file_id: {request.file_id} user: {user_id}")
+    email = board_store.resolve_user_email(user_id)
+    with board_store.tx() as cur:
+        cur.execute("SELECT user_email FROM external_files WHERE id = %s", (request.file_id,))
+        row = cur.fetchone()
+    if row is None or row["user_email"] != email:
+        raise ApiError(404, "not_found")
     background_tasks.add_task(process_file_background, request)
     return {"status": "processing_started", "file_id": request.file_id}
