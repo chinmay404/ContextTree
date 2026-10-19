@@ -325,7 +325,14 @@ class PostgresConversationStore:
                 # back to it so forks can ALWAYS find their parent.
                 if meta is None or not meta.get("parent_node_id"):
                     cur.execute(
-                        "SELECT from_node FROM edges WHERE to_node = %s LIMIT 1",
+                        """
+                        SELECT from_node FROM edges
+                        WHERE to_node = %s AND deleted_at IS NULL
+                          AND (kind = 'lineage'
+                               OR (kind IS NULL AND COALESCE(meta->>'condition', data->'meta'->>'condition') = 'Fork'))
+                        ORDER BY created_at
+                        LIMIT 1
+                        """,
                         (thread_id,),
                     )
                     edge = cur.fetchone()
