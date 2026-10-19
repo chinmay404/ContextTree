@@ -34,6 +34,7 @@ OVERVIEW_INPUT_CHARS = 12_000
 OVERVIEW_MAX_CHARS = 600
 WEB_INGEST_MAX_CHARS = 60_000
 DOC_TEXT_MAX_CHARS = 100_000
+MAX_EMBED_CHUNKS = 300  # bound embedding work per source; the first N chunks are kept
 
 _OVERVIEW_PROMPT = (
     "Summarise this source in 2–3 plain sentences for someone deciding whether to read it.\n\n"
@@ -47,18 +48,23 @@ def _decode(data: bytes) -> str:
         return data.decode("latin-1")
 
 
+def _csv_lines(rows: list[list[str]]) -> str:
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows(rows)
+    return buf.getvalue().rstrip("\n")
+
+
 def parse_csv(data: bytes) -> tuple[list[str], list[dict], dict]:
     """Return (chunks, metadatas with loc 'rows a–b', table {columns, rows <= 200})."""
     all_rows = [r for r in csv.reader(io.StringIO(_decode(data))) if r]
     if not all_rows:
         return [], [], {"columns": [], "rows": []}
     columns, rows = all_rows[0], all_rows[1:]
-    header_line = ",".join(columns)
     chunks: list[str] = []
     metas: list[dict] = []
     for start in range(0, len(rows), CSV_ROWS_PER_CHUNK):
         part = rows[start:start + CSV_ROWS_PER_CHUNK]
-        chunks.append("\n".join([header_line] + [",".join(r) for r in part]))
+        chunks.append(_csv_lines([columns] + part))
         metas.append({"loc": f"rows {start + 1}–{start + len(part)}", "row_end": start + len(part)})
     return chunks, metas, {"columns": columns, "rows": rows[:CSV_TABLE_ROWS]}
 
@@ -113,12 +119,15 @@ def pick_key_passages(chunks, metadatas, chunk_embs, overview_emb, n: int = KEY_
     ]
 
 
-def set_card_status(store: BoardStore, card_id: str, status: str, data_patch: Optional[dict] = None) -> None:
+def set_card_status(store: BoardStore, card_id: str, status: str, data_patch: Optional[dict] = None,
+                    user_email: Optional[str] = None) -> None:
+    """Tenant-scoped, state-guarded status write: only a card still `processing` for this
+    user is touched. A deleted/reset card (or a wrong user) matches no row and is skipped."""
     with store.tx() as cur:
         cur.execute(
             "UPDATE nodes SET status=%s, data = coalesce(data,'{}') || %s::jsonb, updated_at=now() "
-            "WHERE id=%s",
-            (status, json.dumps(data_patch or {}), card_id),
+            "WHERE id=%s AND user_email=%s AND status='processing' AND deleted_at IS NULL",
+            (status, json.dumps(data_patch or {}), card_id, user_email),
         )
 
 
@@ -130,16 +139,22 @@ def _all_zero(embs: list[list[float]]) -> bool:
     return not embs or all(not any(v) for v in embs)
 
 
-def _fail(card_id: str, message: str) -> None:
+def _fail(card_id: str, user_email: str, message: str) -> None:
+    # A failed (re-)ingest keeps any previous chunks: nothing is deleted before the new set is ready.
     try:
-        set_card_status(store, card_id, "failed", {"error": _clip_text(message, 300)})
+        set_card_status(store, card_id, "failed", {"error": _clip_text(message, 300)}, user_email)
     except Exception as e:  # noqa: BLE001
         logger.error(f"could not mark card {card_id} failed: {e}")
 
 
-def _write_chunks(file_id: str, chunks, embs, metas) -> None:
+def _write_chunks(file_id: str, user_email: str, chunks, embs, metas) -> bool:
     """DELETE old chunks, INSERT new ones and mark processed in ONE tx."""
     with store.tx() as cur:
+        # Row lock serialises overlapping ingests of the same file.
+        cur.execute("SELECT id FROM external_files WHERE id = %s AND user_email = %s FOR UPDATE",
+                    (file_id, user_email))
+        if cur.fetchone() is None:
+            return False
         cur.execute("DELETE FROM file_chunks WHERE file_id = %s", (file_id,))
         for idx, (text, emb, meta) in enumerate(zip(chunks, embs, metas)):
             cur.execute(
@@ -148,24 +163,31 @@ def _write_chunks(file_id: str, chunks, embs, metas) -> None:
                 (file_id, idx, text, _vec(emb), json.dumps(meta)),
             )
         cur.execute(
-            "UPDATE external_files SET processed = true, updated_at = NOW() WHERE id = %s",
-            (file_id,),
+            "UPDATE external_files SET processed = true, updated_at = NOW() "
+            "WHERE id = %s AND user_email = %s",
+            (file_id, user_email),
         )
+    return True
 
 
 def _embed_and_finish(card_id, file_id, user_email, chunks, metas, overview_text, patch) -> None:
     """Shared tail: embed -> overview -> key passages -> write chunks -> ready."""
+    if len(chunks) > MAX_EMBED_CHUNKS:
+        logger.warning(f"ingest {card_id}: truncating {len(chunks)} chunks to {MAX_EMBED_CHUNKS}")
+        chunks, metas = chunks[:MAX_EMBED_CHUNKS], metas[:MAX_EMBED_CHUNKS]
     embs = get_embeddings(chunks)
     if len(embs) != len(chunks) or _all_zero(embs):
-        _fail(card_id, "Failed to generate embeddings")
+        _fail(card_id, user_email, "Failed to generate embeddings")
         return
     summary = make_overview(overview_text, user_email)
     overview_emb = get_embedding(summary) or []
     if not any(overview_emb):
         overview_emb = embs[0]
     excerpts = pick_key_passages(chunks, metas, embs, overview_emb)
-    _write_chunks(file_id, chunks, embs, metas)
-    set_card_status(store, card_id, "ready", {**patch, "summary": summary, "excerpts": excerpts})
+    if not _write_chunks(file_id, user_email, chunks, embs, metas):
+        return
+    set_card_status(store, card_id, "ready", {**patch, "summary": summary, "excerpts": excerpts},
+                    user_email)
 
 
 def _source_kind(source_type: Optional[str], file_name: str, mime: str) -> str:
@@ -189,7 +211,7 @@ def ingest_file_source(card_id: str, user_email: str) -> None:
             )
             row = cur.fetchone()
         if not row or row["data"] is None:
-            _fail(card_id, "File not found")
+            _fail(card_id, user_email, "File not found")
             return
         file_id, name, mime = row["id"], row["file_name"] or "", row["mime_type"] or ""
         data = bytes(row["data"])
@@ -199,17 +221,17 @@ def ingest_file_source(card_id: str, user_email: str) -> None:
         if kind == "csv":
             chunks, metas, table = parse_csv(data)
             if not chunks:
-                _fail(card_id, "No readable content found")
+                _fail(card_id, user_email, "No readable content found")
                 return
             patch.update(meta=f"CSV · {metas[-1]['row_end']} rows", table=table)
             full_text = "\n".join(chunks)
         else:
             chunks, metas, full_text, err = load_and_split_documents(data, mime, name)
             if err:
-                _fail(card_id, err)
+                _fail(card_id, user_email, err)
                 return
             if not chunks:
-                _fail(card_id, "No readable content found")
+                _fail(card_id, user_email, "No readable content found")
                 return
             metas = add_locators(kind, metas)
             if kind == "pdf":
@@ -220,7 +242,7 @@ def ingest_file_source(card_id: str, user_email: str) -> None:
         _embed_and_finish(card_id, file_id, user_email, chunks, metas, full_text, patch)
     except Exception as e:  # noqa: BLE001
         logger.error(f"ingest_file_source({card_id}) failed: {e}")
-        _fail(card_id, str(e) or "Ingestion failed")
+        _fail(card_id, user_email, str(e) or "Ingestion failed")
 
 
 def ingest_web_source(card_id: str, user_email: str) -> None:
@@ -232,11 +254,11 @@ def ingest_web_source(card_id: str, user_email: str) -> None:
             )
             row = cur.fetchone()
         if not row or not row["url"]:
-            _fail(card_id, "Couldn't read this page")
+            _fail(card_id, user_email, "Couldn't read this page")
             return
         page = fetch_url_content(row["url"], WEB_INGEST_MAX_CHARS)
         if not page or not (page.get("text") or "").strip():
-            _fail(card_id, "Couldn't read this page")
+            _fail(card_id, user_email, "Couldn't read this page")
             return
         text = page["text"]
         file_id = f"file_{card_id}"
@@ -252,7 +274,7 @@ def ingest_web_source(card_id: str, user_email: str) -> None:
             )
         chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(text)
         if not chunks:
-            _fail(card_id, "Couldn't read this page")
+            _fail(card_id, user_email, "Couldn't read this page")
             return
         metas = add_locators("web", [{} for _ in chunks])
         host = urlparse(row["url"]).hostname or ""
@@ -260,4 +282,4 @@ def ingest_web_source(card_id: str, user_email: str) -> None:
         _embed_and_finish(card_id, file_id, user_email, chunks, metas, text, patch)
     except Exception as e:  # noqa: BLE001
         logger.error(f"ingest_web_source({card_id}) failed: {e}")
-        _fail(card_id, str(e) or "Ingestion failed")
+        _fail(card_id, user_email, str(e) or "Ingestion failed")

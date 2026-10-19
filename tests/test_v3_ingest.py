@@ -204,3 +204,129 @@ def test_ingest_web_refused_marks_failed(db, user, stubs, monkeypatch):
     ingest.ingest_web_source(card, user)
     status, data = _node(db, card)
     assert status == "failed" and data["error"] == "Couldn't read this page"
+
+
+# ── fix round 1 ──────────────────────────────────────────────────────────────
+@requires_db
+def test_overlapping_ingests_leave_one_chunk_set(db, user, stubs, monkeypatch):
+    import threading
+    import time
+    board, card, fid = _doc_card(db, user)
+    ingest.ingest_file_source(card, user)
+    expected = _chunk_count(db, user, card)
+    with db.cursor() as cur:
+        cur.execute("UPDATE nodes SET status='processing' WHERE id=%s", (card,))
+
+    def slow(texts):
+        time.sleep(0.4)
+        return [unit_emb(i) for i, _ in enumerate(texts)]
+    monkeypatch.setattr(ingest, "get_embeddings", slow)
+    ts = [threading.Thread(target=ingest.ingest_file_source, args=(card, user)) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert _chunk_count(db, user, card) == expected
+    with db.cursor() as cur:
+        cur.execute("SELECT count(*), count(DISTINCT chunk_index) FROM file_chunks WHERE file_id=%s", (fid,))
+        assert cur.fetchone() == (expected, expected)
+    assert _node(db, card)[0] == "ready"
+
+
+@requires_db
+def test_card_reset_mid_ingest_is_not_overwritten(db, user, stubs, monkeypatch):
+    board, card, fid = _doc_card(db, user)
+
+    def reset_then_embed(texts):
+        with db.cursor() as cur:
+            cur.execute("UPDATE nodes SET status='idle' WHERE id=%s", (card,))
+        return [unit_emb(i) for i, _ in enumerate(texts)]
+    monkeypatch.setattr(ingest, "get_embeddings", reset_then_embed)
+    ingest.ingest_file_source(card, user)
+    status, data = _node(db, card)
+    assert status == "idle" and "summary" not in data
+
+
+@requires_db
+def test_deleted_card_mid_ingest_is_not_overwritten(db, user, stubs, monkeypatch):
+    board, card, fid = _doc_card(db, user)
+
+    def delete_then_embed(texts):
+        with db.cursor() as cur:
+            cur.execute("UPDATE nodes SET deleted_at=now() WHERE id=%s", (card,))
+        return [unit_emb(i) for i, _ in enumerate(texts)]
+    monkeypatch.setattr(ingest, "get_embeddings", delete_then_embed)
+    ingest.ingest_file_source(card, user)
+    status, data = _node(db, card)
+    assert status == "processing" and "summary" not in data
+
+
+@requires_db
+def test_set_card_status_wrong_user_leaves_card(db, user, stubs):
+    from app.agent.store.board_store import store
+    board, card, fid = _doc_card(db, user)
+    ingest.set_card_status(store, card, "failed", {"error": "x"}, "someone-else@example.com")
+    status, data = _node(db, card)
+    assert status == "processing" and "error" not in data
+
+
+@requires_db
+def test_chunk_cap_truncates(db, user, stubs, monkeypatch):
+    monkeypatch.setattr(ingest, "MAX_EMBED_CHUNKS", 3)
+    csv_bytes = ("a,b\n" + "".join(f"{i},x\n" for i in range(1, 251))).encode()
+    board, card, fid = _doc_card(db, user, name="t.csv", mime="text/csv", data=csv_bytes, source_type="csv")
+    ingest.ingest_file_source(card, user)
+    assert _node(db, card)[0] == "ready" and _chunk_count(db, user, card) == 3
+
+
+def test_csv_cells_with_commas_and_quotes_stay_unambiguous():
+    chunks, _, _ = parse_csv(b'a,b\n"x, y","say ""hi"""\n')
+    assert chunks[0] == 'a,b\n"x, y","say ""hi"""'
+
+
+@requires_db
+def test_stored_overview_is_clipped(db, user, monkeypatch):
+    monkeypatch.setattr(ingest, "get_embeddings", lambda texts: [unit_emb(i) for i, _ in enumerate(texts)])
+    monkeypatch.setattr(ingest, "get_embedding", lambda t: unit_emb(0))
+    monkeypatch.setattr(ingest, "get_llm", lambda *a, **k: FakeLLM("o" * 5000))
+    board, card, fid = _doc_card(db, user)
+    ingest.ingest_file_source(card, user)
+    assert len(_node(db, card)[1]["summary"]) <= 600
+
+
+@requires_db
+def test_no_connection_held_during_embed_or_llm(db, user, monkeypatch):
+    from contextlib import contextmanager
+    from app.agent.store.board_store import store as bs
+    real = bs._get_conn
+    state = {"open": 0, "seen": []}
+
+    @contextmanager
+    def tracked():
+        state["open"] += 1
+        try:
+            with real() as conn:
+                yield conn
+        finally:
+            state["open"] -= 1
+
+    def emb(texts):
+        state["seen"].append(("embed", state["open"]))
+        return [unit_emb(i) for i, _ in enumerate(texts)]
+
+    def one(t):
+        state["seen"].append(("embed1", state["open"]))
+        return unit_emb(0)
+
+    class SeenLLM(FakeLLM):
+        def invoke(self, prompt):
+            state["seen"].append(("llm", state["open"]))
+            return super().invoke(prompt)
+
+    monkeypatch.setattr(ingest, "get_embeddings", emb)
+    monkeypatch.setattr(ingest, "get_embedding", one)
+    monkeypatch.setattr(ingest, "get_llm", lambda *a, **k: SeenLLM("ok"))
+    board, card, fid = _doc_card(db, user)
+    monkeypatch.setattr(bs, "_get_conn", tracked)
+    ingest.ingest_file_source(card, user)
+    assert _node(db, card)[0] == "ready"
+    assert {k for k, _ in state["seen"]} == {"embed", "embed1", "llm"}
+    assert all(n == 0 for _, n in state["seen"])
