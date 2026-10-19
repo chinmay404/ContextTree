@@ -245,3 +245,78 @@ def list_messages(cur, chat_id: str, user_email: str) -> list[dict]:
         }
         for r in cur.fetchall()
     ]
+
+
+def delete_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:
+    """Soft-delete a card (a chat takes its live subtree) under one shared stamp."""
+    require_board(cur, board_id, user_email)
+    card = require_card(cur, board_id, card_id, user_email)
+    cur.execute("SELECT now() AS t")
+    stamp = cur.fetchone()["t"]
+    if card["kind"] == "chat":
+        cur.execute(
+            "SELECT id FROM nodes WHERE canvas_id = %s AND user_email = %s AND deleted_at IS NULL "
+            "AND kind IS NOT NULL AND (id = %s OR ancestor_ids @> ARRAY[%s]::text[])",
+            (board_id, user_email, card_id, card_id),
+        )
+        ids = sorted(r["id"] for r in cur.fetchall())
+    else:
+        ids = [card_id]
+    cur.execute(
+        "UPDATE nodes SET deleted_at = %s, updated_at = now() "
+        "WHERE id = ANY(%s) AND canvas_id = %s AND user_email = %s",
+        (stamp, ids, board_id, user_email),
+    )
+    # strings (non-lineage edges) die with their endpoint; lineage edges stay un-stamped
+    cur.execute(
+        "UPDATE edges SET deleted_at = %s WHERE canvas_id = %s AND user_email = %s "
+        "AND deleted_at IS NULL AND kind <> 'lineage' "
+        "AND (from_node = ANY(%s) OR to_node = ANY(%s))",
+        (stamp, board_id, user_email, ids, ids),
+    )
+    touch_board(cur, board_id)
+    return ids
+
+
+def restore_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:
+    """Undo exactly the delete that stamped this card (cards and edges sharing deleted_at)."""
+    require_board(cur, board_id, user_email)
+    cur.execute(
+        "SELECT * FROM nodes WHERE id = %s AND canvas_id = %s AND user_email = %s "
+        "AND kind IS NOT NULL",
+        (card_id, board_id, user_email),
+    )
+    card = cur.fetchone()
+    if not card:
+        raise ApiError(404, "not_found")
+    stamp = card["deleted_at"]
+    if stamp is None:
+        return []
+    if card["parent_node_id"]:
+        cur.execute(
+            "SELECT deleted_at FROM nodes WHERE id = %s", (card["parent_node_id"],)
+        )
+        parent = cur.fetchone()
+        if parent and parent["deleted_at"] is not None:
+            raise ApiError(409, "not_allowed", "restore the parent chat first")
+    lock_board(cur, board_id)
+    cur.execute(
+        "SELECT id FROM nodes WHERE canvas_id = %s AND user_email = %s AND deleted_at = %s "
+        "AND kind IS NOT NULL AND (id = %s OR ancestor_ids @> ARRAY[%s]::text[])",
+        (board_id, user_email, stamp, card_id, card_id),
+    )
+    ids = sorted(r["id"] for r in cur.fetchall())
+    if live_card_count(cur, board_id) + len(ids) > MAX_CARDS_PER_BOARD:
+        raise ApiError(409, "card_limit", f"a board holds at most {MAX_CARDS_PER_BOARD} cards")
+    cur.execute(
+        "UPDATE nodes SET deleted_at = NULL, updated_at = now() "
+        "WHERE id = ANY(%s) AND canvas_id = %s AND user_email = %s",
+        (ids, board_id, user_email),
+    )
+    cur.execute(
+        "UPDATE edges SET deleted_at = NULL WHERE canvas_id = %s AND user_email = %s "
+        "AND deleted_at = %s AND (from_node = ANY(%s) OR to_node = ANY(%s))",
+        (board_id, user_email, stamp, ids, ids),
+    )
+    touch_board(cur, board_id)
+    return ids

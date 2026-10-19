@@ -147,7 +147,7 @@ def seed_message(db, email, node_id, role, content, position, *, inherited=False
 
 
 # ── API fixture (Task 2) ─────────────────────────────────────────────────────
-JWT_SECRET = "-".join(("v3", "test", "secret"))  # fixture-only HMAC key, not a credential
+JWT_SECRET = "-".join(("v3", "test", "only", "fixture", "hmac", "key", "not", "real"))  # fixture-only HMAC key, not a credential
 
 
 def token_for(email: str) -> str:

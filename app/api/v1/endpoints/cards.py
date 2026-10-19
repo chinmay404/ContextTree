@@ -60,3 +60,25 @@ def api_card_messages(
         if card["kind"] != "chat":
             raise ApiError(400, "invalid", "messages exist only on chats")
         return {"messages": card_store.list_messages(cur, card_id, email)}
+
+
+@router.delete("/{board_id}/cards/{card_id}")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_delete_card(
+    board_id: str, card_id: str, request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        return {"deleted": card_store.delete_card(cur, email, board_id, card_id)}
+
+
+@router.post("/{board_id}/cards/{card_id}/restore")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_restore_card(
+    board_id: str, card_id: str, request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        return {"restored": card_store.restore_card(cur, email, board_id, card_id)}
