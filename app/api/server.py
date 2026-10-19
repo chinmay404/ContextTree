@@ -12,6 +12,7 @@ from app.api.v1.api import api_router
 
 
 from .limiter import limiter
+from .errors import install_error_handlers
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -37,6 +38,7 @@ def create_application() -> FastAPI:
     application.state.limiter = limiter
     application.add_exception_handler(
         RateLimitExceeded, _rate_limit_exceeded_handler)
+    install_error_handlers(application)
     application.add_middleware(SlowAPIMiddleware)
     application.add_middleware(
         CORSMiddleware,

@@ -144,3 +144,53 @@ def seed_message(db, email, node_id, role, content, position, *, inherited=False
             (msg_id, node_id, canvas_id, email, role, content, position, inherited,
              _vec(embedding) if embedding is not None else None))
     return msg_id
+
+
+# ── API fixture (Task 2) ─────────────────────────────────────────────────────
+JWT_SECRET = "-".join(("v3", "test", "secret"))  # fixture-only HMAC key, not a credential
+
+
+def token_for(email: str) -> str:
+    import jwt
+    now = int(time.time())
+    return jwt.encode({"sub": email, "iat": now, "exp": now + 60}, JWT_SECRET, algorithm="HS256")
+
+
+class Api:
+    """TestClient wrapper that prefixes /api/v1 and sends the caller's bearer token."""
+
+    def __init__(self, client, email: str):
+        self.client = client
+        self.email = email
+        self.h = {"Authorization": f"Bearer {token_for(email)}"}
+
+    def _call(self, method, path, **kw):
+        headers = {**self.h, **kw.pop("headers", {})}
+        return self.client.request(method, f"/api/v1{path}", headers=headers, **kw)
+
+    def get(self, path, **kw):
+        return self._call("GET", path, **kw)
+
+    def post(self, path, **kw):
+        return self._call("POST", path, **kw)
+
+    def patch(self, path, **kw):
+        return self._call("PATCH", path, **kw)
+
+    def delete(self, path, **kw):
+        return self._call("DELETE", path, **kw)
+
+
+@pytest.fixture
+def api(user, monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "BACKEND_JWT_SECRET", JWT_SECRET)
+    from fastapi.testclient import TestClient
+    from app.api.server import app
+    return Api(TestClient(app), user)
+
+
+def make_board(api, title="Board") -> dict:
+    r = api.post("/boards", json={"id": new_id("b"), "title": title})
+    assert r.status_code == 201, r.text
+    return r.json()
