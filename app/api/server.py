@@ -13,6 +13,7 @@ from app.api.v1.api import api_router
 
 from .limiter import limiter
 from .errors import install_error_handlers
+from .upload_limit import UploadSizeLimitMiddleware
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -40,6 +41,7 @@ def create_application() -> FastAPI:
         RateLimitExceeded, _rate_limit_exceeded_handler)
     install_error_handlers(application)
     application.add_middleware(SlowAPIMiddleware)
+    application.add_middleware(UploadSizeLimitMiddleware)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=[str(origin)for origin in settings.BACKEND_CORS_ORIGINS],

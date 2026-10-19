@@ -168,7 +168,7 @@ def test_raw_returns_bytes_owner_only(api, db, rec):
     assert r.status_code == 200 and r.content == b"hello"
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["content-type"].startswith("text/plain")
-    assert r.headers["content-disposition"].count('"') == 2
+    assert r.headers["content-security-policy"] == "sandbox"
     other = f"{new_id('o')}@example.com"
     with db.cursor() as cur:
         cur.execute("INSERT INTO users (email, name) VALUES (%s, 'o')", (other,))
@@ -191,3 +191,113 @@ def test_raw_404_for_web_card_without_bytes(api, db, monkeypatch, rec):
             "mime_type, content, data, processed) VALUES (%s,%s,%s,%s,'p','text/html','text/html','t',NULL,true)",
             (f"file_{cid}", api.email, cid, b))
     assert api.get(f"/files/{cid}/raw").status_code == 404
+
+
+def _insert_raw(db, api, b, cid, file_name, mime="text/plain", data=b"hi"):
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO external_files (id, user_email, node_id, canvas_id, file_name, file_type, "
+            "mime_type, data, processed) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,true)",
+            (f"file_{cid}", api.email, cid, b, file_name, mime, mime, data))
+
+
+def test_raw_header_injection_and_non_ascii_names(api, db, rec):
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="doc", status="ready")
+    hostile = 'a"b\r\nX-Evil: 1\x7f\\.txt'
+    _insert_raw(db, api, b, cid, hostile)
+    r = api.get(f"/files/{cid}/raw")
+    cd = r.headers["content-disposition"]
+    assert r.status_code == 200 and "x-evil" not in r.headers
+    ascii_part = cd.split('filename="')[1].split('"; filename*')[0]
+    assert ascii_part == "a_b__X-Evil: 1__.txt" and "\n" not in cd and "\r" not in cd
+    cid2 = seed_card(db, api.email, b, kind="source", source_type="pdf", status="ready")
+    _insert_raw(db, api, b, cid2, "报告.pdf", "application/pdf")
+    r = api.get(f"/files/{cid2}/raw")
+    assert r.status_code == 200
+    assert r.headers["content-disposition"] == (
+        "inline; filename=\"__.pdf\"; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf")
+
+
+def test_raw_404_when_board_deleted(api, db, rec):
+    b = make_board(api)["id"]
+    cid = up(api, b, "a.txt", b"hi", "text/plain").json()["id"]
+    assert api.get(f"/files/{cid}/raw").status_code == 200
+    with db.cursor() as cur:
+        cur.execute("UPDATE canvases SET deleted_at = now() WHERE id = %s", (b,))
+    assert api.get(f"/files/{cid}/raw").status_code == 404
+
+
+def test_upload_html_content_type_served_as_text_plain(api, rec):
+    b = make_board(api)["id"]
+    c = up(api, b, "a.txt", b"<script>1</script>", "text/html").json()
+    r = api.get(f"/files/{c['id']}/raw")
+    assert r.headers["content-type"].startswith("text/plain")
+
+
+def test_content_type_capped_and_empty_stem(api, db, rec):
+    b = make_board(api)["id"]
+    c = up(api, b, ".pdf", b"x", "application/" + "a" * 300).json()
+    assert c["data"]["title"] == ".pdf" and len(c["data"]["fileType"]) == 100
+
+
+def test_fetch_youtube_oembed(monkeypatch):
+    seen = {}
+
+    class R:
+        def raise_for_status(self): pass
+        def json(self): return {"title": "T", "thumbnail_url": "u", "x": 1}
+
+    def fake_get(url, params=None, timeout=None):
+        seen.update(url=url, params=params, timeout=timeout)
+        return R()
+    monkeypatch.setattr(sources.httpx, "get", fake_get)
+    assert sources.fetch_youtube_oembed("https://youtu.be/abcdefghijk") == {"title": "T", "thumbnail_url": "u"}
+    assert seen["url"] == "https://www.youtube.com/oembed"
+    assert seen["params"] == {"url": "https://youtu.be/abcdefghijk", "format": "json"} and seen["timeout"] == 5
+
+    def boom(*a, **k): raise RuntimeError("net")
+    monkeypatch.setattr(sources.httpx, "get", boom)
+    assert sources.fetch_youtube_oembed("https://youtu.be/abcdefghijk") is None
+
+
+def test_parse_youtube_id_rejects_trailing_newline():
+    assert sources._YT_ID.fullmatch("abcdefghijk\n") is None
+    assert sources._YT_ID.fullmatch("abcdefghijk") is not None
+
+
+def test_link_repost_does_no_network(api, monkeypatch, rec):
+    b = make_board(api)["id"]
+    body = {"id": new_id("c"), "url": "https://youtu.be/abcdefghijk", "x": 0, "y": 0}
+    monkeypatch.setattr(sources, "fetch_youtube_oembed", lambda u: None)
+    assert api.post(f"/boards/{b}/sources/link", json=body).status_code == 202
+
+    def boom(*a, **k): raise AssertionError("network")
+    monkeypatch.setattr(sources, "fetch_youtube_oembed", boom)
+    monkeypatch.setattr(sources, "host_is_public", boom)
+    assert api.post(f"/boards/{b}/sources/link", json=body).status_code == 200
+
+
+def test_oversized_streamed_body_413_without_handler(api, monkeypatch, rec):
+    b = make_board(api)["id"]
+    ran = []
+    monkeypatch.setattr(sources, "_create_file_card", lambda *a: ran.append(1))
+    boundary = "XBOUND"
+    head = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="a.txt"\r\n'
+            "Content-Type: text/plain\r\n\r\n").encode()
+
+    def gen():
+        yield head
+        for _ in range(60):
+            yield b"x" * (100 * 1024)  # ~6 MB, no Content-Length
+
+    r = api.post(f"/boards/{b}/sources/file", content=gen(),
+                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+    assert r.status_code == 413 and r.json()["error"] == "too_large" and ran == []
+
+
+def test_declared_content_length_over_cap_413(api, rec):
+    b = make_board(api)["id"]
+    r = api.post(f"/boards/{b}/sources/file", content=b"x" * (4 * 1024 * 1024 + 70 * 1024),
+                 headers={"Content-Type": "multipart/form-data; boundary=B"})
+    assert r.status_code == 413 and r.json()["error"] == "too_large"

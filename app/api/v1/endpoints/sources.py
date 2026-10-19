@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -13,7 +14,7 @@ from fastapi.responses import JSONResponse, Response
 from app.agent.helpers.web_fetch import host_is_public
 from app.agent.ingest import ingest_file_source, ingest_web_source
 from app.agent.store import card_store
-from app.agent.store.board_store import store
+from app.agent.store.board_store import require_board, store
 from app.api.auth import get_current_user_id
 from app.api.errors import ApiError
 from app.api.limiter import BOARD_RATE, limiter, user_key
@@ -22,7 +23,7 @@ from app.schemas.board import ID_PATTERN, CardCreate, LinkCreate
 
 router = APIRouter()
 
-MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+from app.api.upload_limit import MAX_UPLOAD_BYTES  # noqa: E402  (4 * 1024 * 1024)
 MAX_DESC_CHARS = 2000
 
 TYPE_BY_EXT = {
@@ -69,7 +70,7 @@ def parse_youtube_id(url: str) -> Optional[str]:
             cand = u.path[len("/shorts/"):].split("/")[0]
     elif host == "youtu.be":
         cand = u.path.lstrip("/").split("/")[0]
-    return cand if cand and _YT_ID.match(cand) else None
+    return cand if cand and _YT_ID.fullmatch(cand) else None
 
 
 def fetch_youtube_oembed(url: str) -> Optional[dict]:
@@ -87,10 +88,11 @@ def _basename(name: str) -> str:
     return re.split(r"[\\/]", name or "")[-1]
 
 
-def _create_file_card(email, board_id, card_id, x, y, desk_id, desc, name, ctype, raw, source_type, status):
+def _create_file_card(user_id, board_id, card_id, x, y, desk_id, desc, name, ctype, raw, source_type, status):
+    email = store.email_for(user_id)
     stem, _, ext = name.rpartition(".")
     data = {
-        "title": stem, "fileName": name, "fileType": ctype, "fileSize": len(raw),
+        "title": stem or name, "fileName": name, "fileType": ctype, "fileSize": len(raw),
         "meta": f"{source_type.upper()} · {format_size(len(raw))}",
     }
     if desc:
@@ -107,7 +109,7 @@ def _create_file_card(email, board_id, card_id, x, y, desk_id, desc, name, ctype
                 (f"file_{card_id}", email, card_id, board_id, name, ctype, len(raw), raw,
                  MIME_BY_EXT[ext.lower()]),
             )
-    return card, created
+    return card, created, email
 
 
 @router.post("/boards/{board_id}/sources/file")
@@ -122,7 +124,6 @@ async def api_upload_file(
     desc: Optional[str] = Form(default=None, max_length=MAX_DESC_CHARS),
     user_id: str = Depends(get_current_user_id),
 ):
-    email = store.email_for(user_id)
     raw = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(raw) > MAX_UPLOAD_BYTES:
         raise ApiError(413, "too_large", "files are limited to 4 MB")
@@ -131,9 +132,9 @@ async def api_upload_file(
     if ext not in TYPE_BY_EXT:
         raise ApiError(415, "unsupported_type", "unsupported file type")
     source_type, status = TYPE_BY_EXT[ext]
-    ctype = file.content_type or MIME_BY_EXT[ext]
-    card, created = await run_in_threadpool(
-        _create_file_card, email, board_id, id, x, y, deskId, desc, name, ctype, raw, source_type, status)
+    ctype = (file.content_type or MIME_BY_EXT[ext])[:100]
+    card, created, email = await run_in_threadpool(
+        _create_file_card, user_id, board_id, id, x, y, deskId, desc, name, ctype, raw, source_type, status)
     if created and card["status"] == "processing":
         background_tasks.add_task(ingest_file_source, id, email)
     return JSONResponse(card, status_code=202 if created else 200)
@@ -155,6 +156,13 @@ def api_add_link(
         raise ApiError(400, "invalid", "only http(s) links are supported")
     url = body.url.strip()
     desc = {"desc": body.desc} if body.desc else {}
+
+    # Re-post / missing board are answered before any network work (oEmbed, DNS).
+    with store.tx() as cur:
+        require_board(cur, board_id, email)
+        existing = card_store._existing_own(cur, email, board_id, body.id)
+    if existing is not None:
+        return JSONResponse(existing, status_code=200)
 
     ytid = parse_youtube_id(url)
     if ytid:
@@ -185,6 +193,7 @@ def api_raw_file(card_id: str, request: Request, user_id: str = Depends(get_curr
         cur.execute(
             "SELECT ef.data, ef.mime_type, ef.file_name FROM external_files ef "
             "JOIN nodes n ON n.id = ef.node_id "
+            "JOIN canvases c ON c.id = n.canvas_id AND c.deleted_at IS NULL "
             "WHERE ef.node_id = %s AND ef.user_email = %s AND n.user_email = %s "
             "AND n.kind IS NOT NULL AND n.deleted_at IS NULL AND ef.data IS NOT NULL "
             "ORDER BY ef.created_at LIMIT 1",
@@ -193,9 +202,16 @@ def api_raw_file(card_id: str, request: Request, user_id: str = Depends(get_curr
         row = cur.fetchone()
     if not row:
         raise ApiError(404, "not_found")
-    fname = re.sub(r'["\r\n\\]', "", row["file_name"] or "file")
+    full = row["file_name"] or "file"
+    ascii_name = re.sub(r'[^\x20-\x7e]|"|\\', "_", full) or "file"
     return Response(
         bytes(row["data"]),
         media_type=row["mime_type"] or "application/octet-stream",
-        headers={"Content-Disposition": f'inline; filename="{fname}"', "X-Content-Type-Options": "nosniff"},
+        headers={
+            "Content-Disposition": (
+                f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(full, safe='')}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox",
+        },
     )
