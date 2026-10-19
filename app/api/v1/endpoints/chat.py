@@ -156,7 +156,26 @@ def _assert_thread_access(active_graph, user_id: str, thread_id: Optional[str]) 
 
 # ── Fork initialisation (shared between sync and stream routes) ───────────────
 
-def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str, user_id: str) -> None:
+WHOLE_CARRY_MAX_MESSAGES = 40
+WHOLE_CARRY_MAX_TOKENS = 12_000
+_WHOLE_CARRY_MAX_CHARS = WHOLE_CARRY_MAX_TOKENS * 4  # token estimate: ceil(chars / 4)
+
+
+def _whole_carry_split(messages: list) -> tuple[list, list]:
+    """(older, buffer): buffer is the longest tail within the message/char caps."""
+    buffer_start = len(messages)
+    total_chars = 0
+    for m in reversed(messages):
+        total_chars += len(m.get("text") or "")
+        if (len(messages) - buffer_start) >= WHOLE_CARRY_MAX_MESSAGES or total_chars > _WHOLE_CARRY_MAX_CHARS:
+            break
+        buffer_start -= 1
+    return messages[:buffer_start], messages[buffer_start:]
+
+
+def _init_fork_if_needed(
+    chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary"
+) -> None:
     """
     On the first message of a branched node, seed the new thread with a
     compressed summary + a small verbatim buffer from the parent.
@@ -164,6 +183,8 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     This preserves the Context Tree guarantee: the branch starts with an
     accurate, scoped summary of the parent lineage — not a blank slate.
     """
+    if carry not in ("summary", "whole", "fresh"):
+        carry = "summary"
     parent_thread_id = chat_message.parent_thread_id
     fork_at_message_id = chat_message.fork_at_message_id
     node_metadata = None
@@ -217,13 +238,13 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
         except Exception as e:
             logger.warning(f"Could not check message count for fork init: {e}")
 
-    if thread_exists and not should_init and own_message_count <= 1:
+    if carry == "summary" and thread_exists and not should_init and own_message_count <= 1:
         should_init = True
 
     # Self-heal: branches stamped initialized while their parent had nothing
     # to give (e.g. the parent's replies weren't persisted at fork time) have
     # no summary. Re-run inheritance so they finally learn their lineage.
-    if thread_exists and not should_init:
+    if carry == "summary" and thread_exists and not should_init:
         try:
             own_summary = sanitize_summary_text(
                 active_graph.mongo_store.get_thread_summary(
@@ -240,6 +261,23 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
             logger.warning(f"Could not check summary for fork re-init: {e}")
 
     if not should_init:
+        return
+
+    if carry == "fresh":
+        # Lineage columns + is_initialized only; nothing inherited, no LLM.
+        active_graph.mongo_store.fork_thread(
+            user_id=user_id,
+            source_thread_id=parent_thread_id,
+            new_thread_id=chat_message.conversation_id,
+            fork_at_message_id=fork_at_message_id,
+            summary=None,
+            summary_embedding=None,
+            initial_messages=[],
+            memory_facts={},
+        )
+        logger.info(
+            "Fork initialised (fresh): %s → %s", parent_thread_id, chat_message.conversation_id
+        )
         return
 
     fork_source = active_graph.mongo_store.get_fork_inheritance_payload(
@@ -260,7 +298,10 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
             len(messages_data),
             messages_data[-1]["message_id"],
         )
-    if not messages_data:
+    if carry == "whole":
+        if fork_source.get("mode") != "scoped-fork-point":
+            messages_data = active_graph.mongo_store.get_thread_messages(user_id, parent_thread_id)
+    elif not messages_data:
         fallback_k = getattr(settings, "KEEP_LAST_MESSAGES", 6)
         logger.warning("fork_at_message_id not found; falling back to last-K messages")
         messages_data = active_graph.mongo_store.get_thread_recent_messages(
@@ -271,7 +312,10 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
 
     # ── Split into "summarise" portion and verbatim buffer ────────────────────
     buffer_size = getattr(settings, "FORK_BUFFER_MESSAGES", 2)
-    if len(messages_data) <= buffer_size:
+    if carry == "whole":
+        messages_to_summarize, buffer_messages = _whole_carry_split(messages_data)
+        existing_summary = existing_summary if messages_to_summarize else ""
+    elif len(messages_data) <= buffer_size:
         messages_to_summarize = []
         buffer_messages = messages_data
     else:
@@ -292,7 +336,7 @@ def _init_fork_if_needed(chat_message: ChatMessage, active_graph, transport: str
     new_memory_facts = parent_memory_facts if fork_source.get("skip_resummarize") else extract_memory_facts({}, messages_data)
     new_summary_embedding = []
 
-    if messages_to_summarize and (force_summarize or not fork_source.get("skip_resummarize")):
+    if messages_to_summarize and (force_summarize or carry == "whole" or not fork_source.get("skip_resummarize")):
         lc_messages = []
         for m in messages_to_summarize:
             if m["role"] == "user":
