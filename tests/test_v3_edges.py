@@ -121,3 +121,38 @@ def test_delete_other_users_edge_404(api, db, g):
             for t in ("edges", "nodes", "canvases"):
                 cur.execute(f"DELETE FROM {t} WHERE user_email = 'v3_other_edges@example.com'")
             cur.execute("DELETE FROM users WHERE email = 'v3_other_edges@example.com'")
+
+
+def test_delete_edge_takes_board_lock_and_keeps_existing_stamp(db, user, g):
+    # delete_edge must serialise with delete_card (board lock) and never overwrite its stamp
+    import threading
+    import time
+    from app.agent.store import edge_store
+    from app.agent.store.board_store import lock_board, store
+    from app.api.errors import ApiError
+
+    eid = seed_edge(db, user, g.b, g.src, g.a, "wire")
+    outcome = {}
+
+    def run():
+        try:
+            with store.tx() as cur:
+                edge_store.delete_edge(cur, user, g.b, eid)
+            outcome["r"] = "deleted"
+        except ApiError as e:
+            outcome["r"] = e.status_code
+
+    with store.tx() as holder:
+        lock_board(holder, g.b)
+        t = threading.Thread(target=run)
+        t.start()
+        time.sleep(0.5)
+        blocked = "r" not in outcome
+        with db.cursor() as cur:  # delete_card stamps the edge while the lock is held
+            cur.execute("UPDATE edges SET deleted_at = '2026-01-01' WHERE id = %s", (eid,))
+    t.join(5)
+    assert blocked, "delete_edge did not wait for the board lock"
+    assert outcome["r"] == 404
+    with db.cursor() as cur:
+        cur.execute("SELECT deleted_at::date::text FROM edges WHERE id = %s", (eid,))
+        assert cur.fetchone()[0] == "2026-01-01"

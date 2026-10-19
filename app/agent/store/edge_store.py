@@ -84,6 +84,8 @@ def create_edge(cur, user_email: str, board_id: str, body: EdgeCreate) -> tuple[
 
 def delete_edge(cur, user_email: str, board_id: str, edge_id: str) -> None:
     require_board(cur, board_id, user_email)
+    # serialise with delete_card/restore so we never overwrite a stamp restore relies on
+    lock_board(cur, board_id)
     cur.execute(
         "SELECT kind FROM edges WHERE id = %s AND canvas_id = %s AND user_email = %s "
         "AND deleted_at IS NULL",
@@ -94,5 +96,5 @@ def delete_edge(cur, user_email: str, board_id: str, edge_id: str) -> None:
         raise ApiError(404, "not_found")
     if row["kind"] not in ("wire", "answer"):
         raise ApiError(400, "invalid", "lineage edges cannot be deleted")
-    cur.execute("UPDATE edges SET deleted_at = now() WHERE id = %s", (edge_id,))
+    cur.execute("UPDATE edges SET deleted_at = now() WHERE id = %s AND deleted_at IS NULL", (edge_id,))
     touch_board(cur, board_id)
