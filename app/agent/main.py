@@ -11,6 +11,7 @@ from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.utils.embeddings import get_embedding
+from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
 from app.agent.helpers.web_fetch import extract_urls, fetch_pages, format_page_snippets
 from app.core.config import settings
@@ -77,11 +78,7 @@ def _content_to_text(content) -> str:
     return str(content or "")
 
 
-def _clip_text(value, max_chars: int) -> str:
-    text = str(value or "").strip()
-    if len(text) <= max_chars:
-        return text
-    return f"{text[: max_chars - 1].rstrip()}…"
+_clip_text = clip_text  # alias kept for existing call sites
 
 
 def _normalized_message_id(message_id: str | None) -> str:
