@@ -7,9 +7,8 @@ Tenancy key is user_email. A missing, deleted or foreign row is a 404 (never 403
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, ContextManager, Optional
+from typing import Iterator, Optional
 
-from pgvector.psycopg2 import register_vector
 from psycopg2.extras import RealDictCursor
 
 from app.agent.store.PostgresStore import PostgresConversationStore
@@ -41,7 +40,7 @@ def _iso(value) -> Optional[str]:
 
 class BoardStore(PostgresConversationStore):
     @contextmanager
-    def tx(self) -> ContextManager[RealDictCursor]:
+    def tx(self) -> Iterator[RealDictCursor]:
         """One transaction on a pooled connection; commits on clean exit."""
         with self._get_conn() as conn:
             cur = conn.cursor(cursor_factory=RealDictCursor)

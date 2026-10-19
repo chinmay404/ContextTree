@@ -73,8 +73,8 @@ class CardCreate(_Model):
 class CardPatch(_Model):
     """Use `model_fields_set` to tell an absent field from an explicit null."""
     data: Optional[dict[str, Any]] = None
-    desk_id: Optional[str] = None
-    pile_id: Optional[str] = None
+    desk_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
+    pile_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
     status: Optional[Literal[STATUSES]] = None
 
 
