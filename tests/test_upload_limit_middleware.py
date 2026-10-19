@@ -59,6 +59,7 @@ def test_chunked_body_past_cap_413_stops_reading_and_app_response_dropped():
 
     async def receive():
         consumed.append(1)
+        assert len(consumed) <= LIMIT // chunk + 2, "receive() kept being consumed past the cap"
         return {"type": "http.request", "body": b"x" * chunk, "more_body": True}
 
     sent = run(UploadSizeLimitMiddleware(app), _scope(), receive)

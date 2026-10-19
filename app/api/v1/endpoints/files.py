@@ -4,6 +4,7 @@ import logging
 import tempfile
 import os
 from typing import List, Optional, Tuple
+from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel
 
@@ -23,6 +24,8 @@ class IngestRequest(BaseModel):
     file_id: str
     node_id: Optional[str] = None
     canvas_id: Optional[str] = None
+    # Set by the route from the stored file row; any value in the body is overwritten.
+    user_email: Optional[str] = None
     # Identity comes from the verified service JWT (app/api/auth.py),
     # never from the request body.
 
@@ -115,9 +118,7 @@ def process_file_background(request: IngestRequest):
     if not file_record:
         logger.error(f"File {request.file_id} not found in DB")
         if request.node_id:
-            store.update_node_processing_error(
-                request.node_id, "File not found in storage"
-            )
+            store.update_node_processing_error(request.node_id, "File not found in storage", request.user_email)
         return
 
     data = file_record.get('data')
@@ -130,9 +131,7 @@ def process_file_background(request: IngestRequest):
     if not data:
         logger.error(f"No binary data for file {request.file_id}")
         if request.node_id:
-            store.update_node_processing_error(
-                request.node_id, "File content missing"
-            )
+            store.update_node_processing_error(request.node_id, "File content missing", request.user_email)
         return
         
     # Convert memoryview to bytes if needed
@@ -145,7 +144,7 @@ def process_file_background(request: IngestRequest):
     if load_error:
         logger.warning(f"File processing error for {request.file_id}: {load_error}")
         if request.node_id:
-            store.update_node_processing_error(request.node_id, load_error)
+            store.update_node_processing_error(request.node_id, load_error, request.user_email)
         return
 
     if not chunks:
@@ -153,11 +152,9 @@ def process_file_background(request: IngestRequest):
         if request.node_id:
             limit_content = text_content[:100000] if text_content else ""
             if limit_content:
-                store.update_node_data_content(request.node_id, limit_content)
+                store.update_node_data_content(request.node_id, limit_content, request.user_email)
             else:
-                store.update_node_processing_error(
-                    request.node_id, "No text content extracted"
-                )
+                store.update_node_processing_error(request.node_id, "No text content extracted", request.user_email)
         return
 
     # 4. Embed
@@ -167,9 +164,7 @@ def process_file_background(request: IngestRequest):
     except Exception as e:
         logger.error(f"Embedding generation failed for {request.file_id}: {e}")
         if request.node_id:
-            store.update_node_processing_error(
-                request.node_id, "Failed to generate embeddings"
-            )
+            store.update_node_processing_error(request.node_id, "Failed to generate embeddings", request.user_email)
         return
 
     # 5. Save
@@ -178,17 +173,30 @@ def process_file_background(request: IngestRequest):
     except Exception as e:
         logger.error(f"Saving file chunks failed for {request.file_id}: {e}")
         if request.node_id:
-            store.update_node_processing_error(
-                request.node_id, "Failed to save processed file"
-            )
+            store.update_node_processing_error(request.node_id, "Failed to save processed file", request.user_email)
         return
     
     # 6. Update Node with extracted content
     if request.node_id:
         limit_content = text_content[:100000] # 100KB limit for immediate preview
-        store.update_node_data_content(request.node_id, limit_content)
+        store.update_node_data_content(request.node_id, limit_content, request.user_email)
         
     logger.info(f"Successfully ingested file {request.file_id}")
+
+
+def _owned_file_target(file_id: str, email: str):
+    with board_store.tx() as cur:
+        cur.execute(
+            "SELECT ef.user_email, ef.node_id, ef.canvas_id, n.user_email AS node_email "
+            "FROM external_files ef LEFT JOIN nodes n ON n.id = ef.node_id WHERE ef.id = %s",
+            (file_id,),
+        )
+        row = cur.fetchone()
+    if row is None or row["user_email"] != email:
+        return None
+    if row["node_id"] is not None and row["node_email"] != email:
+        return None
+    return row
 
 
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
@@ -202,10 +210,12 @@ async def ingest_file(
     """
     logger.info(f"Ingest request received for file_id: {request.file_id} user: {user_id}")
     email = board_store.resolve_user_email(user_id)
-    with board_store.tx() as cur:
-        cur.execute("SELECT user_email FROM external_files WHERE id = %s", (request.file_id,))
-        row = cur.fetchone()
-    if row is None or row["user_email"] != email:
+    stored = await run_in_threadpool(_owned_file_target, request.file_id, email)
+    # The ingest target is the stored row's node/canvas, never the body's.
+    if stored is None or (request.node_id is not None and request.node_id != stored["node_id"]):
         raise ApiError(404, "not_found")
+    request.node_id = stored["node_id"]
+    request.canvas_id = stored["canvas_id"]
+    request.user_email = email
     background_tasks.add_task(process_file_background, request)
     return {"status": "processing_started", "file_id": request.file_id}

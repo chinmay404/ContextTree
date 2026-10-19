@@ -1183,7 +1183,7 @@ class PostgresConversationStore:
 
     # ── Node content updates ───────────────────────────────────────────────────
 
-    def update_node_data_content(self, node_id: str, content: str) -> bool:
+    def update_node_data_content(self, node_id: str, content: str, user_email: Optional[str] = None) -> bool:
         try:
             text_value = content or ""
             contract_value = content if content else "(No text content extracted)"
@@ -1208,16 +1208,16 @@ class PostgresConversationStore:
                                         '{error}', 'null'::jsonb, true),
                                     '{contextContract}', to_jsonb(%s::text), true),
                                 '{data,contextContract}', to_jsonb(%s::text), true)
-                    WHERE id = %s
+                    WHERE id = %s AND (%s::text IS NULL OR user_email = %s)
                     """,
-                    (text_value, text_value, contract_value, contract_value, node_id),
+                    (text_value, text_value, contract_value, contract_value, node_id, user_email, user_email),
                 )
                 return cur.rowcount > 0
         except Exception as e:
             logger.error(f"Error updating node data content: {e}")
             return False
 
-    def update_node_processing_error(self, node_id: str, message: str) -> bool:
+    def update_node_processing_error(self, node_id: str, message: str, user_email: Optional[str] = None) -> bool:
         try:
             error_value = message or "Failed to process file"
             with self._get_conn() as conn:
@@ -1237,9 +1237,9 @@ class PostgresConversationStore:
                                         '{loading}', 'false'::jsonb, true),
                                     '{contextContract}', to_jsonb(%s::text), true),
                                 '{data,contextContract}', to_jsonb(%s::text), true)
-                    WHERE id = %s
+                    WHERE id = %s AND (%s::text IS NULL OR user_email = %s)
                     """,
-                    (error_value, error_value, error_value, error_value, node_id),
+                    (error_value, error_value, error_value, error_value, node_id, user_email, user_email),
                 )
                 return cur.rowcount > 0
         except Exception as e:
