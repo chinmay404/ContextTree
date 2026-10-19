@@ -56,6 +56,8 @@ class ChatMessage(BaseModel):
         None, description="Override recent history window", alias="lastKMessages")
     external_context_top_k: Optional[int] = Field(
         None, description="External context chunk count", alias="externalContextTopK")
+    board_id: Optional[str] = Field(
+        None, description="V3 board the chat card lives on", alias="boardId")
     context: Optional[list] = Field(
         None, description="Context for the conversation")
     context_node_ids: Optional[list[str]] = Field(

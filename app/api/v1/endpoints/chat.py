@@ -22,7 +22,10 @@ from app.agent.main import getGraphResponse
 from app.agent.memory import extract_memory_facts, sanitize_summary_text
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
-from app.api.limiter import limiter
+from app.agent.reads import _top_k as card_top_k, resolve_reads
+from app.agent.store.board_store import get_card_row, store as board_store
+from app.api.errors import ApiError
+from app.api.limiter import limiter, user_key
 from app.core.config import settings
 from app.core.logger import logger
 from app.core.observability import build_langsmith_trace_config
@@ -102,17 +105,7 @@ _initialise_graph()
 
 
 # ── Rate-limit key: the VERIFIED user id (set by get_current_user_id) ────────
-def _user_key(request: Request) -> str:
-    """
-    SlowAPI key function. Per-user limits, not per-IP, so users behind the
-    same NAT don't block each other. request.state.user_id is set by the
-    auth dependency from the verified JWT — it cannot be spoofed via the body.
-    """
-    uid = getattr(request.state, "user_id", None)
-    if uid:
-        return uid
-    # Unauthenticated requests (will be rejected by the dependency anyway)
-    return request.client.host if request.client else "unknown"
+_user_key = user_key  # canonical per-user key lives in app.api.limiter
 
 
 # ── Daily quota (durable, Postgres-backed — survives restarts/workers) ────────
@@ -431,6 +424,76 @@ def _init_fork_if_needed(
     )
 
 
+# ── V3 card gate ──────────────────────────────────────────────────────────────
+
+def _resolve_v3_card(user_id: str, chat_message: ChatMessage) -> Optional[dict]:
+    """
+    None for V2 turns; the live chat-card row for V3 turns (row["_user_email"] holds
+    the resolved owner email so callers do not resolve it again).
+
+    A turn is V3 when the body carries boardId or the node row has kind NOT NULL.
+    Missing / deleted / foreign / other-board / non-V3-board -> 404; not a chat -> 400.
+    Never creates a row.
+    """
+    node_id = chat_message.conversation_id
+    board_id = chat_message.board_id
+    with board_store.tx() as cur:
+        row = get_card_row(cur, node_id)
+        if not board_id and not (row and row.get("kind") is not None):
+            return None
+        email = board_store.resolve_user_email(user_id)
+        if (not row or row.get("kind") is None or row.get("deleted_at") is not None
+                or row.get("user_email") != email
+                or (board_id and row.get("canvas_id") != board_id)):
+            raise ApiError(404, "not_found")
+        cur.execute(
+            "SELECT 1 FROM canvases WHERE id = %s AND user_email = %s "
+            "AND board_version = 3 AND deleted_at IS NULL",
+            (row["canvas_id"], email),
+        )
+        if not cur.fetchone():
+            raise ApiError(404, "not_found")
+    if row["kind"] != "chat":
+        raise ApiError(400, "invalid", "only chat cards can be chatted with")
+    return {**row, "_user_email": email}
+
+
+def _v3_gate(user_id: str, chat_message: ChatMessage) -> tuple[Optional[dict], str]:
+    """(card, carry). For V3 the card row wins over the body for lineage."""
+    card = _resolve_v3_card(user_id, chat_message)
+    if card is None:
+        return None, "summary"
+    chat_message.parent_thread_id = card.get("parent_node_id")
+    chat_message.fork_at_message_id = card.get("forked_from_message_id")
+    carry = (card.get("data") or {}).get("carry")
+    return card, carry if isinstance(carry, str) else "summary"
+
+
+def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], carry: str) -> dict:
+    """Per-turn context kwargs: V2 passes the body through; V3 uses the server read set."""
+    if card is None:
+        return dict(
+            context_node_ids=chat_message.context_node_ids,
+            board_reads=None,
+            last_k_messages=chat_message.last_k_messages,
+            external_context_top_k=chat_message.external_context_top_k,
+        )
+    data = card.get("data") or {}
+    adv = data.get("advanced") if isinstance(data.get("advanced"), dict) else {}
+    budget = adv.get("contextBudgetTokens")
+    last_k = chat_message.last_k_messages
+    if carry == "whole" and last_k is None:
+        last_k = 50
+    return dict(
+        context_node_ids=None,
+        board_reads=resolve_reads(board_store, card["_user_email"], card["canvas_id"], card["id"]),
+        budget_tokens=budget if isinstance(budget, int) and not isinstance(budget, bool) else None,
+        last_k_messages=last_k,
+        external_context_top_k=card_top_k(data),
+        user_email=card["_user_email"],
+    )
+
+
 # ── Sync endpoint ──────────────────────────────────────────────────────────────
 
 @router.post("/")
@@ -449,15 +512,18 @@ async def get_response(
         )
 
     try:
-        _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
-        _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        card, carry = _v3_gate(user_id, chat_message)
+        if card is None:
+            _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
+            _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
         _enforce_daily_quota(active_graph, user_id)
 
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "http", user_id)
+        _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry)
+        graph_kw = _graph_kwargs(chat_message, card, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
@@ -468,12 +534,10 @@ async def get_response(
             config=config,
             thread_id=chat_message.conversation_id,
             user_id=user_id,
-            context_node_ids=chat_message.context_node_ids,
             system_prompt=chat_message.system_prompt,
-            last_k_messages=chat_message.last_k_messages,
-            external_context_top_k=chat_message.external_context_top_k,
             regenerate_last_user=chat_message.regenerate_last_user,
             web_search=chat_message.web_search,
+            **graph_kw,
         )
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
@@ -508,15 +572,18 @@ async def stream_response(
         )
 
     try:
-        _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
-        _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        card, carry = _v3_gate(user_id, chat_message)
+        if card is None:
+            _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
+            _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
         _enforce_daily_quota(active_graph, user_id)
 
         access_error = validate_model_access(chat_message.model_name, user_id)
         if access_error:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "sse", user_id)
+        _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry)
+        graph_kw = _graph_kwargs(chat_message, card, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")
@@ -528,12 +595,10 @@ async def stream_response(
                 config=config,
                 thread_id=chat_message.conversation_id,
                 user_id=user_id,
-                context_node_ids=chat_message.context_node_ids,
                 system_prompt=chat_message.system_prompt,
-                last_k_messages=chat_message.last_k_messages,
-                external_context_top_k=chat_message.external_context_top_k,
                 regenerate_last_user=chat_message.regenerate_last_user,
                 web_search=chat_message.web_search,
+                **graph_kw,
             ),
             media_type="text/event-stream",
         )
