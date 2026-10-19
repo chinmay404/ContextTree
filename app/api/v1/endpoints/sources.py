@@ -25,6 +25,7 @@ router = APIRouter()
 
 from app.api.upload_limit import MAX_UPLOAD_BYTES  # noqa: E402  (4 * 1024 * 1024)
 MAX_DESC_CHARS = 2000
+MAX_FILE_NAME_CHARS = 255
 
 TYPE_BY_EXT = {
     "pdf": ("pdf", "processing"), "docx": ("doc", "processing"), "txt": ("doc", "processing"),
@@ -57,6 +58,9 @@ def format_size(n: int) -> str:
 
 
 def parse_youtube_id(url: str) -> Optional[str]:
+    # urlparse silently drops tab/CR/LF, which would let an id with a trailing newline through.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        return None
     try:
         u = urlparse(url)
     except ValueError:
@@ -132,6 +136,8 @@ async def api_upload_file(
     if ext not in TYPE_BY_EXT:
         raise ApiError(415, "unsupported_type", "unsupported file type")
     source_type, status = TYPE_BY_EXT[ext]
+    if len(name) > MAX_FILE_NAME_CHARS:  # keep the extension, trim the stem
+        name = name[:MAX_FILE_NAME_CHARS - len(ext) - 1] + "." + ext
     ctype = (file.content_type or MIME_BY_EXT[ext])[:100]
     card, created, email = await run_in_threadpool(
         _create_file_card, user_id, board_id, id, x, y, deskId, desc, name, ctype, raw, source_type, status)

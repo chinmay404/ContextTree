@@ -262,6 +262,9 @@ def test_fetch_youtube_oembed(monkeypatch):
 
 
 def test_parse_youtube_id_rejects_trailing_newline():
+    assert sources.parse_youtube_id("https://youtu.be/abcdefghijk\n") is None
+    assert sources.parse_youtube_id("https://www.youtube.com/watch?v=abcdefghijk%0A") is None
+    assert sources.parse_youtube_id("https://youtu.be/abcdefghijk") == "abcdefghijk"
     assert sources._YT_ID.fullmatch("abcdefghijk\n") is None
     assert sources._YT_ID.fullmatch("abcdefghijk") is not None
 
@@ -301,3 +304,33 @@ def test_declared_content_length_over_cap_413(api, rec):
     r = api.post(f"/boards/{b}/sources/file", content=b"x" * (4 * 1024 * 1024 + 70 * 1024),
                  headers={"Content-Type": "multipart/form-data; boundary=B"})
     assert r.status_code == 413 and r.json()["error"] == "too_large"
+
+
+def test_link_missing_or_foreign_board_404_before_network(api, db, monkeypatch, rec):
+    def boom(*a, **k): raise AssertionError("network")
+    monkeypatch.setattr(sources, "fetch_youtube_oembed", boom)
+    monkeypatch.setattr(sources, "host_is_public", boom)
+    other = f"other_{new_id('u')}@example.com"
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO users (email, name) VALUES (%s, 'O')", (other,))
+    try:
+        foreign = seed_board(db, other)
+        for b in ("nope_board", foreign):
+            for url in ("https://youtu.be/abcdefghijk", "https://example.com/x"):
+                r = api.post(f"/boards/{b}/sources/link", json={"id": new_id("c"), "url": url, "x": 0, "y": 0})
+                assert r.status_code == 404 and r.json()["error"] == "not_found"
+    finally:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM canvases WHERE user_email = %s", (other,))
+            cur.execute("DELETE FROM users WHERE email = %s", (other,))
+
+
+def test_upload_file_name_capped_at_255(api, db, rec):
+    b = make_board(api)["id"]
+    r = up(api, b, "n" * 400 + ".txt", b"hi", "text/plain")
+    assert r.status_code == 202
+    fn = r.json()["data"]["fileName"]
+    assert len(fn) <= 255 and fn.endswith(".txt")
+    with db.cursor() as cur:
+        cur.execute("SELECT file_name FROM external_files WHERE node_id = %s", (r.json()["id"],))
+        assert cur.fetchone()[0] == fn
