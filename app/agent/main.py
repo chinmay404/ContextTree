@@ -11,8 +11,10 @@ from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.store.board_store import store as board_store
-from app.agent.board_context import build_board_context, render_source_blocks, trim_chunks_to_budget
-from app.agent.reads import Reads
+from app.agent.board_context import (
+    build_board_context, has_meaningful_embedding, render_source_blocks, trim_chunks_to_budget,
+)
+from app.agent.reads import Reads, _top_k as _default_top_k
 from app.agent.utils.embeddings import get_embedding
 from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
@@ -108,8 +110,7 @@ def _is_duplicate_hydrated_user_message(last_msg, msg_id: str | None) -> bool:
     return bool(last_id and incoming_id and last_id == incoming_id)
 
 
-def _has_meaningful_embedding(embedding) -> bool:
-    return bool(embedding) and any(abs(float(x)) > 1e-8 for x in embedding)
+_has_meaningful_embedding = has_meaningful_embedding
 
 
 def _history_chars(messages) -> int:
@@ -217,6 +218,7 @@ class getGraphResponse():
         web_search: bool = False,
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
+        user_email: Optional[str] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -249,6 +251,7 @@ class getGraphResponse():
                 web_search=web_search,
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
+                user_email=user_email,
                 fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
             )
 
@@ -426,6 +429,7 @@ class getGraphResponse():
         web_search: bool = False,
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
+        user_email: Optional[str] = None,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -454,6 +458,7 @@ class getGraphResponse():
             web_search=web_search,
             board_reads=board_reads,
             budget_tokens=budget_tokens,
+            user_email=user_email,
             fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
         )
 
@@ -567,6 +572,7 @@ class getGraphResponse():
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
         fixed_chars: int = 0,
+        user_email: Optional[str] = None,
     ):
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
@@ -609,18 +615,19 @@ class getGraphResponse():
         board_ctx = None
         linked_answers: Optional[str] = None
         if board_reads is not None:
-            board_top_k = FILE_CONTEXT_LIMIT
+            board_top_k = _default_top_k({})  # same default as the read-set token meter
             if external_context_top_k is not None:
                 board_top_k = max(0, min(10, int(external_context_top_k)))
             try:
                 board_ctx = build_board_context(
-                    board_store, board_reads, board_store.resolve_user_email(user_id),
+                    board_store, board_reads, user_email or board_store.resolve_user_email(user_id),
                     query_embedding, board_top_k,
                 )
                 external_context_snippets.extend(board_ctx.notes)
                 linked_answers = board_ctx.linked_answers
             except Exception as e:
-                logger.error(f"Board context build failed: {e}")
+                logger.exception("Board context build failed for chat %s (thread %s)",
+                                 board_reads.chat_id, thread_id)
 
         if not _has_meaningful_embedding(query_embedding):
             joined = "\n\n".join(external_context_snippets) if external_context_snippets else None
@@ -696,6 +703,7 @@ class getGraphResponse():
         web_search: bool = False,
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
+        user_email: Optional[str] = None,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits = self._prepare_stream_input(
@@ -712,6 +720,7 @@ class getGraphResponse():
                 web_search=web_search,
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
+                user_email=user_email,
             )
 
             full_response = ""
