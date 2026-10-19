@@ -258,6 +258,7 @@ class AgentNodes:
                 "messages": messages_to_delete,
                 "summary": new_summary,
                 "summarized_up_to_position": new_watermark,
+                "count": 0,
             }
         except Exception as e:
             logger.error(f"Summarization node error: {e}")
