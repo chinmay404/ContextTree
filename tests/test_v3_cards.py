@@ -281,3 +281,21 @@ def test_source_with_parent_is_400(api):
     r = api.post(f"/boards/{b['id']}/cards", json={"id": new_id("c"), "kind": "source", "sourceType": "note",
                  "x": 0, "y": 0, "parentId": f"{b['id']}_q1", "data": {}})
     assert r.status_code == 400 and r.json()["error"] == "invalid"
+
+
+def test_patch_and_create_non_object_advanced_is_400(api):
+    b = make_board(api); bid = b["id"]
+    for bad in (None, "x", [1]):
+        r = api.patch(f"/boards/{bid}/cards/{bid}_q1", json={"data": {"advanced": bad}})
+        assert r.status_code == 400 and r.json()["error"] == "invalid"
+        r = api.post(f"/boards/{bid}/cards", json={"id": new_id("c"), "kind": "chat", "x": 0, "y": 0,
+                     "data": {"advanced": bad}})
+        assert r.status_code == 400 and r.json()["error"] == "invalid"
+
+
+def test_patch_advanced_over_stored_json_null_yields_object(api, db):
+    b = make_board(api); bid = b["id"]; q1 = f"{bid}_q1"
+    with db.cursor() as cur:
+        cur.execute("""UPDATE nodes SET data = jsonb_set(data, '{advanced}', 'null'::jsonb) WHERE id = %s""", (q1,))
+    r = api.patch(f"/boards/{bid}/cards/{q1}", json={"data": {"advanced": {"lastKMessages": 3}}})
+    assert r.status_code == 200 and r.json()["data"]["advanced"] == {"lastKMessages": 3}

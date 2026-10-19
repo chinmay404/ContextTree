@@ -68,9 +68,11 @@ def _validate_create(body: CardCreate) -> None:
 
 def _chat_data(data: dict) -> dict:
     data = _public_data(data)
+    if "advanced" in data and not isinstance(data["advanced"], dict):
+        raise ApiError(400, "invalid", "advanced must be an object")
     merged = default_chat_data(data.get("name", ""))
     for k, v in data.items():
-        if k == "advanced" and isinstance(v, dict):
+        if k == "advanced":
             merged["advanced"].update(v)  # one level deep over the defaults
         else:
             merged[k] = v
@@ -183,11 +185,13 @@ def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatc
         if body.data is None:
             raise ApiError(400, "invalid", "data cannot be null")
         patch = _public_data(body.data)
-        if card["kind"] == "chat" and isinstance(patch.get("advanced"), dict):
+        if card["kind"] == "chat" and "advanced" in patch and not isinstance(patch["advanced"], dict):
+            raise ApiError(400, "invalid", "advanced must be an object")
+        if card["kind"] == "chat" and "advanced" in patch:
             # advanced merges one level deep so a partial patch keeps the other keys
             sets.append(
                 "data = jsonb_set(coalesce(data, '{}'::jsonb) || (%s::jsonb - 'advanced'), "
-                "'{advanced}', coalesce(data->'advanced', '{}'::jsonb) || %s::jsonb)"
+                "'{advanced}', CASE WHEN jsonb_typeof(data->'advanced') = 'object' THEN data->'advanced' ELSE '{}'::jsonb END || %s::jsonb)"
             )
             args.append(json.dumps(patch))
             args.append(json.dumps(patch["advanced"]))
