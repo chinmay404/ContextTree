@@ -10,6 +10,9 @@ import json
 from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
+from app.agent.store.board_store import store as board_store
+from app.agent.board_context import build_board_context, render_source_blocks, trim_chunks_to_budget
+from app.agent.reads import Reads
 from app.agent.utils.embeddings import get_embedding
 from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
@@ -107,6 +110,10 @@ def _is_duplicate_hydrated_user_message(last_msg, msg_id: str | None) -> bool:
 
 def _has_meaningful_embedding(embedding) -> bool:
     return bool(embedding) and any(abs(float(x)) > 1e-8 for x in embedding)
+
+
+def _history_chars(messages) -> int:
+    return sum(len(_content_to_text(getattr(m, "content", ""))) for m in messages or [])
 
 
 def _build_memory_saver():
@@ -208,6 +215,8 @@ class getGraphResponse():
         external_context_top_k: Optional[int] = None,
         regenerate_last_user: bool = False,
         web_search: bool = False,
+        board_reads: Optional[Reads] = None,
+        budget_tokens: Optional[int] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -234,10 +243,13 @@ class getGraphResponse():
 
             existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
-            context_snippets, external_context_str, _web_hits = self._build_retrieved_context(
+            context_snippets, external_context_str, _web_hits, linked_answers = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
                 web_search=web_search,
+                board_reads=board_reads,
+                budget_tokens=budget_tokens,
+                fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -305,6 +317,7 @@ class getGraphResponse():
                         "memory_facts": existing_memory_facts,
                         "context": context_snippets,
                         "external_context": external_context_str,
+                        "linked_answers": linked_answers,
                         "context_node_ids": context_node_ids,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
@@ -411,16 +424,13 @@ class getGraphResponse():
         external_context_top_k=None,
         regenerate_last_user: bool = False,
         web_search: bool = False,
+        board_reads: Optional[Reads] = None,
+        budget_tokens: Optional[int] = None,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
         current_state = self.graph.get_state(config)
         initial_messages = []
-        context_snippets, external_context_str, web_hits = self._build_retrieved_context(
-            query, user_id, thread_id, context_node_ids=context_node_ids,
-            external_context_top_k=external_context_top_k,
-            web_search=web_search,
-        )
 
         summary_state = self.mongo_store.get_thread_summary_state(user_id, thread_id)
         existing_summary = summary_state["summary"]
@@ -436,6 +446,16 @@ class getGraphResponse():
 
         existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
         prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
+
+        # Built after hydration so the token budget can count the history.
+        context_snippets, external_context_str, web_hits, linked_answers = self._build_retrieved_context(
+            query, user_id, thread_id, context_node_ids=context_node_ids,
+            external_context_top_k=external_context_top_k,
+            web_search=web_search,
+            board_reads=board_reads,
+            budget_tokens=budget_tokens,
+            fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
+        )
 
         prompt = get_formated_prompt(query, user_id)
         timestamp = datetime.utcnow().isoformat()
@@ -492,6 +512,7 @@ class getGraphResponse():
             "memory_facts": existing_memory_facts,
             "context": context_snippets,
             "external_context": external_context_str,
+            "linked_answers": linked_answers,
             "context_node_ids": context_node_ids,
             "model": config.get("configurable", {}).get("model"),
             "temperature": config.get("configurable", {}).get("temperature"),
@@ -543,6 +564,9 @@ class getGraphResponse():
         context_node_ids: Optional[list] = None,
         external_context_top_k: Optional[int] = None,
         web_search: bool = False,
+        board_reads: Optional[Reads] = None,
+        budget_tokens: Optional[int] = None,
+        fixed_chars: int = 0,
     ):
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
@@ -579,9 +603,28 @@ class getGraphResponse():
                     ]
 
         query_embedding = get_embedding(query) or []
+
+        # V3: the server read set decides what is read (contextNodeIds is ignored).
+        # Notes and linked answers need no embedding, so they go in before the early return.
+        board_ctx = None
+        linked_answers: Optional[str] = None
+        if board_reads is not None:
+            board_top_k = FILE_CONTEXT_LIMIT
+            if external_context_top_k is not None:
+                board_top_k = max(0, min(10, int(external_context_top_k)))
+            try:
+                board_ctx = build_board_context(
+                    board_store, board_reads, board_store.resolve_user_email(user_id),
+                    query_embedding, board_top_k,
+                )
+                external_context_snippets.extend(board_ctx.notes)
+                linked_answers = board_ctx.linked_answers
+            except Exception as e:
+                logger.error(f"Board context build failed: {e}")
+
         if not _has_meaningful_embedding(query_embedding):
-            web_only = "\n\n".join(external_context_snippets) if external_context_snippets else None
-            return [], web_only, web_hits
+            joined = "\n\n".join(external_context_snippets) if external_context_snippets else None
+            return [], joined, web_hits, linked_answers
 
         try:
             thread_scope = self.mongo_store.get_thread_ancestry_scopes(thread_id)
@@ -604,32 +647,39 @@ class getGraphResponse():
         except Exception as e:
             logger.error(f"Similarity search failed: {e}")
 
-        try:
-            file_context_limit = FILE_CONTEXT_LIMIT
-            if external_context_top_k is not None:
-                file_context_limit = max(0, min(10, int(external_context_top_k)))
-            file_chunks = self.mongo_store.get_related_file_context(
-                node_id=thread_id,
-                query_embedding=query_embedding,
-                limit=file_context_limit,
-                context_node_ids=context_node_ids,
-            ) or []
-            for idx, c in enumerate(file_chunks):
-                meta = c.get("metadata")
-                try:
-                    meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
-                except Exception:
-                    meta = meta or {}
-                external_context_snippets.append(
-                    f"[file {idx + 1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] "
-                    f"{_clip_text(c.get('chunk_text', ''), MAX_FILE_SNIPPET_CHARS)}\n"
-                    f"meta: {_clip_text(meta, MAX_FILE_METADATA_CHARS)}"
-                )
-        except Exception as e:
-            logger.error(f"File context search failed: {e}")
+        if board_reads is not None:
+            if board_ctx is not None and board_ctx.chunks:
+                fixed = (fixed_chars + sum(len(x) for x in external_context_snippets)
+                         + sum(len(x) for x in context_snippets) + len(linked_answers or ""))
+                kept = trim_chunks_to_budget(board_ctx.chunks, fixed, budget_tokens)
+                external_context_snippets.extend(render_source_blocks(board_ctx, kept))
+        else:
+            try:
+                file_context_limit = FILE_CONTEXT_LIMIT
+                if external_context_top_k is not None:
+                    file_context_limit = max(0, min(10, int(external_context_top_k)))
+                file_chunks = self.mongo_store.get_related_file_context(
+                    node_id=thread_id,
+                    query_embedding=query_embedding,
+                    limit=file_context_limit,
+                    context_node_ids=context_node_ids,
+                ) or []
+                for idx, c in enumerate(file_chunks):
+                    meta = c.get("metadata")
+                    try:
+                        meta = json.loads(meta) if isinstance(meta, str) else (meta or {})
+                    except Exception:
+                        meta = meta or {}
+                    external_context_snippets.append(
+                        f"[file {idx + 1} | {c.get('file_name')} | type={c.get('file_type')} | chunk={c.get('chunk_index')}] "
+                        f"{_clip_text(c.get('chunk_text', ''), MAX_FILE_SNIPPET_CHARS)}\n"
+                        f"meta: {_clip_text(meta, MAX_FILE_METADATA_CHARS)}"
+                    )
+            except Exception as e:
+                logger.error(f"File context search failed: {e}")
 
         external_context_str = "\n\n".join(external_context_snippets) if external_context_snippets else None
-        return context_snippets, external_context_str, web_hits
+        return context_snippets, external_context_str, web_hits, linked_answers
 
     async def get_stream_response(
         self,
@@ -644,6 +694,8 @@ class getGraphResponse():
         external_context_top_k: Optional[int] = None,
         regenerate_last_user: bool = False,
         web_search: bool = False,
+        board_reads: Optional[Reads] = None,
+        budget_tokens: Optional[int] = None,
     ):
         try:
             graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits = self._prepare_stream_input(
@@ -658,6 +710,8 @@ class getGraphResponse():
                 external_context_top_k=external_context_top_k,
                 regenerate_last_user=regenerate_last_user,
                 web_search=web_search,
+                board_reads=board_reads,
+                budget_tokens=budget_tokens,
             )
 
             full_response = ""

@@ -146,6 +146,7 @@ def build_memory_context_block(
     memory_facts: dict[str, Any] | None,
     context: list[str] | None,
     external_context: str | None,
+    linked_answers: str | None = None,
 ) -> str:
     clean_summary = sanitize_summary_text(summary)
     parts = [
@@ -175,6 +176,9 @@ def build_memory_context_block(
                 "</EXTERNAL_CONTEXT>",
             ]
         )
+
+    if linked_answers:
+        parts.append(str(linked_answers).strip())
 
     return "\n".join(parts)
 

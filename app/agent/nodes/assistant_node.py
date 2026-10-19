@@ -115,6 +115,7 @@ class AgentNodes:
                 memory_facts=memory_facts,
                 context=context,
                 external_context=external_context,
+                linked_answers=state.get("linked_answers"),
             )
 
             messages = [
