@@ -372,6 +372,83 @@ def get_v3_llm(
     return llm
 
 
+PROVIDER_NAME = {
+    "anthropic": "Anthropic", "openai": "OpenAI", "google": "Google", "groq": "Groq",
+    "deepseek": "DeepSeek", "mistral": "Mistral", "moonshot": "Moonshot",
+}
+
+# The run-config entry (config["configurable"][TURN_KEY_CONFIG]) that carries a TurnKey.
+TURN_KEY_CONFIG = "v3_turn_key"
+
+
+def _redacted_turn_key(provider: str) -> "TurnKey":
+    return TurnKey(provider, "")
+
+
+class TurnKey:
+    """The user's key for one V3 turn.
+
+    It is looked up once per turn (`v3_require_key`, in the route) and reaches every LLM call of
+    that turn (answer, rolling summary, branch-start summary) through the run config, never
+    through graph state, which is checkpointed. It is deliberately not a str: LangGraph copies
+    str/int/float/bool `configurable` values into stored checkpoint metadata and trace metadata,
+    and skips other objects. It prints as `<TurnKey provider>`, and pickling it drops the secret.
+    """
+
+    __slots__ = ("provider", "_secret")
+
+    def __init__(self, provider: str, secret: str | None):
+        self.provider = provider
+        self._secret = secret or ""
+
+    def reveal(self) -> str:
+        return self._secret
+
+    def __repr__(self) -> str:
+        return f"<TurnKey {self.provider}>"
+
+    __str__ = __repr__
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __reduce__(self):
+        return (_redacted_turn_key, (self.provider,))
+
+
+def turn_key_from(config) -> TurnKey | None:
+    """The TurnKey a V3 run config carries, or None."""
+    configurable = (config or {}).get("configurable") or {}
+    found = configurable.get(TURN_KEY_CONFIG)
+    return found if isinstance(found, TurnKey) else None
+
+
+def key_rejected_frame(provider: str) -> dict:
+    """The SSE payload for a provider that refused the user's key (contract amendment 2026-10-20)."""
+    name = PROVIDER_NAME.get(provider, provider)
+    return {"error": f"{name} turned this key down.", "code": "key_rejected", "provider": provider}
+
+
+def invoke_on_user_key(runnable, prompt, provider: str):
+    """`runnable.invoke(prompt)` for a V3 LLM call; a refused key becomes KeyRejectedError.
+
+    Only an error raised by this call itself is read as "key refused". Web search, tools,
+    embeddings and store calls never pass through here, so their 401s stay ordinary errors.
+    """
+    refused = False
+    try:
+        return runnable.invoke(prompt)
+    except Exception as exc:
+        if not is_auth_error(exc):
+            raise
+        refused = True
+    if refused:  # raised outside the except block: no chain to the provider's error text
+        raise KeyRejectedError(provider)
+
+
 _AUTH_STATUS = (401, 403)
 _AUTH_EXC_NAMES = {"PermissionDenied", "Unauthenticated", "AuthenticationError", "PermissionDeniedError"}
 

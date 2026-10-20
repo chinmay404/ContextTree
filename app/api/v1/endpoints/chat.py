@@ -8,6 +8,7 @@ Identity comes from the verified service JWT (app/api/auth.py), never from
 the request body. Rate limit: 60 messages/minute per verified user id.
 """
 
+import json
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -19,6 +20,19 @@ from app.api.auth import get_current_user_id
 
 from app.agent.helpers.get_llm import get_llm, validate_model_access
 from app.agent.helpers.memory_model import get_summary_model_name
+from app.agent.helpers.v3_llm import (
+    TURN_KEY_CONFIG,
+    KeyRejectedError,
+    KeyStoreError,
+    MissingKeyError,
+    TurnKey,
+    UnsupportedModelError,
+    V3ConfigError,
+    get_v3_llm,
+    invoke_on_user_key,
+    key_rejected_frame,
+    v3_require_key,
+)
 from app.agent.main import getGraphResponse
 from app.agent.memory import extract_memory_facts, sanitize_summary_text
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
@@ -168,7 +182,8 @@ def _whole_carry_split(messages: list) -> tuple[list, list]:
 
 
 def _init_fork_if_needed(
-    chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary"
+    chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary",
+    turn_key: Optional[TurnKey] = None,
 ) -> None:
     """
     On the first message of a branched node, seed the new thread from the parent.
@@ -183,6 +198,10 @@ def _init_fork_if_needed(
 
     For summary this preserves the Context Tree guarantee: the branch starts with an
     accurate, scoped summary of the parent lineage — not a blank slate.
+
+    turn_key (V3 turns): the branch-start summary runs on the chat's own model with the
+    user's key. A refused key raises KeyRejectedError before anything is written, so the
+    branch stays uninitialised and the next message retries inheritance.
     """
     if carry not in ("summary", "whole", "fresh"):
         carry = "summary"
@@ -352,12 +371,16 @@ def _init_fork_if_needed(
             elif m["role"] in ("assistant", "ai"):
                 lc_messages.append(AIMessage(content=m["text"]))
 
-        summary_model = get_summary_model_name(chat_message.model_name)
-        llm = get_llm(summary_model, user_id=user_id)
+        if turn_key is not None:
+            summary_model = chat_message.model_name
+            llm = get_v3_llm(summary_model, None, user_key=turn_key.reveal())
+        else:
+            summary_model = get_summary_model_name(chat_message.model_name)
+            llm = get_llm(summary_model, user_id=user_id)
         if llm:
             try:
                 prompt = get_formated_summury_prompt(lc_messages, existing_summary)
-                summary_response = llm.with_config(
+                traced = llm.with_config(
                     build_langsmith_trace_config(
                         run_name="contexttree_fork_initial_summary",
                         conversation_id=chat_message.conversation_id,
@@ -370,11 +393,20 @@ def _init_fork_if_needed(
                         fork_at_message_id=chat_message.fork_at_message_id,
                         tags=["summary"],
                     )
-                ).invoke(prompt)
+                )
+                if turn_key is not None:
+                    summary_response = invoke_on_user_key(traced, prompt, turn_key.provider)
+                else:
+                    summary_response = traced.invoke(prompt)
                 new_summary = sanitize_summary_text(summary_response.content)
                 new_summary_embedding = get_embedding(new_summary) or []
+            except KeyRejectedError:
+                raise
             except Exception as e:
-                logger.error(f"Fork summarisation failed: {e}")
+                if turn_key is not None:  # provider errors can quote parts of the user's key
+                    logger.error("Fork summarisation failed (V3 turn): %s", type(e).__name__)
+                else:
+                    logger.error(f"Fork summarisation failed: {e}")
     logger.info(
         "Fork initialisation payload: new_thread=%s parent=%s mode=%s buffer_messages=%s summarized_messages=%s summary_chars=%s",
         chat_message.conversation_id,
@@ -498,6 +530,38 @@ def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], email: Option
     )
 
 
+# ── V3 key gate (BYOK: a V3 turn runs on the user's own key only) ─────────────
+
+def _v3_turn_key(chat_message: ChatMessage, email: str) -> TurnKey:
+    """The user's key for this V3 turn, looked up once; a coded error before anything streams.
+
+    Runs in the threadpool: it reads the key store. The answer's client is built here once too,
+    so a server-side problem (V3ConfigError) fails with a generic 500 before any row is written.
+    """
+    model = chat_message.model_name
+    failure: Optional[ApiError] = None
+    try:
+        route, key = v3_require_key(model, email)
+        get_v3_llm(model, email, temperature=chat_message.temperature,
+                   max_output_tokens=chat_message.max_output_tokens, user_key=key)
+    except UnsupportedModelError:
+        failure = ApiError(400, "unsupported_model", model)
+    except MissingKeyError as e:
+        failure = ApiError(400, "missing_key", e.provider)
+    except KeyStoreError as e:
+        failure = ApiError(503, "key_store_unavailable", e.provider)
+    except V3ConfigError:
+        logger.error("V3 model %s cannot run on a user key in this server environment", model)
+        failure = ApiError(500, "server_error", "This model can't run on this server right now.")
+    if failure is not None:  # raised outside the except block: no chain to the cause
+        raise failure
+    return TurnKey(route.provider, key)
+
+
+async def _key_rejected_stream(provider: str):
+    yield f"data: {json.dumps(key_rejected_frame(provider))}\n\n"
+
+
 # ── Sync endpoint ──────────────────────────────────────────────────────────────
 
 @router.post("/")
@@ -517,19 +581,25 @@ async def get_response(
 
     try:
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
+        turn_key: Optional[TurnKey] = None
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        else:
+            turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
         _enforce_daily_quota(active_graph, user_id)
 
-        access_error = validate_model_access(chat_message.model_name, user_id)
-        if access_error:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
+        if card is None:
+            access_error = validate_model_access(chat_message.model_name, user_id)
+            if access_error:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry)
+        _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
+        if turn_key is not None:
+            config["configurable"][TURN_KEY_CONFIG] = turn_key
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         res = active_graph.get_response(
@@ -541,6 +611,7 @@ async def get_response(
             system_prompt=chat_message.system_prompt,
             regenerate_last_user=chat_message.regenerate_last_user,
             web_search=chat_message.web_search,
+            byok_only=turn_key is not None,
             **graph_kw,
         )
         if not res:
@@ -551,6 +622,8 @@ async def get_response(
         )
         return {"message": res, "summary": summary or ""}
 
+    except KeyRejectedError as e:
+        raise ApiError(400, "key_rejected", e.provider)
     except HTTPException:
         raise
     except Exception as e:
@@ -577,19 +650,25 @@ async def stream_response(
 
     try:
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
+        turn_key: Optional[TurnKey] = None
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+        else:
+            turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
         _enforce_daily_quota(active_graph, user_id)
 
-        access_error = validate_model_access(chat_message.model_name, user_id)
-        if access_error:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
+        if card is None:
+            access_error = validate_model_access(chat_message.model_name, user_id)
+            if access_error:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry)
+        _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
+        if turn_key is not None:
+            config["configurable"][TURN_KEY_CONFIG] = turn_key
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
         return StreamingResponse(
@@ -602,10 +681,15 @@ async def stream_response(
                 system_prompt=chat_message.system_prompt,
                 regenerate_last_user=chat_message.regenerate_last_user,
                 web_search=chat_message.web_search,
+                byok_only=turn_key is not None,
                 **graph_kw,
             ),
             media_type="text/event-stream",
         )
+    except KeyRejectedError as e:
+        # The branch-start summary was refused: same SSE frame as a refusal mid-answer.
+        logger.warning("V3 turn on %s: %s refused the user's key", chat_message.conversation_id, e.provider)
+        return StreamingResponse(_key_rejected_stream(e.provider), media_type="text/event-stream")
     except HTTPException:
         raise
     except Exception as e:

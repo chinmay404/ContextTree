@@ -28,4 +28,8 @@ class State(TypedDict):
     max_output_tokens: Optional[int]
     last_k_messages: Optional[int]
     system_prompt: Optional[str]
+    # V3 board turn: every LLM call runs on the user's own key (the key itself travels in the
+    # run config as a TurnKey, never in state). False / None on V2 turns.
+    byok_only: Optional[bool]
+    user_email: Optional[str]
     messages: Annotated[List[AnyMessage], add_messages]

@@ -171,18 +171,22 @@ def llm_inputs(monkeypatch):
     from app.core.config import settings
     monkeypatch.setattr(settings, "ENGINE_FAKE_LLM", True)
     seen = []
-    real = assistant_node.get_llm
 
-    def spy(*a, **k):
-        llm = real(*a, **k)
-        orig = llm._prime
+    def spying(real):
+        def spy(*a, **k):
+            llm = real(*a, **k)
+            orig = llm._prime
 
-        def prime(messages):
-            seen.append(list(messages))
-            return orig(messages)
-        object.__setattr__(llm, "_prime", prime)
-        return llm
-    monkeypatch.setattr(assistant_node, "get_llm", spy)
+            def prime(messages):
+                seen.append(list(messages))
+                return orig(messages)
+            object.__setattr__(llm, "_prime", prime)
+            return llm
+        return spy
+
+    # V3 turns build their model with get_v3_llm (the user's key); V2 turns with get_llm.
+    monkeypatch.setattr(assistant_node, "get_llm", spying(assistant_node.get_llm))
+    monkeypatch.setattr(assistant_node, "get_v3_llm", spying(assistant_node.get_v3_llm))
     return seen
 
 
@@ -404,7 +408,7 @@ def fake_mode(monkeypatch):
 
 def _turn(api, node, **extra):
     r = api.post("/chat/stream", json={"message": "What does it say? Tell me.", "message_id": new_id("m"),
-                                       "nodeId": node, "model": "z-ai/glm-5.2", **extra})
+                                       "nodeId": node, "model": "openai/gpt-5-mini", **extra})
     assert r.status_code == 200, r.text
     return _frames(r.text)
 

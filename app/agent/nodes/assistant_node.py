@@ -1,9 +1,19 @@
+from typing import Optional
+
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 
 from app.agent.state import State
 from app.agent.helpers.load_prompt import load_prompt_from_yaml
 from app.agent.helpers.get_llm import get_llm
 from app.agent.helpers.memory_model import get_summary_model_name
+from app.agent.helpers.v3_llm import (
+    KeyRejectedError,
+    get_v3_llm,
+    invoke_on_user_key,
+    turn_key_from,
+    v3_route,
+)
 from app.agent.citations import strip_markers
 from app.agent.memory import (
     build_memory_context_block,
@@ -66,6 +76,22 @@ def _without_markers(msg):
     return msg
 
 
+def _drop_unanswered_questions(history: list) -> list:
+    """V3: a question followed by another question went unanswered (its turn failed, e.g. the
+    provider refused the key). The board drops that bubble and re-asks the text under a new
+    message id, so the model should see it once, not twice."""
+    return [
+        m for i, m in enumerate(history)
+        if not (isinstance(m, HumanMessage) and i + 1 < len(history)
+                and isinstance(history[i + 1], HumanMessage))
+    ]
+
+
+def _user_key(config) -> Optional[str]:
+    turn_key = turn_key_from(config)
+    return turn_key.reveal() if turn_key is not None else None
+
+
 class AgentNodes:
     def __init__(self, mongo_store=None):
         self.mongo_store = mongo_store
@@ -82,7 +108,8 @@ class AgentNodes:
 
         return None
 
-    def assistant(self, state: State) -> State:
+    def assistant(self, state: State, config: Optional[RunnableConfig] = None) -> State:
+        byok_only = bool(state.get("byok_only"))
         try:
             current_count = state.get("count", 0)
             thread_id = state.get("thread_id", None)
@@ -102,6 +129,8 @@ class AgentNodes:
                     history = history[-last_k:] if last_k > 0 else []
                 except (TypeError, ValueError):
                     pass
+            if byok_only:
+                history = _drop_unanswered_questions(history)
             user_id = self._resolve_state_user_id(state)
 
             template = load_prompt_from_yaml("SYSTEM_PROMPT")
@@ -151,16 +180,26 @@ class AgentNodes:
                 )
             messages += prompt_history
 
-            llm = get_llm(
-                model,
-                user_id=user_id,
-                temperature=temperature,
-                max_output_tokens=max_output_tokens,
-            )
+            if byok_only:
+                # V3: the user's own key for the chat's model, resolved once for this turn.
+                llm = get_v3_llm(
+                    model,
+                    state.get("user_email"),
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                    user_key=_user_key(config),
+                )
+            else:
+                llm = get_llm(
+                    model,
+                    user_id=user_id,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                )
             if llm is None:
                 raise RuntimeError("LLM initialization failed for model: " + str(model))
 
-            ai_response: AIMessage = llm.with_config(
+            traced = llm.with_config(
                 build_langsmith_trace_config(
                     run_name="contexttree_assistant_llm",
                     conversation_id=thread_id,
@@ -169,7 +208,11 @@ class AgentNodes:
                     node_name="assistant",
                     tags=["chat-model"],
                 )
-            ).invoke(input=messages)
+            )
+            if byok_only:
+                ai_response: AIMessage = invoke_on_user_key(traced, messages, v3_route(model).provider)
+            else:
+                ai_response = traced.invoke(input=messages)
             normalized_content = sanitize_chat_response_text(_message_content_to_text(ai_response.content))
             if normalized_content != ai_response.content:
                 ai_response = AIMessage(
@@ -196,8 +239,13 @@ class AgentNodes:
                 "last_k_messages": last_k_messages,
                 "system_prompt": custom_system_prompt,
             }
+        except KeyRejectedError:
+            raise  # the stream turns it into a key_rejected frame; nothing is stored
         except Exception as e:
-            logger.error("Assistant node error: %s", e)
+            if byok_only:  # provider errors can quote parts of the user's key
+                logger.error("Assistant node error (V3 turn): %s", type(e).__name__)
+            else:
+                logger.error("Assistant node error: %s", e)
             return {"messages": state.get("messages", [])}
 
     def summury_decision(self, state: State) -> bool:
@@ -210,13 +258,19 @@ class AgentNodes:
             logger.error("Error in summary decision: %s", e)
             return False
 
-    def summurize(self, state: State):
+    def summurize(self, state: State, config: Optional[RunnableConfig] = None):
+        byok_only = bool(state.get("byok_only"))
         try:
             from app.core.config import settings
             prompt = get_formated_summury_prompt(state["messages"], state["summary"])
-            model = get_summary_model_name(state.get("model"))
             user_id = self._resolve_state_user_id(state)
-            llm = get_llm(model, user_id=user_id)
+            if byok_only:
+                # V3: the chat's own model on the user's key; SUMMARY_MODEL_NAME is a server key.
+                model = state.get("model")
+                llm = get_v3_llm(model, state.get("user_email"), user_key=_user_key(config))
+            else:
+                model = get_summary_model_name(state.get("model"))
+                llm = get_llm(model, user_id=user_id)
             if not llm:
                 logger.error("Summarization skipped: LLM init failed")
                 return {"messages": [], "summary": state.get("summary")}
@@ -280,7 +334,12 @@ class AgentNodes:
                 "count": 0,
             }
         except Exception as e:
-            logger.error(f"Summarization node error: {e}")
+            # A failed rolling summary (a refused key included) keeps the old summary: the answer
+            # was already streamed and is stored; the next turn's answer reports a refused key.
+            if byok_only:
+                logger.error("Summarization node error (V3 turn): %s", type(e).__name__)
+            else:
+                logger.error(f"Summarization node error: {e}")
             return {"messages": [], "summary": state.get("summary")}
 
     def get_nodes(self) -> dict:

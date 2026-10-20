@@ -20,6 +20,7 @@ from app.agent.utils.embeddings import get_embedding
 from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
 from app.agent.helpers.web_fetch import extract_urls, fetch_pages, format_page_snippets
+from app.agent.helpers.v3_llm import KeyRejectedError, key_rejected_frame
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -229,6 +230,7 @@ class getGraphResponse():
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
+        byok_only: bool = False,
     ):
         try:
             # Check for existing state in LangGraph
@@ -340,6 +342,8 @@ class getGraphResponse():
                         "max_output_tokens": config.get("configurable", {}).get("max_output_tokens"),
                         "last_k_messages": config.get("configurable", {}).get("last_k_messages"),
                         "system_prompt": system_prompt,
+                        "byok_only": byok_only,
+                        "user_email": user_email,
                     },
                     config
                 )
@@ -364,6 +368,8 @@ class getGraphResponse():
 
             except HTTPException as http_exc:
                 raise http_exc
+            except KeyRejectedError:
+                raise  # V3: the route answers key_rejected; nothing is stored
             except Exception as e:
                 logger.error(f"getGraphResponse Graph invoke : {e}")
                 return False
@@ -426,6 +432,8 @@ class getGraphResponse():
                     return False
 
             return final_message
+        except KeyRejectedError:
+            raise
         except Exception as e:
             logger.error(f"get_graph_res : {e}")
             return False
@@ -446,6 +454,7 @@ class getGraphResponse():
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
+        byok_only: bool = False,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -545,6 +554,9 @@ class getGraphResponse():
             "max_output_tokens": config.get("configurable", {}).get("max_output_tokens"),
             "last_k_messages": config.get("configurable", {}).get("last_k_messages"),
             "system_prompt": system_prompt,
+            # Always set, so a V3 flag never carries over from a checkpoint.
+            "byok_only": byok_only,
+            "user_email": user_email,
         }
 
         return graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits, passages
@@ -739,6 +751,7 @@ class getGraphResponse():
         board_reads: Optional[Reads] = None,
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
+        byok_only: bool = False,
     ):
         try:
             (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
@@ -757,6 +770,7 @@ class getGraphResponse():
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
                 user_email=user_email,
+                byok_only=byok_only,
             )
 
             full_response = ""
@@ -801,6 +815,8 @@ class getGraphResponse():
                         full_response += "</think>"
                         yield f"data: {json.dumps({'message': '</think>'})}\n\n"
                     streamed = True
+                except KeyRejectedError:
+                    raise  # not a streaming failure: the sync fallback would ask the provider again
                 except (NotImplementedError, Exception) as e:
                     logger.warning(f"Async streaming failed, using sync fallback: {e}")
                     streamed = False
@@ -874,6 +890,11 @@ class getGraphResponse():
             yield f"data: {json.dumps(done_data)}\n\n"
             yield "data: [DONE]\n\n"
 
+        except KeyRejectedError as e:
+            # V3: the provider refused the user's key. One coded frame, no [DONE], nothing stored
+            # (neither the question nor an answer): the board re-asks once a key is saved.
+            logger.warning("V3 turn on thread %s: %s refused the user's key", thread_id, e.provider)
+            yield f"data: {json.dumps(key_rejected_frame(e.provider))}\n\n"
         except Exception as e:
             logger.error(f"get_stream_response : {repr(e)}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"

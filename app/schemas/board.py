@@ -11,7 +11,7 @@ STATUSES = ("processing", "ready", "failed", "soon")
 CARRY = ("summary", "whole", "fresh")
 MAX_CARDS_PER_BOARD = 50
 MAX_POSITIONS = 200
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = "openai/gpt-5-mini"  # = MODELS.gpt in components/board/lib/catalog.ts
 
 DEFAULT_ADVANCED = {
     "temperature": None,

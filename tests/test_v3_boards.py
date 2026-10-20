@@ -31,7 +31,7 @@ def test_create_board_returns_board_with_one_chat(api):
     assert q1["sourceType"] is None and q1["status"] is None and q1["parentId"] is None
     d = q1["data"]
     assert d["name"] == "Pricing" and d["carry"] == "summary" and d["inheritDesk"] is True
-    assert d["model"] == "openai/gpt-oss-120b"
+    assert d["model"] == "openai/gpt-5-mini"  # = MODELS.gpt; a board made with no key names a model the board knows
     assert d["hide"] == [] and d["advanced"]["externalContextTopK"] == 5 and d["advanced"]["lastKMessages"] == 6
     assert q1["messageCount"] == 0 and q1["lastMessage"] is None
 
