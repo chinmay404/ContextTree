@@ -57,6 +57,18 @@ def create_application() -> FastAPI:
         application.include_router(api_router, prefix="")
 
     @application.on_event("startup")
+    async def fail_interrupted_sources():
+        # Best effort: a DB that is down at boot must not stop the app from starting.
+        try:
+            from app.agent.store.board_store import fail_stale_sources, store
+            with store.tx() as cur:
+                n = fail_stale_sources(cur)
+            if n:
+                logger.warning("Marked %s interrupted source(s) as failed", n)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not sweep interrupted sources: %s", e)
+
+    @application.on_event("startup")
     async def log_startup_context():
         deploy = get_deploy_info()
         logger.info(

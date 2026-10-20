@@ -6,6 +6,7 @@ Tenancy key is user_email. A missing, deleted or foreign row is a 404 (never 403
 """
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
@@ -32,6 +33,14 @@ CARD_SELECT = (
 
 # Keys the engine keeps inside nodes.data that must never reach the client.
 _INTERNAL_DATA_KEYS = ("memoryFacts",)
+
+
+def dumps_json(value) -> str:
+    """json.dumps for jsonb writes: NaN/Infinity are not valid JSON (Postgres would 500)."""
+    try:
+        return json.dumps(value, allow_nan=False)
+    except ValueError:
+        raise ApiError(400, "invalid", "data must not contain NaN or Infinity")
 
 
 def _iso(value) -> Optional[str]:
@@ -233,3 +242,23 @@ def live_card_count(cur, board_id: str) -> int:
 
 def touch_board(cur, board_id: str) -> None:
     cur.execute("UPDATE canvases SET updated_at = now() WHERE id = %s", (board_id,))
+
+
+# ── Interrupted sources ───────────────────────────────────────────────────────
+# Ingest runs in-process (BackgroundTasks); a restart or crash leaves the card
+# 'processing' forever. Anything stuck for 10+ minutes is reported as failed.
+STALE_SOURCE_ERROR = "Interrupted — please add it again"
+
+
+def fail_stale_sources(cur, board_id: Optional[str] = None) -> int:
+    """Mark sources stuck in 'processing' for over 10 minutes as failed. Returns the count."""
+    cur.execute(
+        "UPDATE nodes SET status = 'failed', "
+        "data = coalesce(data, '{}'::jsonb) || jsonb_build_object('error', %s::text), "
+        "updated_at = now() "
+        "WHERE kind = 'source' AND status = 'processing' AND deleted_at IS NULL "
+        "AND updated_at < now() - interval '10 minutes' "
+        "AND (%s::text IS NULL OR canvas_id = %s)",
+        (STALE_SOURCE_ERROR, board_id, board_id),
+    )
+    return cur.rowcount

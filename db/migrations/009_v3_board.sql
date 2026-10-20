@@ -3,6 +3,10 @@
 -- Nothing is renamed, dropped, retyped or made NOT NULL. Re-running is a no-op
 -- (IF NOT EXISTS everywhere; the backfills only touch kind IS NULL rows).
 
+-- Fail fast instead of queueing behind (and blocking) live V2 traffic on the nodes table.
+-- migrate.py runs each file in one transaction, so SET LOCAL covers every statement below.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS kind text;            -- 'chat' | 'source'
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS source_type text;     -- note|pdf|doc|web|video|audio|csv|image|pile
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS x double precision;

@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.agent.store.board_store import (
+    fail_stale_sources,
     get_board_json,
     require_board,
     store,
@@ -91,6 +92,7 @@ def api_get_board(
     email = store.email_for(user_id)
     with store.tx() as cur:
         require_board(cur, board_id, email)
+        fail_stale_sources(cur, board_id)
         return get_board_json(cur, board_id)
 
 

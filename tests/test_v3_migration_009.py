@@ -156,3 +156,20 @@ def test_v2_shaped_writes_still_work_after_009(db, user):
         assert cur.fetchone()[0] is None
         cur.execute("SELECT kind FROM nodes WHERE canvas_id = %s", (board,))
         assert cur.fetchone()[0] is None
+
+
+def test_009_sets_local_lock_timeout_inside_its_transaction():
+    import psycopg2
+    from tests.v3_support import TEST_DB
+    conn = psycopg2.connect(TEST_DB)  # autocommit off: same shape as migrate.py's per-file transaction
+    try:
+        with conn.cursor() as cur:
+            cur.execute(SQL)
+            cur.execute("SHOW lock_timeout")
+            assert cur.fetchone()[0] == "5s"
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("SHOW lock_timeout")
+            assert cur.fetchone()[0] == "0"  # SET LOCAL does not leak past the transaction
+    finally:
+        conn.close()

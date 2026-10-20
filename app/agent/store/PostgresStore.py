@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
@@ -26,6 +27,7 @@ from pgvector.psycopg2 import register_vector
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import DictCursor, execute_values
 
+from app.api.errors import ApiError
 from app.core.logger import logger
 
 load_dotenv()
@@ -33,13 +35,19 @@ load_dotenv()
 # ── Module-level connection pool ───────────────────────────────────────────────
 _pool: Optional[pg_pool.ThreadedConnectionPool] = None
 
+POOL_MAXCONN = 4
+POOL_WAIT_SECONDS = 10.0
+# ThreadedConnectionPool raises PoolError the moment all connections are out; the gate
+# makes callers queue (up to POOL_WAIT_SECONDS) instead, then fail with a clean 503.
+_pool_gate = threading.BoundedSemaphore(POOL_MAXCONN)
+
 
 def _get_pool(db_url: str) -> pg_pool.ThreadedConnectionPool:
     global _pool
     if _pool is None:
         # Supabase session pooler allows only 15 clients TOTAL; deploys run
         # two instances during overlap. Keep the idle footprint tiny.
-        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=4, dsn=db_url)
+        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=POOL_MAXCONN, dsn=db_url)
         logger.info("PostgreSQL connection pool created (min=1, max=4)")
     return _pool
 
@@ -93,17 +101,22 @@ class PostgresConversationStore:
         Borrow a connection from the pool.
         Commits on clean exit, rolls back + re-raises on exception.
         """
-        p = _get_pool(self.db_url)
-        conn = p.getconn()
+        if not _pool_gate.acquire(timeout=POOL_WAIT_SECONDS):
+            raise ApiError(503, "unavailable", "the database is busy, try again shortly")
         try:
-            register_vector(conn)
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            p = _get_pool(self.db_url)
+            conn = p.getconn()
+            try:
+                register_vector(conn)
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                p.putconn(conn)
         finally:
-            p.putconn(conn)
+            _pool_gate.release()
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
