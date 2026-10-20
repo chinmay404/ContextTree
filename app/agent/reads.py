@@ -9,7 +9,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from math import ceil
 
-from app.agent.store.board_store import require_board, require_card
+from app.agent.store.board_store import (
+    CARD_LINK_JOINS, LIVE_DESK_ID, LIVE_PILE_ID, require_board, require_card)
 from app.api.errors import ApiError
 
 FILE_BACKED = frozenset({"pdf", "doc", "csv", "web", "video", "audio"})
@@ -174,13 +175,14 @@ def compute_reads(g: BoardGraph, chat_id: str) -> Reads:
 
 
 def load_board_graph(cur, user_email: str, board_id: str) -> BoardGraph:
-    """Four queries: live cards, live strings, assistant-message lengths, chunk chars."""
+    """Four queries: live cards (desk/pile links to deleted cards read as NULL, like CARD_SELECT), live strings, assistant-message lengths, chunk chars."""
     g = BoardGraph()
     cur.execute(
-        "SELECT id, kind, source_type, desk_id, pile_id, parent_node_id, status, data, created_at, "
-        "COALESCE(length(summary), 0) AS summary_len FROM nodes "
-        "WHERE canvas_id = %s AND user_email = %s AND kind IS NOT NULL AND deleted_at IS NULL "
-        "ORDER BY created_at, id",
+        f"SELECT n.id, n.kind, n.source_type, {LIVE_DESK_ID} AS desk_id, {LIVE_PILE_ID} AS pile_id, "
+        "n.parent_node_id, n.status, n.data, n.created_at, "
+        f"COALESCE(length(n.summary), 0) AS summary_len FROM nodes n {CARD_LINK_JOINS} "
+        "WHERE n.canvas_id = %s AND n.user_email = %s AND n.kind IS NOT NULL AND n.deleted_at IS NULL "
+        "ORDER BY n.created_at, n.id",
         (board_id, user_email),
     )
     for r in cur.fetchall():

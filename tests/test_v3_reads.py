@@ -209,3 +209,44 @@ def test_broken_lineage_terminates():
     g = prototype_graph()
     _reparent(g, "second", "gone")  # missing/deleted parent
     assert [i.card_id for i in compute_reads(g, "second").items] == ["web", "iv1", "iv2", "iv3", "iv4"]
+
+
+# ── links to deleted piles / chats read as loose ─────────────────────────────
+
+def _read_ids(api, b, chat):
+    r = api.get(f"/boards/{b}/cards/{chat}/reads")
+    assert r.status_code == 200, r.text
+    return [i["cardId"] for i in r.json()["items"]]
+
+
+@requires_db
+def test_former_pile_member_on_desk_is_read(api, db, user):
+    b = make_board(api)["id"]
+    x = seed_card(db, user, b, kind="chat")
+    pile = seed_card(db, user, b, kind="source", source_type="pile", status="ready")
+    m = seed_card(db, user, b, kind="source", source_type="note", status="ready", pile_id=pile)
+    assert api.delete(f"/boards/{b}/cards/{pile}").status_code == 200
+    r = api.patch(f"/boards/{b}/cards/{m}", json={"deskId": x})
+    assert r.status_code == 200, r.text
+    assert _read_ids(api, b, x) == [m]
+    # restoring the pile puts the member back in it (the stored link was kept), so it is
+    # a pile member again and no longer a loose desk source
+    assert api.post(f"/boards/{b}/cards/{pile}/restore").status_code == 200
+    cards = {c["id"]: c for c in api.get(f"/boards/{b}").json()["cards"]}
+    assert cards[m]["pileId"] == pile
+    assert _read_ids(api, b, x) == []
+
+
+@requires_db
+def test_source_on_deleted_desk_not_read_via_that_desk(api, db, user):
+    b = make_board(api)["id"]
+    x = seed_card(db, user, b, kind="chat")
+    y = seed_card(db, user, b, kind="chat", parent_id=x)
+    s = seed_card(db, user, b, kind="source", source_type="note", status="ready", desk_id=y)
+    assert s in _read_ids(api, b, y)
+    assert api.delete(f"/boards/{b}/cards/{y}").status_code == 200
+    z = seed_card(db, user, b, kind="chat")
+    assert s not in _read_ids(api, b, z) and s not in _read_ids(api, b, x)
+    # restore puts it back on the desk
+    assert api.post(f"/boards/{b}/cards/{y}/restore").status_code == 200
+    assert s in _read_ids(api, b, y)

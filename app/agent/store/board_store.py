@@ -20,15 +20,18 @@ LAST_MESSAGE_LIMIT = 280
 
 # Card columns plus desk/pile ids masked to NULL while the target card is deleted
 # (the stored column keeps the id so a restore puts the link back).
+# Shared with reads.load_board_graph so "linked to a deleted card" has one definition.
+LIVE_DESK_ID = "CASE WHEN d.deleted_at IS NULL THEN n.desk_id END"
+LIVE_PILE_ID = "CASE WHEN p.deleted_at IS NULL THEN n.pile_id END"
+CARD_LINK_JOINS = "LEFT JOIN nodes d ON d.id = n.desk_id LEFT JOIN nodes p ON p.id = n.pile_id"
+
 CARD_SELECT = (
     "SELECT n.id, n.canvas_id, n.user_email, n.kind, n.source_type, n.x, n.y, "
     "n.parent_node_id, n.forked_from_message_id, n.status, n.data, "
     "n.created_at, n.updated_at, n.deleted_at, n.desk_id, n.pile_id, "
-    "CASE WHEN d.deleted_at IS NULL THEN n.desk_id END AS \"deskId\", "
-    "CASE WHEN p.deleted_at IS NULL THEN n.pile_id END AS \"pileId\" "
-    "FROM nodes n "
-    "LEFT JOIN nodes d ON d.id = n.desk_id "
-    "LEFT JOIN nodes p ON p.id = n.pile_id"
+    f"{LIVE_DESK_ID} AS \"deskId\", "
+    f"{LIVE_PILE_ID} AS \"pileId\" "
+    f"FROM nodes n {CARD_LINK_JOINS}"
 )
 
 # Keys the engine keeps inside nodes.data that must never reach the client.
