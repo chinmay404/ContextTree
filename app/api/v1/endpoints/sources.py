@@ -221,3 +221,46 @@ def api_raw_file(card_id: str, request: Request, user_id: str = Depends(get_curr
             "Content-Security-Policy": "sandbox",
         },
     )
+
+
+PASSAGE_SOURCE_TYPES = ("pdf", "doc", "web", "csv")
+
+
+@router.get("/files/{card_id}/passages")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_passages(card_id: str, request: Request, user_id: str = Depends(get_current_user_id)):
+    """A source's chunks in document order, for the side panel.
+
+    A source that is still processing or failed returns 200 with whatever chunks exist (usually
+    none), so the panel can render an empty state instead of an error. A missing, deleted or
+    foreign card is 404; a card that has no passages by kind (note, chat, video, ...) is 400.
+    """
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        cur.execute(
+            "SELECT n.kind, n.source_type FROM nodes n "
+            "JOIN canvases c ON c.id = n.canvas_id AND c.deleted_at IS NULL "
+            "WHERE n.id = %s AND n.user_email = %s AND n.kind IS NOT NULL AND n.deleted_at IS NULL",
+            (card_id, email),
+        )
+        node = cur.fetchone()
+        if node is None:
+            raise ApiError(404, "not_found")
+        if node["kind"] != "source" or node["source_type"] not in PASSAGE_SOURCE_TYPES:
+            raise ApiError(400, "invalid", "this card has no passages")
+        cur.execute(
+            "SELECT fc.metadata->>'loc' AS loc, fc.metadata->>'page' AS page, fc.chunk_text "
+            "FROM file_chunks fc JOIN external_files ef ON fc.file_id = ef.id "
+            "WHERE ef.node_id = %s AND ef.user_email = %s "
+            "ORDER BY ef.created_at, fc.chunk_index",
+            (card_id, email),
+        )
+        rows = cur.fetchall()
+    passages = []
+    for r in rows:
+        try:
+            page = int(r["page"]) + 1  # metadata page is 0-based; the API's is 1-based
+        except (TypeError, ValueError):
+            page = None
+        passages.append({"loc": r["loc"], "page": page, "text": r["chunk_text"]})
+    return {"passages": passages}

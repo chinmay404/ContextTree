@@ -334,3 +334,107 @@ def test_upload_file_name_capped_at_255(api, db, rec):
     with db.cursor() as cur:
         cur.execute("SELECT file_name FROM external_files WHERE node_id = %s", (r.json()["id"],))
         assert cur.fetchone()[0] == fn
+
+
+def _seed_chunks(db, api, b, cid, chunks, *, with_data=False):
+    """An external_files row plus chunks [(text, metadata)] inserted in the given chunk_index order."""
+    import json
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO external_files (id, user_email, node_id, canvas_id, file_name, file_type, "
+            "mime_type, data, processed) VALUES (%s,%s,%s,%s,'f','x','x',%s,true)",
+            (f"file_{cid}", api.email, cid, b, b"x" if with_data else None))
+        for idx, (text, meta) in chunks:
+            cur.execute(
+                "INSERT INTO file_chunks (file_id, chunk_index, chunk_text, metadata) "
+                "VALUES (%s,%s,%s,%s::jsonb)", (f"file_{cid}", idx, text, json.dumps(meta)))
+
+
+def test_passages_pdf_in_document_order_with_one_based_pages(api, db):
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="pdf", status="ready")
+    # inserted out of order on purpose: the route must order by chunk_index
+    _seed_chunks(db, api, b, cid, [
+        (2, ("third", {"loc": "p. 2", "page": 1})),
+        (0, ("first", {"loc": "p. 1", "page": 0})),
+        (1, ("second", {"loc": "p. 1", "page": 0})),
+    ], with_data=True)
+    r = api.get(f"/files/{cid}/passages")
+    assert r.status_code == 200
+    assert r.json() == {"passages": [
+        {"loc": "p. 1", "page": 1, "text": "first"},
+        {"loc": "p. 1", "page": 1, "text": "second"},
+        {"loc": "p. 2", "page": 2, "text": "third"},
+    ]}
+
+
+def test_passages_web_and_csv_have_null_page(api, db):
+    b = make_board(api)["id"]
+    web = seed_card(db, api.email, b, kind="source", source_type="web", status="ready")
+    _seed_chunks(db, api, b, web, [(0, ("w0", {"loc": "§ 1"})), (1, ("w1", {"loc": "§ 2"}))])
+    assert api.get(f"/files/{web}/passages").json() == {"passages": [
+        {"loc": "§ 1", "page": None, "text": "w0"}, {"loc": "§ 2", "page": None, "text": "w1"}]}
+    csv = seed_card(db, api.email, b, kind="source", source_type="csv", status="ready")
+    _seed_chunks(db, api, b, csv, [(0, ("a,b\n1,2", {"loc": "rows 1–1", "row_end": 1})), (1, ("x", {}))])
+    assert api.get(f"/files/{csv}/passages").json() == {"passages": [
+        {"loc": "rows 1–1", "page": None, "text": "a,b\n1,2"}, {"loc": None, "page": None, "text": "x"}]}
+
+
+def test_passages_doc_ok(api, db):
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="doc", status="ready")
+    _seed_chunks(db, api, b, cid, [(0, ("d", {"loc": "§ 1"}))])
+    assert api.get(f"/files/{cid}/passages").json()["passages"][0]["text"] == "d"
+
+
+def test_passages_processing_or_failed_returns_empty_200(api, db):
+    b = make_board(api)["id"]
+    for status in ("processing", "failed"):
+        cid = seed_card(db, api.email, b, kind="source", source_type="pdf", status=status)
+        r = api.get(f"/files/{cid}/passages")
+        assert r.status_code == 200 and r.json() == {"passages": []}
+
+
+@pytest.mark.parametrize("kind,stype", [("chat", None), ("note", None), ("source", "video"),
+                                        ("source", "image"), ("source", "audio")])
+def test_passages_other_kinds_400_invalid(api, db, kind, stype):
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind=kind, source_type=stype, status="ready")
+    r = api.get(f"/files/{cid}/passages")
+    assert r.status_code == 400 and r.json()["error"] == "invalid" and r.json()["detail"]
+
+
+def test_passages_other_users_card_404(api, db):
+    from tests.v3_support import Api
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="web", status="ready")
+    _seed_chunks(db, api, b, cid, [(0, ("secret", {"loc": "§ 1"}))])
+    other = f"{new_id('o')}@example.com"
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO users (email, name) VALUES (%s, 'o')", (other,))
+    try:
+        r = Api(api.client, other).get(f"/files/{cid}/passages")
+        assert r.status_code == 404 and "secret" not in r.text
+    finally:
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM users WHERE email = %s", (other,))
+
+
+def test_passages_deleted_card_and_deleted_board_and_unknown_404(api, db):
+    b = make_board(api)["id"]
+    cid = seed_card(db, api.email, b, kind="source", source_type="web", status="ready")
+    _seed_chunks(db, api, b, cid, [(0, ("t", {"loc": "§ 1"}))])
+    assert api.get(f"/files/{cid}/passages").status_code == 200
+    assert api.delete(f"/boards/{b}/cards/{cid}").status_code == 200
+    assert api.get(f"/files/{cid}/passages").status_code == 404
+    cid2 = seed_card(db, api.email, b, kind="source", source_type="web", status="ready")
+    with db.cursor() as cur:
+        cur.execute("UPDATE canvases SET deleted_at = now() WHERE id = %s", (b,))
+    assert api.get(f"/files/{cid2}/passages").status_code == 404
+    assert api.get(f"/files/{new_id('c')}/passages").status_code == 404
+
+
+def test_passages_route_is_rate_limited_like_raw():
+    from app.api.limiter import limiter
+    for fn in (sources.api_raw_file, sources.api_passages):
+        assert f"{fn.__module__}.{fn.__name__}" in limiter._route_limits
