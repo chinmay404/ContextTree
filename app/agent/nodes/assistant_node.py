@@ -122,6 +122,9 @@ class AgentNodes:
                 SystemMessage(content=system_content),
                 SystemMessage(content=memory_context),
             ]
+            citation_note = str(state.get("citation_note") or "").strip()
+            if citation_note:  # V3 turn that numbered passages
+                messages.append(SystemMessage(content=citation_note))
             if custom_system_prompt:
                 messages.append(
                     SystemMessage(

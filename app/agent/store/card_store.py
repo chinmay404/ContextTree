@@ -246,22 +246,27 @@ def save_positions(cur, user_email: str, board_id: str, positions: list[Position
 
 
 
+def _message_out(r) -> dict:
+    role = "user" if r["role"] == "user" else "assistant"
+    out = {
+        "id": r["id"],
+        "role": role,
+        "content": r["content"] or "",
+        "position": r["position"],
+        "createdAt": r["created_at"].isoformat() if r["created_at"] is not None else None,
+    }
+    if role == "assistant":  # every assistant message carries the list; rows from before 010 give []
+        out["citations"] = r["citations"] if isinstance(r["citations"], list) else []
+    return out
+
+
 def list_messages(cur, chat_id: str, user_email: str) -> list[dict]:
     cur.execute(
-        'SELECT id, role, content, position, "timestamp" AS created_at FROM messages '
+        'SELECT id, role, content, position, "timestamp" AS created_at, citations FROM messages '
         "WHERE node_id = %s AND user_email = %s AND inherited = false ORDER BY position, id",
         (chat_id, user_email),
     )
-    return [
-        {
-            "id": r["id"],
-            "role": "user" if r["role"] == "user" else "assistant",
-            "content": r["content"] or "",
-            "position": r["position"],
-            "createdAt": r["created_at"].isoformat() if r["created_at"] is not None else None,
-        }
-        for r in cur.fetchall()
-    ]
+    return [_message_out(r) for r in cur.fetchall()]
 
 
 def delete_card(cur, user_email: str, board_id: str, card_id: str) -> list[str]:

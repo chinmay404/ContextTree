@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from math import ceil
 
+from app.agent.citations import QUOTE_MAX_CHARS, strip_markers
 from app.agent.reads import (
     ANSWER_MAX_CHARS, ANSWER_SUMMARY_MAX_CHARS, FILE_BACKED, FILE_SNIPPET_CHARS,
     NOTE_MAX_CHARS, Reads,
@@ -52,6 +53,7 @@ class ScoredChunk:
     loc: str | None
     text: str
     score: float
+    page: int | None = None  # 1-based (chunk metadata stores it 0-based)
 
 
 @dataclass
@@ -60,6 +62,33 @@ class BoardContext:
     chunks: list[ScoredChunk] = field(default_factory=list)
     headers: dict[str, str] = field(default_factory=dict)
     linked_answers: str | None = None
+    # The same notes / linked answers as parts, for numbering: (card_id, header, body, quote)
+    # and (card_id, head lines, body, quote). `notes` / `linked_answers` stay unnumbered.
+    note_parts: list[tuple[str, str, str, str]] = field(default_factory=list)
+    answer_parts: list[tuple[str, list[str], str, str]] = field(default_factory=list)
+
+
+@dataclass
+class NumberedContext:
+    notes: list[str]
+    sources: list[str]
+    linked_answers: str | None
+    passages: dict[int, dict]  # n -> Citation {n, cardId, loc, page, quote}
+
+
+def _sent_and_quote(text, limit: int) -> tuple[str, str]:
+    """The clipped text the prompt gets, and its quote: the same text without the clip ellipsis."""
+    raw = str(text or "").strip()
+    sent = clip_text(raw, limit)
+    body = sent[:-1] if len(raw) > limit else sent
+    return sent, body[:QUOTE_MAX_CHARS]
+
+
+def _page(value) -> int | None:
+    try:
+        return int(value) + 1
+    except (TypeError, ValueError):
+        return None
 
 
 def has_meaningful_embedding(embedding) -> bool:
@@ -77,7 +106,7 @@ def search_board_chunks(cur, user_email: str, card_ids: list[str], query_embeddi
         return []
     pairs = [(c, loc) for c, locs in (off or {}).items() for loc in locs]
     cur.execute(
-        "SELECT ef.node_id, fc.metadata->>'loc' AS loc, fc.chunk_text, "
+        "SELECT ef.node_id, fc.metadata->>'loc' AS loc, fc.metadata->>'page' AS page, fc.chunk_text, "
         "(fc.embedding <=> %s::vector) AS distance "
         "FROM file_chunks fc JOIN external_files ef ON fc.file_id = ef.id "
         "WHERE ef.node_id = ANY(%s) AND ef.user_email = %s AND fc.embedding IS NOT NULL "
@@ -87,7 +116,8 @@ def search_board_chunks(cur, user_email: str, card_ids: list[str], query_embeddi
         (_vec(query_embedding), list(card_ids), user_email,
          [c for c, _ in pairs], [loc for _, loc in pairs], limit),
     )
-    return [ScoredChunk(r["node_id"], r["loc"], _safe(r["chunk_text"]), 1.0 - float(r["distance"]))
+    return [ScoredChunk(r["node_id"], r["loc"], _safe(r["chunk_text"]), 1.0 - float(r["distance"]),
+                        _page(r["page"]))
             for r in cur.fetchall()]
 
 
@@ -103,6 +133,12 @@ def _linked_answers(entries: list[str]) -> str | None:
     if not entries:
         return None
     return "<LINKED_ANSWERS>\n" + "\n\n".join(entries) + "\n</LINKED_ANSWERS>"
+
+
+def _add_note(ctx: BoardContext, cid: str, header: str, text, limit: int) -> None:
+    body, quote = _sent_and_quote(_safe(text), limit)
+    ctx.note_parts.append((cid, header, body, quote))
+    ctx.notes.append(header + "\n" + body)
 
 
 def build_board_context(store, reads: Reads, user_email: str, query_embedding: list[float] | None,
@@ -147,18 +183,19 @@ def build_board_context(store, reads: Reads, user_email: str, query_embedding: l
                 parts = [f"[answer | {_label(data.get('name')) or 'Chat'}]"]
                 if (row["summary"] or "").strip():
                     parts.append("Summary: " + clip_text(_safe(row["summary"]), ANSWER_SUMMARY_MAX_CHARS))
-                parts.append(clip_text(_safe(latest[cid]), ANSWER_MAX_CHARS))
-                entries.append("\n".join(parts))
+                body, quote = _sent_and_quote(strip_markers(_safe(latest[cid])), ANSWER_MAX_CHARS)
+                ctx.answer_parts.append((cid, list(parts), body, quote))
+                entries.append("\n".join(parts + [body]))
                 continue
             t = row["source_type"]
             header = source_header(row)
             if t == "note":
                 ctx.headers[cid] = header
-                ctx.notes.append(header + "\n" + clip_text(_safe(data.get("text")), NOTE_MAX_CHARS))
+                _add_note(ctx, cid, header, data.get("text"), NOTE_MAX_CHARS)
             elif t == "image":
                 if data.get("summary"):
                     ctx.headers[cid] = header
-                    ctx.notes.append(header + "\n" + clip_text(_safe(data["summary"]), IMAGE_SUMMARY_CHARS))
+                    _add_note(ctx, cid, header, data["summary"], IMAGE_SUMMARY_CHARS)
             elif t in FILE_BACKED:
                 ctx.headers[cid] = header
                 file_ids.append(cid)
@@ -172,6 +209,40 @@ def build_board_context(store, reads: Reads, user_email: str, query_embedding: l
 
 def _rendered(c: ScoredChunk) -> str:
     return f"({c.loc}) {c.text}" if c.loc is not None else c.text
+
+
+def number_passages(ctx: BoardContext, chunks: list[ScoredChunk]) -> NumberedContext:
+    """Render the blocks a V3 turn sends, each passage prefixed ``[n]`` in prompt order.
+
+    Prompt order is EXTERNAL_CONTEXT (notes, then file chunks grouped by card) and then
+    LINKED_ANSWERS. Call it with the chunks that survived the budget: only what is sent
+    gets a number.
+    """
+    passages: dict[int, dict] = {}
+
+    def add(card_id: str, loc, page, quote: str) -> int:
+        n = len(passages) + 1
+        passages[n] = {"n": n, "cardId": card_id, "loc": loc, "page": page, "quote": quote}
+        return n
+
+    notes = [f"{header}\n[{add(cid, None, None, quote)}] {body}"
+             for cid, header, body, quote in ctx.note_parts]
+
+    by_card: dict[str, list[ScoredChunk]] = {}
+    for c in chunks:
+        by_card.setdefault(c.card_id, []).append(c)  # dicts keep first-seen card order
+    sources = []
+    for cid, group in by_card.items():
+        lines = []
+        for c in group:
+            sent, quote = _sent_and_quote(c.text, FILE_SNIPPET_CHARS)
+            prefix = f"({c.loc}) " if c.loc is not None else ""
+            lines.append(f"[{add(cid, c.loc, c.page, quote)}] {prefix}{sent}")
+        sources.append((ctx.headers.get(cid) or f"[source | {cid}]") + "\n" + "\n".join(lines))
+
+    entries = ["\n".join(head + [f"[{add(cid, None, None, quote)}] {body}"])
+               for cid, head, body, quote in ctx.answer_parts]
+    return NumberedContext(notes, sources, _linked_answers(entries), passages)
 
 
 def render_source_blocks(ctx: BoardContext, chunks: list[ScoredChunk]) -> list[str]:

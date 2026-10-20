@@ -12,8 +12,9 @@ from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.store.board_store import store as board_store
 from app.agent.board_context import (
-    build_board_context, has_meaningful_embedding, render_source_blocks, trim_chunks_to_budget,
+    build_board_context, has_meaningful_embedding, number_passages, trim_chunks_to_budget,
 )
+from app.agent.citations import CITE_INSTRUCTION, extract_citations
 from app.agent.reads import Reads, _top_k as _default_top_k
 from app.agent.utils.embeddings import get_embedding
 from app.agent.utils.text import clip_text
@@ -254,6 +255,7 @@ class getGraphResponse():
 
             existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
+            passages: Optional[dict] = {} if board_reads is not None else None
             context_snippets, external_context_str, _web_hits, linked_answers = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
@@ -262,6 +264,7 @@ class getGraphResponse():
                 budget_tokens=budget_tokens,
                 user_email=user_email,
                 fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
+                passages=passages,
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -330,6 +333,7 @@ class getGraphResponse():
                         "context": context_snippets,
                         "external_context": external_context_str,
                         "linked_answers": linked_answers,
+                        "citation_note": CITE_INSTRUCTION if passages else None,
                         "context_node_ids": context_node_ids,
                         "model": config.get("configurable", {}).get("model"),
                         "temperature": config.get("configurable", {}).get("temperature"),
@@ -402,17 +406,20 @@ class getGraphResponse():
                         )
 
                     if should_save_assistant:
+                        answer_text = str(final_message) if not isinstance(final_message, str) else final_message
                         self.mongo_store.add_message(
                             user_id=user_id,
                             thread_id=thread_id,
                             role="assistant",
                             message_id=f"{msg_id}_ai",
-                            text=str(final_message) if not isinstance(final_message, str) else final_message,
+                            text=answer_text,
                             embedding=get_embedding(str(final_message)) or [],
                             summary=updated_summary,
                             summarize_fn="None",
                             embed_summary_fn=get_embedding,
-                            context_fn=[]
+                            context_fn=[],
+                            citations=(extract_citations(answer_text, passages)
+                                       if passages is not None else None),
                         )
                 except Exception as e:
                     logger.error(f"getGraphResponse Convo save : {e}")
@@ -461,6 +468,8 @@ class getGraphResponse():
         prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
 
         # Built after hydration so the token budget can count the history.
+        # V3 turns collect the numbered passages they send (n -> Citation); V2 turns pass None.
+        passages: Optional[dict] = {} if board_reads is not None else None
         context_snippets, external_context_str, web_hits, linked_answers = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
@@ -469,6 +478,7 @@ class getGraphResponse():
             budget_tokens=budget_tokens,
             user_email=user_email,
             fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
+            passages=passages,
         )
 
         prompt = get_formated_prompt(query, user_id)
@@ -527,6 +537,8 @@ class getGraphResponse():
             "context": context_snippets,
             "external_context": external_context_str,
             "linked_answers": linked_answers,
+            # Always set, so a checkpointed value from an earlier turn never carries over.
+            "citation_note": CITE_INSTRUCTION if passages else None,
             "context_node_ids": context_node_ids,
             "model": config.get("configurable", {}).get("model"),
             "temperature": config.get("configurable", {}).get("temperature"),
@@ -535,7 +547,7 @@ class getGraphResponse():
             "system_prompt": system_prompt,
         }
 
-        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits
+        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits, passages
 
     def _hydrate_recent_messages(
         self,
@@ -582,7 +594,9 @@ class getGraphResponse():
         budget_tokens: Optional[int] = None,
         fixed_chars: int = 0,
         user_email: Optional[str] = None,
+        passages: Optional[dict] = None,
     ):
+        """`passages` (V3 only) is filled with n -> Citation for every numbered passage sent."""
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
         web_hits: list[dict] = []
@@ -632,13 +646,22 @@ class getGraphResponse():
                     board_store, board_reads, user_email or board_store.resolve_user_email(user_id),
                     query_embedding, board_top_k,
                 )
-                external_context_snippets.extend(board_ctx.notes)
-                linked_answers = board_ctx.linked_answers
             except Exception as e:
                 logger.exception("Board context build failed for chat %s (thread %s)",
                                  board_reads.chat_id, thread_id)
 
+        def add_board_blocks(kept) -> Optional[str]:
+            """Numbered notes and kept chunks join EXTERNAL_CONTEXT; returns the LINKED_ANSWERS block.
+            Numbers run in prompt order over what is actually sent (citations plan E2)."""
+            numbered = number_passages(board_ctx, kept)
+            external_context_snippets.extend(numbered.notes + numbered.sources)
+            if passages is not None:
+                passages.update(numbered.passages)
+            return numbered.linked_answers
+
         if not _has_meaningful_embedding(query_embedding):
+            if board_ctx is not None:
+                linked_answers = add_board_blocks([])
             joined = "\n\n".join(external_context_snippets) if external_context_snippets else None
             return [], joined, web_hits, linked_answers
 
@@ -664,11 +687,14 @@ class getGraphResponse():
             logger.error(f"Similarity search failed: {e}")
 
         if board_reads is not None:
-            if board_ctx is not None and board_ctx.chunks:
-                fixed = (fixed_chars + sum(len(x) for x in external_context_snippets)
-                         + sum(len(x) for x in context_snippets) + len(linked_answers or ""))
-                kept = trim_chunks_to_budget(board_ctx.chunks, fixed, budget_tokens)
-                external_context_snippets.extend(render_source_blocks(board_ctx, kept))
+            if board_ctx is not None:
+                kept = []
+                if board_ctx.chunks:
+                    fixed = (fixed_chars + sum(len(x) for x in external_context_snippets)
+                             + sum(len(x) for x in board_ctx.notes)
+                             + sum(len(x) for x in context_snippets) + len(board_ctx.linked_answers or ""))
+                    kept = trim_chunks_to_budget(board_ctx.chunks, fixed, budget_tokens)
+                linked_answers = add_board_blocks(kept)
         else:
             try:
                 file_context_limit = FILE_CONTEXT_LIMIT
@@ -715,7 +741,8 @@ class getGraphResponse():
         user_email: Optional[str] = None,
     ):
         try:
-            graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits = self._prepare_stream_input(
+            (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
+             passages) = self._prepare_stream_input(
                 query,
                 config,
                 user_id,
@@ -795,6 +822,14 @@ class getGraphResponse():
                 logger.error("Agent produced no output in stream")
                 return
 
+            # V3: the passages the finished answer cited, right after the last delta. Always sent
+            # for V3 ([] when none). A stream that errors or produces nothing never gets here, so
+            # it sends no citations frame (the client sees the error frame instead).
+            citations = None
+            if passages is not None:
+                citations = extract_citations(full_response, passages)
+                yield f"data: {json.dumps({'citations': citations})}\n\n"
+
             # Persistence decision matrix (mirrors the sync get_response):
             #   regenerate_last_user → user msg already in DB from fork-init;
             #                          save only the AI response.
@@ -828,7 +863,8 @@ class getGraphResponse():
                             text=full_response,
                             embedding=get_embedding(full_response) or [],
                             summary=updated_summary, summarize_fn="None",
-                            embed_summary_fn=get_embedding, context_fn=[]
+                            embed_summary_fn=get_embedding, context_fn=[],
+                            citations=citations,
                         )
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")

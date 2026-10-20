@@ -271,7 +271,7 @@ def get_gemini_llm(
       - "gemini-3-flash-preview"         (bare)
       - None → falls back to DEFAULT_GEMINI_MODEL or Gemini 3 Flash Preview
     """
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GOOGLE_API_KEY")  # env var name only, no value in code
     if not api_key:
         logger.error("GOOGLE_API_KEY not set — cannot initialise Gemini LLM")
         return None
@@ -304,7 +304,7 @@ def get_openai_llm(
     max_output_tokens: int | None = None,
 ):
     resolved = _normalize_openai_model_name(model_name)
-    api_key = _resolve_provider_key("openai", "OPENAI_API_KEY", user_id)
+    api_key = _resolve_provider_key("openai", "OPENAI_API_KEY", user_id)  # env var name only, no value in code
     if not api_key:
         logger.error("No OpenAI credentials available for %s", resolved)
         return None
@@ -344,7 +344,7 @@ def get_groq_llm(
     if name in _GROQ_SENTINEL:
         name = _GROQ_DEFAULT
 
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY")  # env var name only, no value in code
     if not api_key:
         logger.error("GROQ_API_KEY not set — cannot initialise Groq LLM")
         return None
@@ -373,7 +373,7 @@ def get_anthropic_llm(
     max_output_tokens: int | None = None,
 ):
     resolved = _normalize_anthropic_model_name(model_name)
-    api_key = _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id)
+    api_key = _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id)  # env var name only, no value in code
     if not api_key:
         logger.error("No Anthropic credentials available for %s", resolved)
         return None
@@ -406,7 +406,7 @@ def get_nvidia_llm(
     """Returns a ChatOpenAI instance pointed at NVIDIA's OpenAI-compatible API."""
     model_name = _normalize_nvidia_model_name(model_name)
 
-    api_key = os.getenv("NVIDIA_API_KEY")
+    api_key = os.getenv("NVIDIA_API_KEY")  # env var name only, no value in code
     if not api_key:
         logger.error("NVIDIA_API_KEY not set — cannot initialise NVIDIA LLM")
         return None
@@ -450,7 +450,7 @@ def get_litellm_llm(
     resolved = _normalize_litellm_model_name(model_name)
     credentials = get_user_provider_credentials(user_id, "litellm") or {}
     metadata = credentials.get("metadata") or {}
-    api_key = os.getenv("LITELLM_API_KEY") or credentials.get("api_key")
+    api_key = os.getenv("LITELLM_API_KEY") or credentials.get("api_key")  # env var name only, no value in code
     api_base = os.getenv("LITELLM_API_BASE") or metadata.get("apiBase")
 
     if not api_key and not api_base:
@@ -543,11 +543,25 @@ def _build_fake_llm():
                 return str(c)
         return ""
 
+    def _passages_sent(messages) -> bool:
+        from app.agent.citations import CITE_INSTRUCTION
+        return any(getattr(m, "type", "") == "system" and CITE_INSTRUCTION in str(m.content)
+                   for m in messages or [])
+
+    def _cite_first_sentence(text: str) -> str:
+        import re
+        m = re.search(r"[.!?](?=\s|$)", text)
+        at = m.end() if m else len(text)
+        return text[:at] + "[1]" + text[at:]
+
     class _FakeChat(GenericFakeChatModel):
-        """Answers 'Fake answer to: <first 60 chars of question>'; streams per word."""
+        """Answers 'Fake answer to: <first 60 chars of question>'; streams per word.
+        When the turn numbered passages (V3), cites [1] after the first sentence."""
 
         def _prime(self, messages) -> None:
             reply = "Fake answer to: " + _question(messages)[:60]
+            if _passages_sent(messages):
+                reply = _cite_first_sentence(reply)
             self.messages = iter([AIMessage(content=reply)])
 
         def _generate(self, messages, *args: Any, **kwargs: Any):

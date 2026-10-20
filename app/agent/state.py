@@ -10,6 +10,8 @@ class State(TypedDict):
     external_context: Optional[str]
     # V3: the <LINKED_ANSWERS> block (already wrapped); None for V2 turns.
     linked_answers: Optional[str]
+    # V3: the cite-with-[n] instruction when the turn numbered passages; None otherwise.
+    citation_note: Optional[str]
     # IDs of external-context nodes currently attached to this chat node.
     # None  → backend falls back to persisted edges (legacy behavior)
     # []    → external context explicitly disabled for this turn

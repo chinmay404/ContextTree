@@ -194,6 +194,7 @@ class PostgresConversationStore:
         summarize_fn=None,
         embed_summary_fn=None,
         context_fn=None,
+        citations: Optional[list] = None,
     ):
         now = datetime.utcnow()
         with self._get_conn() as conn:
@@ -231,15 +232,28 @@ class PostgresConversationStore:
             # Canonical id: converge with the frontend's copy of the same
             # message so the PK dedupes instead of storing twin rows.
             msg_id = canonical_message_id(message_id, role)
-            cur.execute(
-                """
-                INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
-                SELECT %s, %s, %s, %s, %s, %s, %s,
-                       GREATEST(COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0), 0) + 1
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (msg_id, thread_id, role, text, emb, now, user_email, thread_id),
-            )
+            if citations is None:  # V2 turns and user messages: the column is not touched
+                cur.execute(
+                    """
+                    INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position)
+                    SELECT %s, %s, %s, %s, %s, %s, %s,
+                           GREATEST(COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0), 0) + 1
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (msg_id, thread_id, role, text, emb, now, user_email, thread_id),
+                )
+            else:  # V3 assistant message: the citations the answer used (migration 010)
+                cur.execute(
+                    """
+                    INSERT INTO messages (id, node_id, role, content, embedding, timestamp, user_email, position,
+                                          citations)
+                    SELECT %s, %s, %s, %s, %s, %s, %s,
+                           GREATEST(COALESCE((SELECT MAX(position) FROM messages WHERE node_id = %s), 0), 0) + 1,
+                           %s::jsonb
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    (msg_id, thread_id, role, text, emb, now, user_email, thread_id, json.dumps(citations)),
+                )
 
     def get_thread_messages(self, user_id: str, thread_id: str) -> List[dict]:
         try:
