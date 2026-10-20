@@ -11,6 +11,7 @@ the request body. Rate limit: 60 messages/minute per verified user id.
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -515,7 +516,7 @@ async def get_response(
         )
 
     try:
-        card, v3_email, carry = _v3_gate(user_id, chat_message)
+        card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
@@ -526,7 +527,7 @@ async def get_response(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry)
-        graph_kw = _graph_kwargs(chat_message, card, v3_email, carry)
+        graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
@@ -575,7 +576,7 @@ async def stream_response(
         )
 
     try:
-        card, v3_email, carry = _v3_gate(user_id, chat_message)
+        card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         if card is None:
             _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
@@ -586,7 +587,7 @@ async def stream_response(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry)
-        graph_kw = _graph_kwargs(chat_message, card, v3_email, carry)
+        graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
         logger.info(f"Stream request: node={chat_message.conversation_id} model={chat_message.model_name}")

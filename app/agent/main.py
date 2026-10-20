@@ -117,6 +117,15 @@ def _history_chars(messages) -> int:
     return sum(len(_content_to_text(getattr(m, "content", ""))) for m in messages or [])
 
 
+def _budget_history(current_state, initial_messages) -> list:
+    """Messages that will reach the model: the hydrated buffer, or (when hydration was
+    skipped) whatever the checkpointer already holds for the thread."""
+    if initial_messages:
+        return initial_messages
+    values = getattr(current_state, "values", None) or {}
+    return list(values.get("messages") or [])
+
+
 def _build_memory_saver():
     """Best-effort in-memory fallback for local/dev when PostgresSaver is unavailable."""
     try:
@@ -252,7 +261,7 @@ class getGraphResponse():
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
                 user_email=user_email,
-                fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
+                fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -459,7 +468,7 @@ class getGraphResponse():
             board_reads=board_reads,
             budget_tokens=budget_tokens,
             user_email=user_email,
-            fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(initial_messages),
+            fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
         )
 
         prompt = get_formated_prompt(query, user_id)

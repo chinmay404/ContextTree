@@ -127,7 +127,7 @@ def set_card_status(store: BoardStore, card_id: str, status: str, data_patch: Op
         cur.execute(
             "UPDATE nodes SET status=%s, data = coalesce(data,'{}') || %s::jsonb, updated_at=now() "
             "WHERE id=%s AND user_email=%s AND status='processing' AND deleted_at IS NULL",
-            (status, json.dumps(data_patch or {}), card_id, user_email),
+            (status, json.dumps(data_patch or {}, allow_nan=False), card_id, user_email),
         )
 
 
@@ -170,11 +170,25 @@ def _write_chunks(file_id: str, user_email: str, chunks, embs, metas) -> bool:
     return True
 
 
+def _truncation_meta(card_id: str, user_email: str, patch: dict) -> str:
+    """The card's meta line plus a note that only the first MAX_EMBED_CHUNKS parts were read."""
+    base = patch.get("meta")
+    if base is None:
+        with store.tx() as cur:
+            cur.execute("SELECT data->>'meta' AS meta FROM nodes WHERE id = %s AND user_email = %s",
+                        (card_id, user_email))
+            row = cur.fetchone()
+        base = (row or {}).get("meta") or ""
+    note = f"first {MAX_EMBED_CHUNKS} parts read"
+    return f"{base} · {note}" if base else note
+
+
 def _embed_and_finish(card_id, file_id, user_email, chunks, metas, overview_text, patch) -> None:
     """Shared tail: embed -> overview -> key passages -> write chunks -> ready."""
     if len(chunks) > MAX_EMBED_CHUNKS:
         logger.warning(f"ingest {card_id}: truncating {len(chunks)} chunks to {MAX_EMBED_CHUNKS}")
         chunks, metas = chunks[:MAX_EMBED_CHUNKS], metas[:MAX_EMBED_CHUNKS]
+        patch = {**patch, "meta": _truncation_meta(card_id, user_email, patch)}
     embs = get_embeddings(chunks)
     if len(embs) != len(chunks) or _all_zero(embs):
         _fail(card_id, user_email, "Failed to generate embeddings")
@@ -269,7 +283,7 @@ def ingest_web_source(card_id: str, user_email: str) -> None:
                 "mime_type, content, data, processed) "
                 "VALUES (%s,%s,%s,%s,%s,'text/html','text/html',%s,NULL,false) "
                 "ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, processed = false, "
-                "updated_at = NOW()",
+                "updated_at = NOW() WHERE external_files.user_email = EXCLUDED.user_email",
                 (file_id, user_email, card_id, row["canvas_id"],
                  _clip_text(page.get("title") or row["url"], 200), text),
             )
