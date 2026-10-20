@@ -234,6 +234,8 @@ def _resolve_provider_key(
 
 
 def validate_model_access(model_name: str | None, user_id: str | None = None) -> str | None:
+    if settings.ENGINE_FAKE_LLM:
+        return None
     if _is_litellm(model_name):
         credentials = get_user_provider_credentials(user_id, "litellm")
         env_key = os.getenv("LITELLM_API_KEY")

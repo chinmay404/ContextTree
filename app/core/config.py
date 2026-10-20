@@ -1,8 +1,12 @@
+import logging
 import os
+from urllib.parse import urlparse
 from typing import Any, List, Optional
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class Settings(BaseSettings):
@@ -97,10 +101,22 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _fake_llm_local_only(self):
-        if self.ENGINE_FAKE_LLM and (
-            os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID")
-        ):
+        if not self.ENGINE_FAKE_LLM:
+            return self
+        # Broad refusal: presence (even empty) of any RAILWAY_* variable.
+        if any(k.upper().startswith("RAILWAY_") for k in os.environ):
             raise RuntimeError("ENGINE_FAKE_LLM is for local runs only")
+        # Positive local opt-in: a configured DB must be on this machine.
+        if self.DATABASE_URL:
+            host = (urlparse(self.DATABASE_URL).hostname or "").lower()
+            if host not in _LOCAL_HOSTS:
+                raise RuntimeError(
+                    "ENGINE_FAKE_LLM is for local runs only (DATABASE_URL host is not local)"
+                )
+        logging.getLogger(__name__).warning(
+            "*** ENGINE_FAKE_LLM is ON: fake LLM answers and fake embeddings. "
+            "Local runs only; never use with real data. ***"
+        )
         return self
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
