@@ -4,6 +4,7 @@ from app.agent.state import State
 from app.agent.helpers.load_prompt import load_prompt_from_yaml
 from app.agent.helpers.get_llm import get_llm
 from app.agent.helpers.memory_model import get_summary_model_name
+from app.agent.citations import strip_markers
 from app.agent.memory import (
     build_memory_context_block,
     sanitize_chat_response_text,
@@ -58,6 +59,13 @@ def _message_content_to_text(content) -> str:
     return str(content)
 
 
+def _without_markers(msg):
+    """A copy of a past assistant message with its citation markers removed; others as they are."""
+    if isinstance(msg, AIMessage) and isinstance(msg.content, str):
+        return msg.model_copy(update={"content": strip_markers(msg.content)})
+    return msg
+
+
 class AgentNodes:
     def __init__(self, mongo_store=None):
         self.mongo_store = mongo_store
@@ -110,10 +118,18 @@ class AgentNodes:
                 current_time=current_time,
                 user_query=user_query or "",
             )
+            # V3 turn that numbered passages: old [n] markers in past answer text would collide with
+            # this turn's numbers, so the model sees copies without them (state is left as is).
+            citation_note = str(state.get("citation_note") or "").strip()
+            prompt_summary, prompt_context, prompt_history = summary, context, history
+            if citation_note:
+                prompt_summary = strip_markers(summary or "")
+                prompt_context = [strip_markers(str(c)) for c in context or []]
+                prompt_history = [_without_markers(m) for m in history]
             memory_context = build_memory_context_block(
-                summary=sanitize_summary_text(summary),
+                summary=sanitize_summary_text(prompt_summary),
                 memory_facts=memory_facts,
-                context=context,
+                context=prompt_context,
                 external_context=external_context,
                 linked_answers=state.get("linked_answers"),
             )
@@ -122,8 +138,7 @@ class AgentNodes:
                 SystemMessage(content=system_content),
                 SystemMessage(content=memory_context),
             ]
-            citation_note = str(state.get("citation_note") or "").strip()
-            if citation_note:  # V3 turn that numbered passages
+            if citation_note:
                 messages.append(SystemMessage(content=citation_note))
             if custom_system_prompt:
                 messages.append(
@@ -134,7 +149,7 @@ class AgentNodes:
                         )
                     )
                 )
-            messages += history
+            messages += prompt_history
 
             llm = get_llm(
                 model,

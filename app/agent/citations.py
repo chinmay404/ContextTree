@@ -22,7 +22,9 @@ CITE_INSTRUCTION = (
 _MARK = re.compile(r"\[\s*(\d{1,4}(?:\s*,\s*\d{1,4})*)\s*\]")
 _THINK = re.compile(r"<think>.*?(?:</think>|\Z)", re.S)
 _FENCE_OPEN = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
-_INLINE_CODE = re.compile(r"(`+)(?!`).+?(?<!`)\1(?!`)", re.S)
+# A code span may wrap lines but never crosses a blank line, so a stray backtick cannot
+# swallow the paragraphs (and citations) after it.
+_INLINE_CODE = re.compile(r"(`+)(?!`)(?:(?!\n[ \t]*\n)[\s\S])+?(?<!`)\1(?!`)")
 
 
 def _blank(m: re.Match) -> str:
@@ -61,10 +63,32 @@ def extract_citations(answer: str, passages: dict[int, dict]) -> list[dict]:
 
 
 def strip_markers(text: str) -> str:
-    """Remove citation markers (outside code) — another chat's markers mean nothing in this turn."""
+    """Remove citation markers (outside code) from past answer text: old numbers mean nothing in
+    this turn. The spaces before a marker go with it, so no double spaces are left behind."""
+    text = str(text or "")
+    out, last, opened_line = [], 0, False
+    for m, _ in _markers(text):
+        start, end = m.start(), m.end()
+        while start > last and text[start - 1] in " \t":
+            start -= 1
+        # marker opens the line (or follows one that did): drop the gap after it too
+        opened_line = start == 0 or text[start - 1] == "\n" or (start == last and opened_line)
+        if opened_line:
+            while end < len(text) and text[end] in " \t":
+                end += 1
+        out.append(text[last:start])
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def neutralise_markers(text: str) -> str:
+    """Rewrite bracketed numbers in source text, ``[12]`` -> ``(12)``, so a PDF footnote or wiki
+    reference cannot pose as one of this turn's passage numbers. Prompt copy only; code untouched."""
+    text = str(text or "")
     out, last = [], 0
     for m, _ in _markers(text):
-        out.append(text[last:m.start()])
+        out.append(text[last:m.start()] + "(" + m.group(1) + ")")
         last = m.end()
     out.append(text[last:])
     return "".join(out)

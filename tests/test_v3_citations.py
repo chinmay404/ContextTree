@@ -5,7 +5,9 @@ from pathlib import Path
 import pytest
 
 from app.agent.board_context import BoardContext, ScoredChunk, build_board_context, number_passages
-from app.agent.citations import CITE_INSTRUCTION, QUOTE_MAX_CHARS, extract_citations
+from app.agent.citations import (
+    CITE_INSTRUCTION, QUOTE_MAX_CHARS, extract_citations, neutralise_markers, strip_markers,
+)
 from app.agent.reads import resolve_reads
 from app.agent.store.board_store import store
 from tests.v3_support import (  # noqa: F401
@@ -87,9 +89,27 @@ P = {n: {"n": n, "cardId": f"c{n}", "loc": None, "page": None, "quote": f"q{n}"}
     ("Unclosed fence [2]\n```\nc[3]", [2]),
     ("<think>maybe [1]</think>Answer [3].", [3]),
     ("Spaced [ 2 ] marker.", [2]),
+    # a stray backtick must not open a code span across paragraphs (review M2)
+    ("Press the ` key.\n\nClaim one [1].\n\nClaim two [2].\n\nRun `ls` [3].", [1, 2, 3]),
 ])
 def test_extract_citations(text, want):
     assert [c["n"] for c in extract_citations(text, P)] == want
+
+
+@pytest.mark.parametrize("text,want", [
+    ("Side answer [4] with an old marker.", "Side answer with an old marker."),
+    ("Claim [2]. Next [1][3], done [2, 3].", "Claim. Next, done."),
+    ("[1] Leading marker.", "Leading marker."),
+    ("[1][2] Two leading.\n[3] Next line.", "Two leading.\nNext line."),
+    ("Line one [1]\nline two", "Line one\nline two"),
+    ("Code `a[1]` stays [2].", "Code `a[1]` stays."),
+])
+def test_strip_markers_leaves_no_double_spaces(text, want):
+    assert strip_markers(text) == want
+
+
+def test_neutralise_markers_rewrites_bracketed_numbers_outside_code():
+    assert neutralise_markers("see [7] and [1, 2] but `x[3]` and [a]") == "see (7) and (1, 2) but `x[3]` and [a]"
 
 
 def test_extract_citations_returns_map_entries():
@@ -144,6 +164,56 @@ def test_assistant_node_adds_citation_instruction_only_when_given(monkeypatch):
     assert CITE_INSTRUCTION not in [m.content for m in seen[-1]]
 
 
+@pytest.fixture
+def llm_inputs(monkeypatch):
+    """Every message list the (fake) assistant LLM is called with."""
+    from app.agent.nodes import assistant_node
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "ENGINE_FAKE_LLM", True)
+    seen = []
+    real = assistant_node.get_llm
+
+    def spy(*a, **k):
+        llm = real(*a, **k)
+        orig = llm._prime
+
+        def prime(messages):
+            seen.append(list(messages))
+            return orig(messages)
+        object.__setattr__(llm, "_prime", prime)
+        return llm
+    monkeypatch.setattr(assistant_node, "get_llm", spy)
+    return seen
+
+
+def test_v3_turn_strips_old_markers_from_every_past_answer_copy(llm_inputs):
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from app.agent.nodes.assistant_node import AgentNodes
+    old = AIMessage(content="Old answer [1] said so [2, 3].", id="a1")
+    state = {
+        "messages": [HumanMessage(content="first", id="u1"), old, HumanMessage(content="next [5]?", id="u2")],
+        "count": 0, "user_id": "u@x.org", "citation_note": CITE_INSTRUCTION,
+        "context": ["[sim 1 | role=assistant | score=0.900] id=m1: prior [4] text"],
+        "summary": "Earlier we cited [6] twice.",
+        "external_context": "[source | Note | N]\n[1] passage text",
+        "linked_answers": "<LINKED_ANSWERS>\n[answer | X]\n[2] linked body\n</LINKED_ANSWERS>",
+    }
+    AgentNodes().assistant(state)
+    sent = llm_inputs[-1]
+    ai = [m for m in sent if m.type == "ai"]
+    assert [m.content for m in ai] == ["Old answer said so."]
+    memory = sent[1].content
+    assert "id=m1: prior text" in memory and "Earlier we cited twice." in memory
+    assert "[1] passage text" in memory and "[2] linked body" in memory  # this turn's numbers stay
+    assert [m.content for m in sent if m.type == "human"] == ["first", "next [5]?"]  # user text untouched
+    assert old.content == "Old answer [1] said so [2, 3]."  # copies only: state is not modified
+
+    state["citation_note"] = None  # no numbered passages this turn: nothing is rewritten
+    AgentNodes().assistant(state)
+    assert [m.content for m in llm_inputs[-1] if m.type == "ai"] == ["Old answer [1] said so [2, 3]."]
+
+
 # ── DB: numbering after budget trimming ──────────────────────────────────────
 
 def _chunk(db, email, board, card, idx, loc, emb, text, page=None):
@@ -170,11 +240,13 @@ def board(db, user):
     pdf = seed_card(db, user, b, kind="source", source_type="pdf", status="ready", desk_id=q,
                     data={"title": "Survey"})
     note = seed_card(db, user, b, kind="source", source_type="note", status="ready", desk_id=q,
-                     data={"title": "N", "text": "Note text. Second sentence."})
+                     data={"title": "N", "text": "Note text [7]. Second sentence."})
     side = seed_card(db, user, b, kind="chat", data={"name": "Side"})
+    with db.cursor() as cur:
+        cur.execute("UPDATE nodes SET summary = 'Side summary [3] here.' WHERE id = %s", (side,))
     seed_message(db, user, side, "assistant", "Side answer [4] with an old marker.", 1)
     seed_edge(db, user, b, side, q, "answer")
-    _chunk(db, user, b, pdf, 0, "p. 4", unit_emb(1), "Close chunk text.", page=3)
+    _chunk(db, user, b, pdf, 0, "p. 4", unit_emb(1), "Close chunk text [12].", page=3)
     _chunk(db, user, b, pdf, 1, "p. 9", [0.6 if i in (1, 2) else 0.0 for i in range(768)], "Far chunk.", page=8)
     return dict(b=b, q=q, pdf=pdf, note=note, side=side, email=user)
 
@@ -202,13 +274,18 @@ def test_retrieved_context_numbers_what_is_sent(board, monkeypatch):
     passages = {}
     ctx, ext, hits, la = g._build_retrieved_context("hello", board["email"], board["q"], board_reads=reads,
                                                     user_email=board["email"], passages=passages)
-    assert "\n[1] Note text. Second sentence." in ext
-    assert "[2] (p. 4) Close chunk text." in ext and "[3] (p. 9) Far chunk." in ext
-    assert "[4] Side answer  with an old marker." in la  # the other chat's own markers are removed
+    # source footnotes are rewritten in the prompt copy only (review M3)
+    assert "\n[1] Note text (7). Second sentence." in ext and "[7]" not in ext
+    assert "[2] (p. 4) Close chunk text (12)." in ext and "[3] (p. 9) Far chunk." in ext
+    # the other chat's own markers are removed from its answer and its summary (review I1, M8)
+    assert "\nSummary: Side summary here.\n[4] Side answer with an old marker." in la
     assert [(p["cardId"], p["loc"], p["page"]) for p in passages.values()] == [
         (board["note"], None, None), (board["pdf"], "p. 4", 4), (board["pdf"], "p. 9", 9),
         (board["side"], None, None)]
-    assert passages[4]["quote"] == "Side answer  with an old marker."
+    # quotes keep the stored text
+    assert passages[1]["quote"] == "Note text [7]. Second sentence."
+    assert passages[2]["quote"] == "Close chunk text [12]."
+    assert passages[4]["quote"] == "Side answer [4] with an old marker."
 
 
 @requires_db
@@ -230,7 +307,7 @@ def test_zero_embedding_still_numbers_notes_and_answers(board, monkeypatch):
     passages = {}
     out = g._build_retrieved_context("hello", board["email"], board["q"], board_reads=reads,
                                      user_email=board["email"], passages=passages)
-    assert len(out) == 4 and "[1] Note text." in out[1] and "[2] Side answer" in out[3]
+    assert len(out) == 4 and "[1] Note text (7)." in out[1] and "[2] Side answer" in out[3]
     assert sorted(passages) == [1, 2]
 
 
@@ -368,6 +445,57 @@ def test_v3_stream_without_passages_sends_empty_citations(api, db, user, fake_mo
     assert "[1]" not in "".join(f["message"] for f in frames if isinstance(f, dict) and "message" in f)
     msgs = api.get(f"/boards/{b}/cards/{q}/messages").json()["messages"]
     assert msgs[1]["citations"] == []
+
+
+def _assistant_calls(llm_inputs):
+    return [s for s in llm_inputs if any(m.type == "system" and "<MEMORY_FACTS>" in str(m.content) for m in s)]
+
+
+def _text(frames):
+    return "".join(f["message"] for f in frames if isinstance(f, dict) and "message" in f)
+
+
+@requires_db
+def test_v3_second_turn_prompt_holds_no_old_marker(api, db, user, llm_inputs):
+    import re
+    b = seed_board(db, user)
+    q = seed_card(db, user, b, kind="chat")
+    seed_card(db, user, b, kind="source", source_type="note", status="ready", desk_id=q,
+              data={"title": "N", "text": "The sky is green here."})
+    first = _turn(api, q, boardId=b)
+    assert _text(first) == "Fake answer to: What does it say?[1] Tell me."
+    second = _turn(api, q, boardId=b)
+    assert _kinds(second)[-1] == "done"
+    prompt = _assistant_calls(llm_inputs)[-1]
+    ai = [m.content for m in prompt if m.type == "ai"]
+    assert ai == ["Fake answer to: What does it say? Tell me."]  # turn 1's answer, marker removed
+    assert not any("?[1]" in str(m.content) for m in prompt)
+    for m in prompt:
+        if m.type == "system":
+            for line in str(m.content).splitlines():
+                if line.startswith("[sim ") or "Fake answer" in line:  # past answers in any block
+                    assert not re.search(r"\[\d+\]", line), line
+    with db.cursor() as cur:  # the stored answer keeps its marker
+        cur.execute("SELECT content FROM messages WHERE node_id = %s AND role = 'assistant' "
+                    "ORDER BY position LIMIT 1", (q,))
+        assert cur.fetchone()[0] == "Fake answer to: What does it say?[1] Tell me."
+
+
+@requires_db
+def test_v3_instruction_does_not_carry_over_to_a_turn_without_passages(api, db, user, llm_inputs):
+    b = seed_board(db, user)
+    q = seed_card(db, user, b, kind="chat")
+    note = seed_card(db, user, b, kind="source", source_type="note", status="ready", desk_id=q,
+                     data={"title": "N", "text": "The sky is green here."})
+    first = _turn(api, q, boardId=b)
+    assert [c["n"] for c in first[_kinds(first).index("citations")]["citations"]] == [1]
+    assert CITE_INSTRUCTION in [m.content for m in _assistant_calls(llm_inputs)[-1]]
+    with db.cursor() as cur:
+        cur.execute("UPDATE nodes SET deleted_at = now() WHERE id = %s", (note,))
+    second = _turn(api, q, boardId=b)
+    assert second[_kinds(second).index("citations")] == {"citations": []}
+    assert CITE_INSTRUCTION not in [m.content for m in _assistant_calls(llm_inputs)[-1]]
+    assert "[1]" not in _text(second)
 
 
 @requires_db

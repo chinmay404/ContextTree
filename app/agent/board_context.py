@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from math import ceil
 
-from app.agent.citations import QUOTE_MAX_CHARS, strip_markers
+from app.agent.citations import QUOTE_MAX_CHARS, neutralise_markers, strip_markers
 from app.agent.reads import (
     ANSWER_MAX_CHARS, ANSWER_SUMMARY_MAX_CHARS, FILE_BACKED, FILE_SNIPPET_CHARS,
     NOTE_MAX_CHARS, Reads,
@@ -76,12 +76,14 @@ class NumberedContext:
     passages: dict[int, dict]  # n -> Citation {n, cardId, loc, page, quote}
 
 
-def _sent_and_quote(text, limit: int) -> tuple[str, str]:
-    """The clipped text the prompt gets, and its quote: the same text without the clip ellipsis."""
+def _sent_and_quote(text, limit: int, for_prompt=neutralise_markers) -> tuple[str, str]:
+    """The clipped prompt copy, and the quote: the stored text clipped the same way, without the
+    clip ellipsis. Only the prompt copy has bracketed numbers rewritten (or, for another chat's
+    answer, its old markers removed), so they cannot pose as this turn's passage numbers."""
     raw = str(text or "").strip()
-    sent = clip_text(raw, limit)
-    body = sent[:-1] if len(raw) > limit else sent
-    return sent, body[:QUOTE_MAX_CHARS]
+    sent = clip_text(for_prompt(raw), limit)
+    quote = raw if len(raw) <= limit else raw[: limit - 1].rstrip()
+    return sent, quote[:QUOTE_MAX_CHARS]
 
 
 def _page(value) -> int | None:
@@ -182,8 +184,9 @@ def build_board_context(store, reads: Reads, user_email: str, query_embedding: l
                     continue
                 parts = [f"[answer | {_label(data.get('name')) or 'Chat'}]"]
                 if (row["summary"] or "").strip():
-                    parts.append("Summary: " + clip_text(_safe(row["summary"]), ANSWER_SUMMARY_MAX_CHARS))
-                body, quote = _sent_and_quote(strip_markers(_safe(latest[cid])), ANSWER_MAX_CHARS)
+                    parts.append("Summary: " + clip_text(strip_markers(_safe(row["summary"])),
+                                                         ANSWER_SUMMARY_MAX_CHARS))
+                body, quote = _sent_and_quote(_safe(latest[cid]), ANSWER_MAX_CHARS, strip_markers)
                 ctx.answer_parts.append((cid, list(parts), body, quote))
                 entries.append("\n".join(parts + [body]))
                 continue

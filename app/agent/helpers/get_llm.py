@@ -221,12 +221,18 @@ def _normalize_litellm_model_name(model_name: str | None) -> str:
     return bare or _LITELLM_DEFAULT
 
 
-def _resolve_provider_key(
+def _env(name: str) -> str | None:
+    """A provider key from the environment, read by variable name."""
+    return os.getenv(name)
+
+
+def _byok(
     provider: str,
     env_key_name: str,
     user_id: str | None = None,
 ):
-    env_key = os.getenv(env_key_name)
+    """A provider key: the environment's, else the user's own stored key (BYOK)."""
+    env_key = _env(env_key_name)
     if env_key:
         return env_key
 
@@ -247,12 +253,12 @@ def validate_model_access(model_name: str | None, user_id: str | None = None) ->
         return "Connect your LiteLLM credential or private endpoint to use custom models."
 
     if _is_openai_direct(model_name):
-        if _resolve_provider_key("openai", "OPENAI_API_KEY", user_id):
+        if _byok("openai", "OPENAI_API_KEY", user_id):
             return None
         return "Connect your OpenAI API key to use GPT models."
 
     if _is_anthropic(model_name):
-        if _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id):
+        if _byok("anthropic", "ANTHROPIC_API_KEY", user_id):
             return None
         return "Connect your Anthropic API key to use Claude models."
 
@@ -271,7 +277,7 @@ def get_gemini_llm(
       - "gemini-3-flash-preview"         (bare)
       - None → falls back to DEFAULT_GEMINI_MODEL or Gemini 3 Flash Preview
     """
-    api_key = os.getenv("GOOGLE_API_KEY")  # env var name only, no value in code
+    api_key = _env("GOOGLE_API_KEY")
     if not api_key:
         logger.error("GOOGLE_API_KEY not set — cannot initialise Gemini LLM")
         return None
@@ -304,7 +310,7 @@ def get_openai_llm(
     max_output_tokens: int | None = None,
 ):
     resolved = _normalize_openai_model_name(model_name)
-    api_key = _resolve_provider_key("openai", "OPENAI_API_KEY", user_id)  # env var name only, no value in code
+    api_key = _byok("openai", "OPENAI_API_KEY", user_id)
     if not api_key:
         logger.error("No OpenAI credentials available for %s", resolved)
         return None
@@ -344,7 +350,7 @@ def get_groq_llm(
     if name in _GROQ_SENTINEL:
         name = _GROQ_DEFAULT
 
-    api_key = os.getenv("GROQ_API_KEY")  # env var name only, no value in code
+    api_key = _env("GROQ_API_KEY")
     if not api_key:
         logger.error("GROQ_API_KEY not set — cannot initialise Groq LLM")
         return None
@@ -373,7 +379,7 @@ def get_anthropic_llm(
     max_output_tokens: int | None = None,
 ):
     resolved = _normalize_anthropic_model_name(model_name)
-    api_key = _resolve_provider_key("anthropic", "ANTHROPIC_API_KEY", user_id)  # env var name only, no value in code
+    api_key = _byok("anthropic", "ANTHROPIC_API_KEY", user_id)
     if not api_key:
         logger.error("No Anthropic credentials available for %s", resolved)
         return None
@@ -406,7 +412,7 @@ def get_nvidia_llm(
     """Returns a ChatOpenAI instance pointed at NVIDIA's OpenAI-compatible API."""
     model_name = _normalize_nvidia_model_name(model_name)
 
-    api_key = os.getenv("NVIDIA_API_KEY")  # env var name only, no value in code
+    api_key = _env("NVIDIA_API_KEY")
     if not api_key:
         logger.error("NVIDIA_API_KEY not set — cannot initialise NVIDIA LLM")
         return None
@@ -450,7 +456,7 @@ def get_litellm_llm(
     resolved = _normalize_litellm_model_name(model_name)
     credentials = get_user_provider_credentials(user_id, "litellm") or {}
     metadata = credentials.get("metadata") or {}
-    api_key = os.getenv("LITELLM_API_KEY") or credentials.get("api_key")  # env var name only, no value in code
+    api_key = _env("LITELLM_API_KEY") or credentials.get("api_key")
     api_base = os.getenv("LITELLM_API_BASE") or metadata.get("apiBase")
 
     if not api_key and not api_base:
