@@ -357,3 +357,63 @@ def test_cross_tenant_delete_and_restore_are_404(api, db):
             for t in ("edges", "nodes", "canvases"):
                 cur.execute(f"DELETE FROM {t} WHERE user_email = %s", (other,))
             cur.execute("DELETE FROM users WHERE email = %s", (other,))
+
+
+# ── follow-up: never block the event loop; one connection in find_similar ────
+def test_get_conn_on_event_loop_thread_fails_fast_with_pool_error(fake_pool, monkeypatch):
+    import asyncio
+    from psycopg2 import pool as pg_pool
+    monkeypatch.setattr(ps, "POOL_WAIT_SECONDS", 10.0)
+    monkeypatch.setattr(ps, "_pool_gate", threading.BoundedSemaphore(1))
+    ps._pool_gate.acquire()  # gate full
+    s = ps.PostgresConversationStore(db_url="postgresql://unused/x")
+
+    async def run():
+        t0 = time.monotonic()
+        with pytest.raises(pg_pool.PoolError):
+            with s._get_conn():
+                pass
+        return time.monotonic() - t0
+
+    assert asyncio.run(run()) < 0.5
+
+
+def test_get_conn_off_loop_still_waits_then_503(fake_pool, monkeypatch):
+    from app.api.errors import ApiError
+    monkeypatch.setattr(ps, "POOL_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(ps, "_pool_gate", threading.BoundedSemaphore(1))
+    ps._pool_gate.acquire()
+    s = ps.PostgresConversationStore(db_url="postgresql://unused/x")
+    t0 = time.monotonic()
+    with pytest.raises(ApiError) as e:
+        with s._get_conn():
+            pass
+    assert e.value.status_code == 503 and time.monotonic() - t0 >= 0.2
+
+
+@requires_db
+def test_find_similar_by_message_id_uses_one_connection(db, user, monkeypatch):
+    from contextlib import contextmanager
+    from tests.v3_support import TEST_DB
+    s = ps.PostgresConversationStore(db_url=TEST_DB)
+    b = seed_board(db, user)
+    t = seed_card(db, user, b, kind="chat")
+    from tests.v3_support import seed_message
+    mid = seed_message(db, user, t, "user", "hello", 1, embedding=unit_emb(3))
+    real = s._get_conn
+    state = {"open": 0, "max": 0}
+
+    @contextmanager
+    def tracked():
+        state["open"] += 1
+        state["max"] = max(state["max"], state["open"])
+        try:
+            with real() as conn:
+                yield conn
+        finally:
+            state["open"] -= 1
+
+    monkeypatch.setattr(s, "_get_conn", tracked)
+    hits = s.find_similar_by_message_id(user, [(t, None)], unit_emb(3), top_k=3)
+    assert state["max"] == 1
+    assert [h["message_id"] for h in hits] == [mid]

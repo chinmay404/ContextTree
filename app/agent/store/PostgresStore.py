@@ -12,6 +12,7 @@ Key design decisions:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -37,6 +38,7 @@ _pool: Optional[pg_pool.ThreadedConnectionPool] = None
 
 POOL_MAXCONN = 4
 POOL_WAIT_SECONDS = 10.0
+POOL_CONNECT_TIMEOUT = 5  # seconds; a black-holed DB must not hang boot or a request for minutes
 # ThreadedConnectionPool raises PoolError the moment all connections are out; the gate
 # makes callers queue (up to POOL_WAIT_SECONDS) instead, then fail with a clean 503.
 _pool_gate = threading.BoundedSemaphore(POOL_MAXCONN)
@@ -47,9 +49,18 @@ def _get_pool(db_url: str) -> pg_pool.ThreadedConnectionPool:
     if _pool is None:
         # Supabase session pooler allows only 15 clients TOTAL; deploys run
         # two instances during overlap. Keep the idle footprint tiny.
-        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=POOL_MAXCONN, dsn=db_url)
+        _pool = pg_pool.ThreadedConnectionPool(minconn=1, maxconn=POOL_MAXCONN, dsn=db_url,
+                                                connect_timeout=POOL_CONNECT_TIMEOUT)
         logger.info("PostgreSQL connection pool created (min=1, max=4)")
     return _pool
+
+
+def _on_event_loop_thread() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
 
 
 # ── Canonical message identity ─────────────────────────────────────────────────
@@ -101,7 +112,11 @@ class PostgresConversationStore:
         Borrow a connection from the pool.
         Commits on clean exit, rolls back + re-raises on exception.
         """
-        if not _pool_gate.acquire(timeout=POOL_WAIT_SECONDS):
+        if _on_event_loop_thread():
+            # Never park the event loop: keep the pre-gate fail-fast behaviour (PoolError).
+            if not _pool_gate.acquire(blocking=False):
+                raise pg_pool.PoolError("connection pool exhausted")
+        elif not _pool_gate.acquire(timeout=POOL_WAIT_SECONDS):
             raise ApiError(503, "unavailable", "the database is busy, try again shortly")
         try:
             p = _get_pool(self.db_url)
@@ -819,8 +834,13 @@ class PostgresConversationStore:
 
                 if not is_global:
                     for thread_id, limit_msg_id in thread_queries:
-                        msgs = self.get_thread_messages(user_id, thread_id)
-                        ids = [m["message_id"] for m in msgs]
+                        # same cursor/connection: a second _get_conn here could deadlock the pool
+                        cur.execute(
+                            "SELECT id FROM messages WHERE node_id = %s AND user_email = %s "
+                            "ORDER BY position ASC NULLS LAST, timestamp ASC",
+                            (thread_id, self._resolve_user_email(cur, user_id)),
+                        )
+                        ids = [r["id"] for r in cur.fetchall()]
                         if limit_msg_id:
                             resolved = self._resolve_message_id(limit_msg_id, ids)
                             if resolved and resolved in ids:
