@@ -1,7 +1,7 @@
 import os
 from typing import Any, List, Optional
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -89,6 +89,19 @@ class Settings(BaseSettings):
     RESERVE_TOKENS: int = 1000
     # Minimum semantic similarity score for message-to-message retrieval.
     SIMILARITY_MIN_SCORE: float = 0.2
+
+    # ── Local end-to-end runs ──────────────────────────────────────────────────
+    # Deterministic fake LLM + embeddings (no network). Local only: refused
+    # when running on Railway.
+    ENGINE_FAKE_LLM: bool = False
+
+    @model_validator(mode="after")
+    def _fake_llm_local_only(self):
+        if self.ENGINE_FAKE_LLM and (
+            os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID")
+        ):
+            raise RuntimeError("ENGINE_FAKE_LLM is for local runs only")
+        return self
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod

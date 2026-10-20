@@ -1,10 +1,12 @@
 import os
+import hashlib
 import math
 from functools import lru_cache
 from typing import List
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from app.core.logger import logger
+from app.core.config import settings
 
 load_dotenv()
 
@@ -90,8 +92,22 @@ def _embed_documents(texts: List[str]) -> List[List[float]]:
 
     raise RuntimeError(f"All embedding model candidates failed: {last_error}")
 
+def _fake_embedding(text: str) -> List[float]:
+    """Deterministic unit vector derived from sha256(text); no network."""
+    seed = hashlib.sha256((text or "").encode("utf-8")).digest()
+    raw: List[float] = []
+    counter = 0
+    while len(raw) < EXPECTED_EMBEDDING_DIM:
+        block = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        raw.extend((b - 127.5) / 127.5 for b in block)
+        counter += 1
+    return _shape_embedding(raw[:EXPECTED_EMBEDDING_DIM])
+
+
 def get_embedding(text: str) -> List[float]:
     """Generates embedding for a single string using Gemini."""
+    if settings.ENGINE_FAKE_LLM:
+        return _fake_embedding(text)
     try:
         return _embed_query(text)
     except Exception as e:
@@ -100,6 +116,8 @@ def get_embedding(text: str) -> List[float]:
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
     """Generates embeddings for a list of strings using Gemini."""
+    if settings.ENGINE_FAKE_LLM:
+        return [_fake_embedding(t) for t in texts]
     try:
         if not texts:
             return []

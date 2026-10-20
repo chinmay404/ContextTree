@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from app.agent.helpers.byok import get_user_provider_api_key, get_user_provider_credentials
 from app.core.logger import logger
+from app.core.config import settings
 
 load_dotenv()
 
@@ -524,6 +525,43 @@ def _fallback_to_groq_default(
     )
 
 
+def _build_fake_llm():
+    from typing import Any, Iterator
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+
+    def _question(messages) -> str:
+        for m in reversed(messages or []):
+            if getattr(m, "type", "") == "human":
+                c = m.content
+                if isinstance(c, list):
+                    c = " ".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p) for p in c
+                    )
+                return str(c)
+        return ""
+
+    class _FakeChat(GenericFakeChatModel):
+        """Answers 'Fake answer to: <first 60 chars of question>'; streams per word."""
+
+        def _prime(self, messages) -> None:
+            reply = "Fake answer to: " + _question(messages)[:60]
+            self.messages = iter([AIMessage(content=reply)])
+
+        def _generate(self, messages, *args: Any, **kwargs: Any):
+            self._prime(messages)
+            return super()._generate(messages, *args, **kwargs)
+
+        def _stream(self, messages, *args: Any, **kwargs: Any) -> Iterator:
+            self._prime(messages)
+            return super()._stream(messages, *args, **kwargs)
+
+        def bind_tools(self, *args: Any, **kwargs: Any):
+            return self
+
+    return _FakeChat(messages=iter([]))
+
+
 def get_llm(
     model_name: str | None = None,
     user_id: str | None = None,
@@ -543,6 +581,9 @@ def get_llm(
 
     Falls back to the Groq default model if Gemini/NVIDIA init fails.
     """
+    if settings.ENGINE_FAKE_LLM:
+        return _build_fake_llm()
+
     # No model chosen → NVIDIA NIM default (widest catalog, larger context
     # window than free-tier Groq). Groq stays as the cross-provider fallback.
     if model_name in _NVIDIA_SENTINEL:
