@@ -6,6 +6,7 @@ key lookup is monkeypatched and the LangChain clients are only constructed.
 """
 
 import re
+import secrets
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,7 @@ def keys(monkeypatch):
         calls.append((user_id, provider))
         return f"user-{provider}" if provider in stored else None
 
-    monkeypatch.setattr(v3_llm, "get_user_provider_api_key", fake_lookup)
+    monkeypatch.setattr(v3_llm, "fetch_user_provider_api_key", fake_lookup)
     monkeypatch.setattr(settings, "ENGINE_FAKE_LLM", False)
     for name in ENV_KEYS:
         monkeypatch.setenv(name, ENV_SENTINEL)
@@ -100,7 +101,7 @@ def test_each_board_model_builds_its_client_on_the_user_key(keys, model_id):
     provider, cls, secret_attr, model_attr, wire = EXPECTED[model_id]
     llm = v3_llm.get_v3_llm(model_id, "me@example.test")
 
-    assert type(llm).__name__ == cls
+    assert cls in [c.__name__ for c in type(llm).__mro__]
     secret = getattr(llm, secret_attr).get_secret_value()
     assert secret == f"user-{provider}"
     assert secret != ENV_SENTINEL
@@ -232,15 +233,15 @@ def test_providers_with_a_0_to_1_temperature_are_capped(keys, model_id):
 
 
 def test_client_build_error_does_not_carry_the_key(keys, monkeypatch):
-    def broken(**kwargs):
-        raise ValueError(f"bad input {kwargs}")
+    def broken(route, key, *a):
+        raise ValueError(f"bad input api_key={key}")
 
-    monkeypatch.setattr("langchain_openai.ChatOpenAI", broken)
+    monkeypatch.setattr(v3_llm, "_build_client", broken)
     with pytest.raises(RuntimeError) as err:
         v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test")
     assert "user-openai" not in str(err.value)
     assert err.value.__cause__ is None
-    assert err.value.__suppress_context__ is True
+    assert err.value.__context__ is None
 
 
 class _Status:
@@ -315,3 +316,247 @@ def test_fake_mode_still_rejects_unsupported_models(monkeypatch):
     monkeypatch.setattr(settings, "ENGINE_FAKE_LLM", True)
     with pytest.raises(v3_llm.UnsupportedModelError):
         v3_llm.v3_require_key("z-ai/glm-5.2", "me@example.test")
+
+
+# ── Fix round 1 (security review I1, M1–M3) ────────────────────────────────────
+
+@pytest.fixture
+def server_env(keys, monkeypatch):
+    """Server env that SDKs turn into request headers or credentials.
+
+    None of it may reach a V3 request. Every value carries one random per-run
+    mark (returned as `keys.mark`), so the wire check is one substring test.
+    """
+    mark = f"srv{secrets.token_hex(8)}"
+    anthropic_auth_header = AUTH["anthropic"][0]
+    values = {
+        "OPENAI_ORG_ID": f"org-{mark}",
+        "OPENAI_ORGANIZATION": f"org2-{mark}",
+        "OPENAI_PROJECT_ID": f"proj_{mark}",
+        "OPENAI_ADMIN_KEY": f"admin-{mark}",
+        "OPENAI_CUSTOM_HEADERS": f"X-Srv-Auth: hdr-{mark}\nAuthorization: Bearer auth-{mark}",
+        "ANTHROPIC_AUTH_TOKEN": f"token-{mark}",
+        "ANTHROPIC_CUSTOM_HEADERS": f"X-Srv-Auth: hdr-{mark}\n{anthropic_auth_header}: hdr2-{mark}",
+        "GOOGLE_CLOUD_PROJECT": f"project-{mark}",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    keys.mark = mark
+    return keys
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Requests as they leave the client (after httpx event hooks), answered 401."""
+    import httpx
+
+    sent: list = []
+
+    def reply(request):
+        sent.append(request)
+        return httpx.Response(
+            401, json={"error": {"message": "bad key", "type": "authentication_error"}},
+            request=request)
+
+    def handle(self, request):
+        return reply(request)
+
+    async def ahandle(self, request):
+        return reply(request)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", ahandle)
+    return sent
+
+
+AUTH = {
+    "anthropic": ("x-api-key", "user-anthropic"),
+    "openai": ("authorization", "Bearer user-openai"),
+    "groq": ("authorization", "Bearer user-groq"),
+    "deepseek": ("authorization", "Bearer user-deepseek"),
+    "mistral": ("authorization", "Bearer user-mistral"),
+    "moonshot": ("authorization", "Bearer user-moonshot"),
+    "google": ("x-goog-api-key", "user-google"),
+}
+HOSTS = {
+    "anthropic": "api.anthropic.com", "openai": "api.openai.com", "groq": "api.groq.com",
+    "deepseek": "api.deepseek.com", "mistral": "api.mistral.ai", "moonshot": "api.moonshot.ai",
+    "google": "generativelanguage.googleapis.com",
+}
+
+
+def _assert_clean(requests, provider, mark):
+    assert requests, "no request reached the transport"
+    name, value = AUTH[provider]
+    for req in requests:
+        assert req.url.host == HOSTS[provider]
+        headers = {k.lower(): v for k, v in req.headers.items()}
+        assert headers.get(name) == value
+        for k, v in headers.items():
+            assert mark not in v, f"server value leaked in header {k}"
+            assert ENV_SENTINEL not in v.split(), f"env key leaked in header {k}"
+        for banned in ("openai-organization", "openai-project", "x-srv-auth", "x-goog-user-project"):
+            assert banned not in headers
+        if provider == "anthropic":
+            assert "authorization" not in headers
+        assert mark not in req.content.decode("utf-8", "replace")
+
+
+def _invoke(llm):
+    with pytest.raises(Exception):
+        llm.invoke("hi")
+
+
+def _ainvoke(llm):
+    import asyncio
+
+    async def go():
+        await llm.ainvoke("hi")
+
+    with pytest.raises(Exception):
+        asyncio.run(go())
+
+
+@pytest.mark.parametrize("model_id", sorted(EXPECTED))
+def test_sync_requests_carry_only_the_user_key(server_env, wire, model_id):
+    provider = EXPECTED[model_id][0]
+    _invoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
+    _assert_clean(wire, provider, server_env.mark)
+
+
+@pytest.mark.parametrize(
+    "model_id", sorted(m for m in EXPECTED if EXPECTED[m][0] != "google"),
+)
+def test_async_requests_carry_only_the_user_key(server_env, wire, model_id):
+    # google-genai's async path uses aiohttp, not httpx; its sync path is checked above.
+    provider = EXPECTED[model_id][0]
+    _ainvoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
+    _assert_clean(wire, provider, server_env.mark)
+
+
+def test_openai_proxy_env_does_not_break_the_build(server_env, monkeypatch):
+    monkeypatch.setenv("OPENAI_PROXY", "http://proxy.invalid:8080")
+    llm = v3_llm.get_v3_llm("deepseek/deepseek-chat", "me@example.test")
+    assert llm.openai_api_key.get_secret_value() == "user-deepseek"
+
+
+@pytest.mark.parametrize("flag", ["GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_ENTERPRISE"])
+def test_vertex_env_fails_closed_for_gemini(keys, monkeypatch, flag):
+    monkeypatch.setenv(flag, "true")
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "project-srvsentinel")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    with pytest.raises(v3_llm.V3ConfigError) as err:
+        v3_llm.get_v3_llm("gemini/gemini-3-flash-preview", "me@example.test")
+    assert "user-google" not in str(err.value)
+    assert not isinstance(err.value, (v3_llm.MissingKeyError, v3_llm.KeyRejectedError))
+
+
+def test_key_store_failure_is_not_missing_key(keys, monkeypatch):
+    from app.agent.helpers.v3_keys import KeyStoreUnavailableError
+
+    def broken(user_email, provider):
+        raise KeyStoreUnavailableError("db down")
+
+    monkeypatch.setattr(v3_llm, "fetch_user_provider_api_key", broken)
+    with pytest.raises(v3_llm.KeyStoreError) as err:
+        v3_llm.v3_require_key("openai/gpt-5-mini", "me@example.test")
+    assert err.value.provider == "openai"
+    assert not isinstance(err.value, v3_llm.MissingKeyError)
+    assert err.value.__cause__ is None and err.value.__context__ is None
+    with pytest.raises(v3_llm.KeyStoreError):
+        v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test")
+
+
+def test_no_row_is_still_missing_key(keys):
+    keys.clear()
+    with pytest.raises(v3_llm.MissingKeyError):
+        v3_llm.v3_require_key("openai/gpt-5-mini", "me@example.test")
+
+
+def test_get_v3_llm_accepts_a_resolved_key_without_a_lookup(keys):
+    llm = v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test", user_key="user-resolved")
+    assert llm.openai_api_key.get_secret_value() == "user-resolved"
+    assert keys.calls == []
+
+
+# The strict store lookup itself, against the local test DB.
+from tests.v3_support import TEST_DB, requires_db  # noqa: E402
+
+def _encrypt(plain: str, master: str) -> str:
+    """Same format as lib/byok-crypto.ts: b64url(iv).b64url(tag).b64url(ciphertext)."""
+    import base64
+    import hashlib
+
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    def b64(b):
+        return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+    aes_key = hashlib.sha256(master.encode()).digest()
+    iv = secrets.token_bytes(12)
+    sealed = AESGCM(aes_key).encrypt(iv, plain.encode(), None)
+    return ".".join([b64(iv), b64(sealed[-16:]), b64(sealed[:-16])])
+
+
+@pytest.fixture
+def key_rows(monkeypatch):
+    """A throwaway email, `put(provider, payload)`, and `seal(text)` under a per-run master."""
+    import uuid
+
+    import psycopg2
+
+    master = secrets.token_hex(16)
+    monkeypatch.setenv("BYOK_ENCRYPTION_SECRET", master)
+    email = f"v3key_{uuid.uuid4().hex[:10]}@example.com"
+    conn = psycopg2.connect(TEST_DB)
+    conn.autocommit = True
+
+    def put(provider, encrypted):
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_api_keys (user_email, provider, encrypted_key, created_at, updated_at) "
+                "VALUES (%s, %s, %s, now(), now())", (email, provider, encrypted))
+
+    def seal(text):
+        return _encrypt(text, master)
+
+    try:
+        yield email, put, seal
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_api_keys WHERE user_email = %s", (email,))
+        conn.close()
+
+
+@requires_db
+def test_strict_lookup_returns_the_key_or_none(key_rows):
+    from app.agent.helpers.v3_keys import fetch_user_provider_api_key
+
+    email, put, seal = key_rows
+    put("mistral", seal("user-mistral-stored"))
+    assert fetch_user_provider_api_key(email, "mistral") == "user-mistral-stored"
+    assert fetch_user_provider_api_key(email, "moonshot") is None
+
+
+@requires_db
+def test_strict_lookup_raises_on_undecryptable_row_v2_unchanged(key_rows):
+    from app.agent.helpers.byok import get_user_provider_api_key
+    from app.agent.helpers.v3_keys import KeyStoreUnavailableError, fetch_user_provider_api_key
+
+    email, put, seal = key_rows
+    put("deepseek", "not.a.valid-payload")
+    with pytest.raises(KeyStoreUnavailableError) as err:
+        fetch_user_provider_api_key(email, "deepseek")
+    assert err.value.__cause__ is None
+    assert get_user_provider_api_key(email, "deepseek") is None  # V2 behaviour kept
+
+
+def test_strict_lookup_raises_when_the_db_is_unreachable(monkeypatch):
+    from app.agent.helpers.v3_keys import KeyStoreUnavailableError, fetch_user_provider_api_key
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://127.0.0.1:1/none?connect_timeout=2")
+    with pytest.raises(KeyStoreUnavailableError):
+        fetch_user_provider_api_key("me@example.test", "openai")
+    monkeypatch.delenv("DATABASE_URL")
+    with pytest.raises(KeyStoreUnavailableError):
+        fetch_user_provider_api_key("me@example.test", "openai")
