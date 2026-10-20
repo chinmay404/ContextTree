@@ -5,13 +5,13 @@ query by user_email. Missing, deleted or foreign rows are 404 (never 403).
 """
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 from psycopg2.extras import execute_values
 
 from app.agent.store.board_store import (
     _INTERNAL_DATA_KEYS,
+    dumps_json,
     fetch_card_json,
     live_card_count,
     lock_board,
@@ -56,6 +56,15 @@ def _check_pile(cur, user_email: str, board_id: str, pile_id: str) -> None:
 
 
 def _validate_create(body: CardCreate) -> None:
+    if body.desk_id is not None and body.kind != "source":
+        raise ApiError(400, "invalid", "only a source can sit on a desk")
+    if body.pile_id is not None:
+        if body.kind != "source":
+            raise ApiError(400, "invalid", "only a source can be in a pile")
+        if body.source_type == "pile":
+            raise ApiError(400, "invalid", "a pile cannot go inside a pile")
+        if body.pile_id == body.id:
+            raise ApiError(400, "invalid", "a card cannot be in itself")
     if body.kind == "chat":
         if body.source_type is not None or body.status is not None:
             raise ApiError(400, "invalid", "a chat takes no sourceType or status")
@@ -142,7 +151,7 @@ def create_card(cur, user_email: str, board_id: str, body: CardCreate) -> tuple[
         "is_initialized, is_primary) "
         "VALUES (%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (id) DO NOTHING RETURNING id",
-        (body.id, board_id, user_email, json.dumps(data), body.kind, body.source_type, status,
+        (body.id, board_id, user_email, dumps_json(data), body.kind, body.source_type, status,
          body.x, body.y, body.desk_id, body.pile_id, parent_id, forked, ancestors,
          is_initialized, is_primary),
     )
@@ -166,11 +175,19 @@ def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatc
     args: list = []
     if "desk_id" in fields:
         if body.desk_id is not None:
+            if card["kind"] != "source":
+                raise ApiError(400, "invalid", "only a source can sit on a desk")
             _check_desk(cur, user_email, board_id, body.desk_id)
         sets.append("desk_id = %s")
         args.append(body.desk_id)
     if "pile_id" in fields:
         if body.pile_id is not None:
+            if card["kind"] != "source":
+                raise ApiError(400, "invalid", "only a source can be in a pile")
+            if card["source_type"] == "pile":
+                raise ApiError(400, "invalid", "a pile cannot go inside a pile")
+            if body.pile_id == card_id:
+                raise ApiError(400, "invalid", "a card cannot be in itself")
             _check_pile(cur, user_email, board_id, body.pile_id)
         sets.append("pile_id = %s")
         args.append(body.pile_id)
@@ -193,11 +210,11 @@ def patch_card(cur, user_email: str, board_id: str, card_id: str, body: CardPatc
                 "data = jsonb_set(coalesce(data, '{}'::jsonb) || (%s::jsonb - 'advanced'), "
                 "'{advanced}', CASE WHEN jsonb_typeof(data->'advanced') = 'object' THEN data->'advanced' ELSE '{}'::jsonb END || %s::jsonb)"
             )
-            args.append(json.dumps(patch))
-            args.append(json.dumps(patch["advanced"]))
+            args.append(dumps_json(patch))
+            args.append(dumps_json(patch["advanced"]))
         else:
             sets.append("data = coalesce(data, '{}'::jsonb) || %s::jsonb")
-            args.append(json.dumps(patch))
+            args.append(dumps_json(patch))
     if sets:
         cur.execute(
             f"UPDATE nodes SET {', '.join(sets)}, updated_at = now() "
