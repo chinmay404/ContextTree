@@ -116,6 +116,10 @@ class KeyStoreError(Exception):
         self.provider = provider
 
 
+class KeyMismatchError(RuntimeError):
+    """A resolved key was handed to a model of another provider (a caller bug; nothing is sent)."""
+
+
 class V3ConfigError(RuntimeError):
     """The server environment rules out a user-key-only client (an operator fix)."""
 
@@ -172,6 +176,11 @@ def v3_require_key(model_id: str | None, user_email: str | None) -> tuple[Route,
     return route, key
 
 
+# Headers the guard never removes. LangChain hands its User-Agent to some SDKs (Groq) as a
+# custom header; it carries no credential, and stripping it would send none at all.
+_NEVER_STRIPPED = frozenset({"user-agent"})
+
+
 class _HeaderGuard:
     """httpx request hook: the request carries the user's key and no server header.
 
@@ -190,7 +199,7 @@ class _HeaderGuard:
     def learn(self, sdk_client: Any, intended: Any) -> None:
         custom = getattr(sdk_client, "_custom_headers", None) or {}
         keep = {str(k).lower() for k in (intended or {})}
-        self.strip |= {str(k).lower() for k in custom} - keep
+        self.strip |= {str(k).lower() for k in custom} - keep - _NEVER_STRIPPED
 
     def apply(self, request) -> None:
         for name in self.strip:
@@ -346,18 +355,28 @@ def get_v3_llm(
     user_email: str | None,
     temperature: float | None = None,
     max_output_tokens: int | None = None,
-    user_key: str | None = None,
+    resolved: tuple[Route, str] | None = None,
 ):
     """A chat model for a V3 turn, built on the user's own key only.
 
-    Pass `user_key` when the caller already resolved it with `v3_require_key`
-    (one store lookup per turn); otherwise it is looked up here.
+    Pass `resolved`, the (route, key) pair `v3_require_key` returned, when the caller already
+    looked the key up (one store lookup per turn); otherwise it is looked up here. The key goes
+    only to the provider it was resolved for: a pair from another provider raises
+    KeyMismatchError before any client is built.
     """
     route = v3_route(model_id)
+    if resolved is not None:
+        resolved_route, user_key = resolved
+        if resolved_route.provider != route.provider:
+            raise KeyMismatchError(
+                f"a {resolved_route.provider} key was passed for a {route.provider} model"
+            )
     if settings.ENGINE_FAKE_LLM:
         return _build_fake_llm()
-    if not user_key:
+    if resolved is None:
         _, user_key = v3_require_key(model_id, user_email)
+    elif not user_key:
+        raise MissingKeyError(route.provider)
     failure: str | None = None
     try:
         llm = _build_client(route, user_key, temperature, max_output_tokens)
@@ -381,8 +400,8 @@ PROVIDER_NAME = {
 TURN_KEY_CONFIG = "v3_turn_key"
 
 
-def _redacted_turn_key(provider: str) -> "TurnKey":
-    return TurnKey(provider, "")
+def _redacted_turn_key(route: Route) -> "TurnKey":
+    return TurnKey(route, "")
 
 
 class TurnKey:
@@ -395,14 +414,19 @@ class TurnKey:
     and skips other objects. It prints as `<TurnKey provider>`, and pickling it drops the secret.
     """
 
-    __slots__ = ("provider", "_secret")
+    __slots__ = ("route", "_secret")
 
-    def __init__(self, provider: str, secret: str | None):
-        self.provider = provider
+    def __init__(self, route: Route, secret: str | None):
+        self.route = route
         self._secret = secret or ""
 
-    def reveal(self) -> str:
-        return self._secret
+    @property
+    def provider(self) -> str:
+        return self.route.provider
+
+    def resolved(self) -> tuple[Route, str]:
+        """The (route, key) pair for `get_v3_llm(..., resolved=...)`."""
+        return self.route, self._secret
 
     def __repr__(self) -> str:
         return f"<TurnKey {self.provider}>"
@@ -416,7 +440,7 @@ class TurnKey:
         return self
 
     def __reduce__(self):
-        return (_redacted_turn_key, (self.provider,))
+        return (_redacted_turn_key, (self.route,))
 
 
 def turn_key_from(config) -> TurnKey | None:

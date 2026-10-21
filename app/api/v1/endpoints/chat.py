@@ -373,7 +373,7 @@ def _init_fork_if_needed(
 
         if turn_key is not None:
             summary_model = chat_message.model_name
-            llm = get_v3_llm(summary_model, None, user_key=turn_key.reveal())
+            llm = get_v3_llm(summary_model, None, resolved=turn_key.resolved())
         else:
             summary_model = get_summary_model_name(chat_message.model_name)
             llm = get_llm(summary_model, user_id=user_id)
@@ -543,7 +543,7 @@ def _v3_turn_key(chat_message: ChatMessage, email: str) -> TurnKey:
     try:
         route, key = v3_require_key(model, email)
         get_v3_llm(model, email, temperature=chat_message.temperature,
-                   max_output_tokens=chat_message.max_output_tokens, user_key=key)
+                   max_output_tokens=chat_message.max_output_tokens, resolved=(route, key))
     except UnsupportedModelError:
         failure = ApiError(400, "unsupported_model", model)
     except MissingKeyError as e:
@@ -555,7 +555,7 @@ def _v3_turn_key(chat_message: ChatMessage, email: str) -> TurnKey:
         failure = ApiError(500, "server_error", "This model can't run on this server right now.")
     if failure is not None:  # raised outside the except block: no chain to the cause
         raise failure
-    return TurnKey(route.provider, key)
+    return TurnKey(route, key)
 
 
 async def _key_rejected_stream(provider: str):

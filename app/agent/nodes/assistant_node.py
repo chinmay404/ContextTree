@@ -87,9 +87,10 @@ def _drop_unanswered_questions(history: list) -> list:
     ]
 
 
-def _user_key(config) -> Optional[str]:
+def _resolved(config):
+    """This turn's (route, key) pair from the run config, or None (then get_v3_llm looks it up)."""
     turn_key = turn_key_from(config)
-    return turn_key.reveal() if turn_key is not None else None
+    return turn_key.resolved() if turn_key is not None else None
 
 
 class AgentNodes:
@@ -187,7 +188,7 @@ class AgentNodes:
                     state.get("user_email"),
                     temperature=temperature,
                     max_output_tokens=max_output_tokens,
-                    user_key=_user_key(config),
+                    resolved=_resolved(config),
                 )
             else:
                 llm = get_llm(
@@ -267,7 +268,7 @@ class AgentNodes:
             if byok_only:
                 # V3: the chat's own model on the user's key; SUMMARY_MODEL_NAME is a server key.
                 model = state.get("model")
-                llm = get_v3_llm(model, state.get("user_email"), user_key=_user_key(config))
+                llm = get_v3_llm(model, state.get("user_email"), resolved=_resolved(config))
             else:
                 model = get_summary_model_name(state.get("model"))
                 llm = get_llm(model, user_id=user_id)

@@ -47,7 +47,7 @@ def env(monkeypatch):
     monkeypatch.setattr(chat, "_init_fork_if_needed", rec)
     # These tests are about the card gate; the key check has its own tests below.
     monkeypatch.setattr(chat, "_v3_turn_key",
-                        lambda msg, email: TurnKey(v3_route(msg.model_name).provider, "gate-test-key"))
+                        lambda msg, email: TurnKey(v3_route(msg.model_name), "gate-test-key"))
     return SimpleNamespace(captured=captured, forks=forks)
 
 
@@ -518,7 +518,8 @@ def test_v3_summary_uses_chat_model_on_user_key(api, db, user, byok, monkeypatch
     real = an.get_v3_llm
 
     def recording(model_id, user_email, *a, **k):
-        spy.append({"model": model_id, "user_key": k.get("user_key")})
+        route, key = k.get("resolved") or (None, None)
+        spy.append({"model": model_id, "provider": getattr(route, "provider", None), "key": key})
         return real(model_id, user_email, *a, **k)
 
     monkeypatch.setattr(an, "get_v3_llm", recording)
@@ -529,7 +530,7 @@ def test_v3_summary_uses_chat_model_on_user_key(api, db, user, byok, monkeypatch
     r = _ask(api, c, bid)
     assert r.status_code == 200, r.text
     assert len(spy) == 2  # the answer, then the rolling summary
-    assert all(s == {"model": GPT, "user_key": byok.user_key} for s in spy)
+    assert all(s == {"model": GPT, "provider": "openai", "key": byok.user_key} for s in spy)
     assert len(byok.wire.calls) == 2
     assert {call["auth"] for call in byok.wire.calls} == {f"Bearer {byok.user_key}"}
     assert {call["model"] for call in byok.wire.calls} == {"gpt-5-mini"}  # not SUMMARY_MODEL_NAME

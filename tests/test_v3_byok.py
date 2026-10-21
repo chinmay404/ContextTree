@@ -474,9 +474,43 @@ def test_no_row_is_still_missing_key(keys):
 
 
 def test_get_v3_llm_accepts_a_resolved_key_without_a_lookup(keys):
-    llm = v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test", user_key="user-resolved")
+    resolved = (v3_llm.V3_ROUTES["openai/gpt-5-mini"], "user-resolved")
+    llm = v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test", resolved=resolved)
     assert llm.openai_api_key.get_secret_value() == "user-resolved"
     assert keys.calls == []
+
+
+def test_a_bare_key_cannot_be_passed_without_its_route():
+    import inspect
+    assert "user_key" not in inspect.signature(v3_llm.get_v3_llm).parameters
+
+
+def test_resolved_key_for_another_provider_is_refused_before_a_client(keys, wire, monkeypatch):
+    built = []
+    monkeypatch.setattr(v3_llm, "_build_client", lambda *a, **k: built.append(a))
+    resolved = v3_llm.v3_require_key("anthropic/claude-sonnet-4-20250514", "me@example.test")
+    with pytest.raises(v3_llm.KeyMismatchError) as err:
+        v3_llm.get_v3_llm("openai/gpt-5-mini", "me@example.test", resolved=resolved)
+    assert "user-anthropic" not in str(err.value)
+    assert built == [] and wire == []
+
+
+def test_resolved_legacy_id_on_the_same_provider_is_accepted(keys):
+    resolved = v3_llm.v3_require_key("openai/gpt-oss-120b", "me@example.test")  # groq
+    llm = v3_llm.get_v3_llm("meta-llama/llama-4-maverick-17b-128e-instruct", "me@example.test",
+                            resolved=resolved)
+    assert llm.groq_api_key.get_secret_value() == "user-groq"
+
+
+def test_groq_requests_keep_a_user_agent(keys, wire):
+    model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
+    _invoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
+    _ainvoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
+    assert len(wire) >= 2
+    for req in wire:
+        assert req.url.host == "api.groq.com"
+        assert req.headers.get("user-agent"), "the User-Agent was stripped"
+        assert req.headers.get("authorization") == "Bearer user-groq"
 
 
 # The strict store lookup itself, against the local test DB.
@@ -560,3 +594,19 @@ def test_strict_lookup_raises_when_the_db_is_unreachable(monkeypatch):
     monkeypatch.delenv("DATABASE_URL")
     with pytest.raises(KeyStoreUnavailableError):
         fetch_user_provider_api_key("me@example.test", "openai")
+
+
+def test_turn_key_never_prints_pickles_or_checkpoints_the_key():
+    import copy
+    import pickle
+
+    from langgraph.checkpoint.base import get_checkpoint_metadata
+
+    tk = v3_llm.TurnKey(v3_llm.V3_ROUTES["openai/gpt-5-mini"], "user-secret-xyz")
+    assert "user-secret-xyz" not in repr(tk) + str(tk)
+    assert tk.resolved() == (v3_llm.V3_ROUTES["openai/gpt-5-mini"], "user-secret-xyz")
+    assert pickle.loads(pickle.dumps(tk)).resolved() == (v3_llm.V3_ROUTES["openai/gpt-5-mini"], "")
+    assert copy.deepcopy(tk) is tk
+    config = {"configurable": {v3_llm.TURN_KEY_CONFIG: tk, "thread_id": "t"}}
+    assert v3_llm.TURN_KEY_CONFIG not in get_checkpoint_metadata(config, {})
+    assert v3_llm.turn_key_from(config) is tk
