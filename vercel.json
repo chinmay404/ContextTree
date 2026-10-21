@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["dub1"],
+  "functions": {
+    "main.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,env/**,.venv/**,scripts/**,db/**,.superpowers/**,.github/**,.pytest_cache/**,*.log,**/*.log,**/__pycache__/**,ARCHITECTURE.md,railway.json,render.yaml}"
+    }
+  }
+}

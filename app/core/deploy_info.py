@@ -8,7 +8,8 @@ from typing import Any, Dict
 
 def get_deploy_info() -> Dict[str, Any]:
     info: Dict[str, Any] = {
-        "sha": os.getenv("APP_BUILD_SHA") or "",
+        # VERCEL_GIT_COMMIT_SHA: set by Vercel on Git deployments.
+        "sha": os.getenv("APP_BUILD_SHA") or os.getenv("VERCEL_GIT_COMMIT_SHA") or "",
         "deployed_at": os.getenv("APP_BUILD_AT") or "",
         "workflow": os.getenv("APP_BUILD_WORKFLOW") or "",
         "run_id": os.getenv("APP_BUILD_RUN_ID") or "",

@@ -11,10 +11,8 @@ pydantic-settings
 # For production
 gunicorn>=20.1.0
 
-# For testing
-pytest>=7.3.1
+# HTTP client (oEmbed, page fetch). pytest / pytest-cov: requirements-dev.txt
 httpx>=0.24.0
-pytest-cov>=4.1.0
 
 # Optional database
 # sqlalchemy>=2.0.0

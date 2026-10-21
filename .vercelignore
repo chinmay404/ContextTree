@@ -1,0 +1,13 @@
+# Never upload local secrets, virtualenvs or dev-only files with `vercel deploy`.
+.env
+.env.*
+env/
+.venv/
+venv/
+tests/
+.pytest_cache/
+.superpowers/
+__pycache__/
+*.log
+DB.txt
+*.pem
