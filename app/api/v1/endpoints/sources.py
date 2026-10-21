@@ -1,4 +1,9 @@
-"""Source routes: file upload, link (web / YouTube) and raw download (contract rows 15-17)."""
+"""Source routes: file upload, link (web / YouTube), ingest and raw download (contract rows 15-17).
+
+Upload and link only create the card (202, `processing`). Ingest runs inside
+POST /boards/{b}/cards/{id}/ingest, which the client calls right after: on Vercel, work after
+a response is best effort (contract amendment 2026-10-21), so nothing runs in BackgroundTasks.
+"""
 from __future__ import annotations
 
 import re
@@ -7,14 +12,14 @@ from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 from app.agent.helpers.web_fetch import host_is_public
 from app.agent.ingest import ingest_file_source, ingest_web_source
 from app.agent.store import card_store
-from app.agent.store.board_store import require_board, store
+from app.agent.store.board_store import fetch_card_json, require_board, require_card, store
 from app.api.auth import get_current_user_id
 from app.api.errors import ApiError
 from app.api.limiter import BOARD_RATE, limiter, user_key
@@ -119,7 +124,7 @@ def _create_file_card(user_id, board_id, card_id, x, y, desk_id, desc, name, cty
 @router.post("/boards/{board_id}/sources/file")
 @limiter.limit(BOARD_RATE, key_func=user_key)
 async def api_upload_file(
-    board_id: str, request: Request, background_tasks: BackgroundTasks,
+    board_id: str, request: Request,
     id: str = Form(pattern=ID_PATTERN),
     file: UploadFile = File(...),
     x: float = Form(),
@@ -139,17 +144,15 @@ async def api_upload_file(
     if len(name) > MAX_FILE_NAME_CHARS:  # keep the extension, trim the stem
         name = name[:MAX_FILE_NAME_CHARS - len(ext) - 1] + "." + ext
     ctype = (file.content_type or MIME_BY_EXT[ext])[:100]
-    card, created, email = await run_in_threadpool(
+    card, created, _email = await run_in_threadpool(
         _create_file_card, user_id, board_id, id, x, y, deskId, desc, name, ctype, raw, source_type, status)
-    if created and card["status"] == "processing":
-        background_tasks.add_task(ingest_file_source, id, email)
     return JSONResponse(card, status_code=202 if created else 200)
 
 
 @router.post("/boards/{board_id}/sources/link")
 @limiter.limit(BOARD_RATE, key_func=user_key)
 def api_add_link(
-    board_id: str, body: LinkCreate, request: Request, background_tasks: BackgroundTasks,
+    board_id: str, body: LinkCreate, request: Request,
     user_id: str = Depends(get_current_user_id),
 ):
     email = store.email_for(user_id)
@@ -186,9 +189,62 @@ def api_add_link(
                            desk_id=body.desk_id, status=status, data=data)
     with store.tx() as cur:
         card, created = card_store.create_card(cur, email, board_id, card_body)
-    if created and card["status"] == "processing":
-        background_tasks.add_task(ingest_web_source, body.id, email)
     return JSONResponse(card, status_code=202 if created else 200)
+
+
+# ── Ingest (inside the request) ───────────────────────────────────────────────
+
+INGEST_LEASE_SECONDS = 300  # Vercel Hobby's per-request limit; an older lease is a dead run
+_INGEST_KIND = {"pdf": "file", "doc": "file", "csv": "file", "web": "web"}
+
+
+def claim_ingest_lease(cur, card_id: str, user_email: str) -> bool:
+    """Stamp the lease on a `processing` source with no live lease, in one statement.
+
+    True when this call owns the ingest; False when another call started it < 300 s ago (or
+    the card is no longer processing). A missing or malformed stamp counts as expired.
+    """
+    cur.execute(
+        "UPDATE nodes SET data = coalesce(data, '{}'::jsonb) "
+        "|| jsonb_build_object('ingestLease', extract(epoch from clock_timestamp())), "
+        "updated_at = now() "
+        "WHERE id = %s AND user_email = %s AND kind = 'source' AND status = 'processing' "
+        "AND deleted_at IS NULL AND CASE WHEN jsonb_typeof(data->'ingestLease') = 'number' "
+        "THEN (data->>'ingestLease')::float8 < extract(epoch from clock_timestamp()) - %s "
+        "ELSE true END RETURNING id",
+        (card_id, user_email, INGEST_LEASE_SECONDS),
+    )
+    return cur.fetchone() is not None
+
+
+@router.post("/boards/{board_id}/cards/{card_id}/ingest")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_ingest_source(
+    board_id: str, card_id: str, request: Request, user_id: str = Depends(get_current_user_id),
+):
+    """Run a source's ingest inside this request and return the card with its final status.
+
+    A sync route, so FastAPI runs it in the threadpool; ingest itself never holds a pooled
+    connection across an embedding or LLM call. ready / failed / soon (and notes) return as is.
+    """
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        require_board(cur, board_id, email)
+        card = require_card(cur, board_id, card_id, email)
+        if card["kind"] != "source":
+            raise ApiError(400, "invalid", "only sources are ingested")
+        kind = _INGEST_KIND.get(card["source_type"])
+        if card["status"] != "processing" or kind is None:
+            return fetch_card_json(cur, board_id, card_id)
+        claimed = claim_ingest_lease(cur, card_id, email)
+    if not claimed:
+        return JSONResponse({"status": "processing"}, status_code=202)
+    if kind == "web":
+        ingest_web_source(card_id, email)
+    else:
+        ingest_file_source(card_id, email)
+    with store.tx() as cur:
+        return fetch_card_json(cur, board_id, card_id)
 
 
 @router.get("/files/{card_id}/raw")

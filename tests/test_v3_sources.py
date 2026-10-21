@@ -30,7 +30,7 @@ def link(api, b, url, **kw):
     return api.post(f"/boards/{b}/sources/link", json={"id": new_id("c"), "url": url, "x": 0, "y": 0, **kw})
 
 
-def test_upload_pdf_202_processing_and_schedules_ingest(api, rec):
+def test_upload_pdf_202_processing_without_starting_ingest(api, rec):
     b = make_board(api)["id"]
     r = up(api, b, "Survey.pdf", b"%PDF-1.4 ...")
     assert r.status_code == 202
@@ -38,7 +38,7 @@ def test_upload_pdf_202_processing_and_schedules_ingest(api, rec):
     assert (c["kind"], c["sourceType"], c["status"]) == ("source", "pdf", "processing")
     assert c["data"]["fileName"] == "Survey.pdf" and c["data"]["title"] == "Survey"
     assert c["data"]["meta"] == "PDF · 12 B" and c["data"]["fileSize"] == 12
-    assert rec.file_calls == [(c["id"], api.email)]
+    assert rec.file_calls == []  # the client calls POST .../ingest next (Vercel amendment)
 
 
 def test_upload_image_soon_no_ingest(api, rec):
@@ -81,7 +81,7 @@ def test_upload_idempotent_200(api, rec, db):
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM external_files WHERE node_id = %s", (cid,))
         assert cur.fetchone()[0] == 1
-    assert rec.file_calls == [(cid, api.email)]
+    assert rec.file_calls == []
 
 
 def test_upload_desk_must_be_live_chat_400(api, db, rec):
@@ -128,13 +128,13 @@ def test_parse_youtube_id_forms():
     assert p("https://evil.com/watch?v=abcdefghijk") is None
 
 
-def test_link_web_processing_schedules_ingest(api, monkeypatch, rec):
+def test_link_web_processing_without_starting_ingest(api, monkeypatch, rec):
     b = make_board(api)["id"]
     monkeypatch.setattr(sources, "host_is_public", lambda h: True)
     r = link(api, b, "https://harbor.dev/blog")
     c = r.json()
     assert r.status_code == 202 and (c["sourceType"], c["status"]) == ("web", "processing")
-    assert c["data"]["title"] == "harbor.dev" and rec.web_calls == [(c["id"], api.email)]
+    assert c["data"]["title"] == "harbor.dev" and rec.web_calls == []
 
 
 def test_link_private_host_400(api, rec):
@@ -157,7 +157,7 @@ def test_link_idempotent_no_second_ingest(api, monkeypatch, rec):
     body = {"id": new_id("c"), "url": "https://harbor.dev/x", "x": 0, "y": 0}
     assert api.post(f"/boards/{b}/sources/link", json=body).status_code == 202
     assert api.post(f"/boards/{b}/sources/link", json=body).status_code == 200
-    assert len(rec.web_calls) == 1
+    assert rec.web_calls == []
 
 
 def test_raw_returns_bytes_owner_only(api, db, rec):
