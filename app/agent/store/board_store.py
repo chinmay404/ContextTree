@@ -228,6 +228,68 @@ def get_board_json(cur, board_id: str) -> dict:
     }
 
 
+# ── Board previews (GET /boards) ──────────────────────────────────────────────
+
+PREVIEW_BOARDS = 24          # only the most recently updated boards carry a preview
+PREVIEW_NAME_CHARS = 60
+
+
+def board_previews(cur, board_ids: list[str], user_email: str) -> dict[str, dict]:
+    """{board_id: {"cards": [...], "edges": [...]}}: positions and links only, two queries.
+
+    Cards are the owner's live cards minus members of a live pile; desk/pile ids linked to a
+    deleted card read as NULL. Chats carry their name (first 60 chars); nothing else from
+    `data`, no messages and no summaries. Edges are the live wire/answer edges with both ends
+    among the preview cards.
+    """
+    if not board_ids:
+        return {}
+    cur.execute(
+        "SELECT n.id, n.canvas_id, n.kind, n.source_type, n.x, n.y, n.parent_node_id, "
+        f"{LIVE_DESK_ID} AS desk_id, "
+        f"CASE WHEN n.kind = 'chat' THEN left(n.data->>'name', {PREVIEW_NAME_CHARS}) END AS name "
+        f"FROM nodes n {CARD_LINK_JOINS} "
+        "WHERE n.canvas_id = ANY(%s) AND n.user_email = %s AND n.kind IS NOT NULL "
+        f"AND n.deleted_at IS NULL AND {LIVE_PILE_ID} IS NULL "
+        "ORDER BY n.created_at, n.id",
+        (list(board_ids), user_email),
+    )
+    previews: dict[str, dict] = {bid: {"cards": [], "edges": []} for bid in board_ids}
+    board_of: dict[str, str] = {}
+    for r in cur.fetchall():
+        card = {
+            "id": r["id"],
+            "kind": r["kind"],
+            "sourceType": r["source_type"],
+            "x": r["x"] if r["x"] is not None else 0,
+            "y": r["y"] if r["y"] is not None else 0,
+            "deskId": r["desk_id"],
+            "pileId": None,  # a member of a live pile is not in the preview at all
+            "parentId": r["parent_node_id"],
+        }
+        if r["kind"] == "chat" and r["name"] is not None:
+            card["name"] = r["name"]
+        previews[r["canvas_id"]]["cards"].append(card)
+        board_of[r["id"]] = r["canvas_id"]
+    if not board_of:
+        return previews
+    card_ids = list(board_of)
+    cur.execute(
+        "SELECT e.canvas_id, e.kind, e.from_node, e.to_node FROM edges e "
+        "WHERE e.canvas_id = ANY(%s) AND e.user_email = %s AND e.deleted_at IS NULL "
+        "AND e.kind IN ('wire', 'answer') "
+        "AND e.from_node = ANY(%s) AND e.to_node = ANY(%s) "
+        "ORDER BY e.created_at, e.id",
+        (list(board_ids), user_email, card_ids, card_ids),
+    )
+    for r in cur.fetchall():
+        if board_of[r["from_node"]] != r["canvas_id"] or board_of[r["to_node"]] != r["canvas_id"]:
+            continue  # both ends on this board's preview
+        previews[r["canvas_id"]]["edges"].append(
+            {"kind": r["kind"], "from": r["from_node"], "to": r["to_node"]})
+    return previews
+
+
 # ── Write helpers ─────────────────────────────────────────────────────────────
 
 def lock_board(cur, board_id: str) -> None:

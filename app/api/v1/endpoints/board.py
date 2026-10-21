@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.agent.store.board_store import (
+    PREVIEW_BOARDS,
+    board_previews,
     fail_stale_sources,
     get_board_json,
     require_board,
@@ -33,17 +35,19 @@ def api_list_boards(request: Request, user_id: str = Depends(get_current_user_id
             (email,),
         )
         rows = cur.fetchall()
-    return {
-        "boards": [
-            {
-                "id": r["id"],
-                "title": r["title"],
-                "updatedAt": r["updated_at"].isoformat(),
-                "cardCount": int(r["card_count"]),
-            }
-            for r in rows
-        ]
-    }
+        previews = board_previews(cur, [r["id"] for r in rows[:PREVIEW_BOARDS]], email)
+    boards = []
+    for r in rows:
+        item = {
+            "id": r["id"],
+            "title": r["title"],
+            "updatedAt": r["updated_at"].isoformat(),
+            "cardCount": int(r["card_count"]),
+        }
+        if r["id"] in previews:
+            item["preview"] = previews[r["id"]]
+        boards.append(item)
+    return {"boards": boards}
 
 
 @router.post("")
