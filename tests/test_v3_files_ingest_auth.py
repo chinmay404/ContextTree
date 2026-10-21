@@ -138,3 +138,42 @@ def test_node_updates_scoped_by_user_email(db, user):
     assert st.update_node_data_content(node, "x", user) is True
     assert st.update_node_processing_error(node, "boom", user) is True
     assert st.update_node_data_content(node, "y") is True  # V2 call shape unchanged
+
+
+# ── Vercel (contract amendment 2026-10-21): V2 ingest runs inside the request ──
+
+def test_ingest_runs_inside_the_request_not_in_background_tasks():
+    import inspect
+    assert not any(p.annotation.__name__ == "BackgroundTasks"
+                   for p in inspect.signature(files.ingest_file).parameters.values()
+                   if isinstance(p.annotation, type))
+
+
+def test_ingest_is_done_off_the_event_loop_before_the_202(api, db, monkeypatch):
+    import asyncio
+    seen = []
+
+    def process(req):
+        try:
+            asyncio.get_running_loop()
+            seen.append("on the event loop")
+        except RuntimeError:
+            seen.append("worker thread")
+
+    monkeypatch.setattr(files, "process_file_background", process)
+    fid = new_id("file")
+    _seed_file(db, api.email, fid)
+    r = api.post("/files/ingest", json={"file_id": fid})
+    assert r.status_code == 202 and r.json() == {"status": "processing_started", "file_id": fid}
+    assert seen == ["worker thread"]
+
+
+def test_an_ingest_crash_keeps_the_same_202(api, db, monkeypatch):
+    def boom(req):
+        raise RuntimeError("loader exploded")
+
+    monkeypatch.setattr(files, "process_file_background", boom)
+    fid = new_id("file")
+    _seed_file(db, api.email, fid)
+    r = api.post("/files/ingest", json={"file_id": fid})
+    assert r.status_code == 202 and r.json() == {"status": "processing_started", "file_id": fid}

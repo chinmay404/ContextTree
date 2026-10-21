@@ -5,7 +5,7 @@ import tempfile
 import os
 from typing import List, Optional, Tuple
 from fastapi.concurrency import run_in_threadpool
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.api.auth import get_current_user_id
@@ -202,11 +202,15 @@ def _owned_file_target(file_id: str, email: str):
 @router.post("/ingest", status_code=status.HTTP_202_ACCEPTED)
 async def ingest_file(
     request: IngestRequest,
-    background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
 ):
     """
-    Triggers background ingestion of a file already stored in DB.
+    Ingests a file already stored in the DB, inside this request, then answers 202 as before.
+
+    On Vercel, work after a response is best effort (contract amendment 2026-10-21), so the
+    processing runs before the response, in the threadpool (it blocks on DB, loaders and
+    embeddings). The response shape is unchanged; it just arrives once the file is processed.
+    Failures are recorded on the node by process_file_background and never change the 202.
     """
     logger.info(f"Ingest request received for file_id: {request.file_id} user: {user_id}")
     email = board_store.resolve_user_email(user_id)
@@ -217,5 +221,8 @@ async def ingest_file(
     request.node_id = stored["node_id"]
     request.canvas_id = stored["canvas_id"]
     request.user_email = email
-    background_tasks.add_task(process_file_background, request)
+    try:
+        await run_in_threadpool(process_file_background, request)
+    except Exception as e:  # noqa: BLE001 - same 202 as when this ran in the background
+        logger.error(f"Inline ingestion failed for file {request.file_id}: {type(e).__name__}")
     return {"status": "processing_started", "file_id": request.file_id}
