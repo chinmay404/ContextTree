@@ -214,3 +214,11 @@ def test_format_page_snippets_labels():
         [{"title": "T", "url": "http://u", "text": "body"}]
     )
     assert lines == ["[page 1 | T | http://u] body"]
+
+
+def test_format_page_snippets_neutralise_citation_markers():
+    """A fetched page cannot pose as one of this turn's passage numbers (app-shell plan Task 9)."""
+    [line] = format_page_snippets(
+        [{"title": "Report [2]", "url": "https://example.test/p", "text": "see [3] and [1, 2]"}])
+    assert line.startswith("[page 1 | ")
+    assert line == "[page 1 | Report (2) | https://example.test/p] see (3) and (1, 2)"

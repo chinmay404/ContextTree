@@ -64,3 +64,18 @@ def test_search_web_failure_is_silent_empty():
 
 def test_search_web_empty_query_short_circuits():
     assert search_web("   ") == []
+
+
+def test_format_web_snippets_neutralise_citation_markers():
+    """A web hit cannot pose as one of this turn's passage numbers (app-shell plan Task 9)."""
+    rows = [{"title": "Report [2]", "url": "https://example.test/a", "snippet": "see [3] and [1, 2]"}]
+    [line] = format_web_snippets(rows, clip_chars=600)
+    assert line.startswith("[web 1 | ")
+    assert line == "[web 1 | Report (2) | https://example.test/a] see (3) and (1, 2)"
+
+
+def test_format_web_snippets_neutralise_after_clipping():
+    rows = [{"title": "T", "url": "u", "snippet": "a [7] " + "x" * 50}]
+    [line] = format_web_snippets(rows, clip_chars=20)
+    assert line.startswith("[web 1 | T | u] a (7) ") and line.endswith("…")
+    assert "[7]" not in line

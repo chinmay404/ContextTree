@@ -26,6 +26,7 @@ from html.parser import HTMLParser
 from typing import List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
+from app.agent.citations import neutralise_markers
 from app.core.logger import logger
 
 MAX_FETCH_URLS = 2
@@ -212,9 +213,13 @@ def fetch_pages(urls: List[str], max_chars: int = DEFAULT_MAX_CHARS) -> List[dic
 
 
 def format_page_snippets(pages: List[dict]) -> List[str]:
-    """Label fetched pages like other context: [page N | title | url] text."""
+    """Label fetched pages like other context: [page N | title | url] text.
+
+    Page text arrives already clipped (fetch_pages). Bracketed numbers in the title and text
+    become (n), so a page cannot pose as one of this turn's passage numbers; the label stays.
+    """
     return [
-        f"[page {idx + 1} | {p.get('title') or 'untitled'} | {p.get('url') or 'no-url'}] "
-        f"{p.get('text', '')}"
+        f"[page {idx + 1} | {neutralise_markers(p.get('title') or 'untitled')} | "
+        f"{p.get('url') or 'no-url'}] {neutralise_markers(p.get('text', ''))}"
         for idx, p in enumerate(pages)
     ]

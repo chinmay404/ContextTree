@@ -12,6 +12,7 @@ rate-limit, import) logs a warning and returns an empty list.
 
 from typing import List
 
+from app.agent.citations import neutralise_markers
 from app.core.logger import logger
 
 
@@ -45,13 +46,18 @@ def search_web(query: str, max_results: int = 3, timeout: int = 6) -> List[dict]
 
 
 def format_web_snippets(results: List[dict], clip_chars: int) -> List[str]:
-    """Label web hits like file chunks: [web N | title | url] snippet."""
+    """Label web hits like file chunks: [web N | title | url] snippet.
+
+    Bracketed numbers in the title and snippet become (n) after clipping, so a hit cannot
+    pose as one of this turn's passage numbers. The [web N | …] label stays as it is.
+    """
     lines: List[str] = []
     for idx, r in enumerate(results):
         snippet = str(r.get("snippet") or "").strip()
         if len(snippet) > clip_chars:
             snippet = f"{snippet[: clip_chars - 1].rstrip()}…"
+        title = neutralise_markers(r.get("title") or "untitled")
         lines.append(
-            f"[web {idx + 1} | {r.get('title') or 'untitled'} | {r.get('url') or 'no-url'}] {snippet}"
+            f"[web {idx + 1} | {title} | {r.get('url') or 'no-url'}] {neutralise_markers(snippet)}"
         )
     return lines
