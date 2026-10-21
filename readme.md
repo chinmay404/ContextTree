@@ -3,6 +3,8 @@
 BASE URL : https://v0-context-tree.vercel.app/
 Link : https://chinmaypisal.notion.site/
 
+**Deploying the engine:** see [DEPLOY-VERCEL.md](DEPLOY-VERCEL.md) (Vercel, Hobby plan).
+
 
 is a React-based, interactive canvas application designed to enhance chatbot conversations by allowing users to create and navigate sub-conversations (branches) without losing context in the main discussion.
 
