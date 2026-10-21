@@ -690,6 +690,10 @@ class PostgresConversationStore:
         Atomically increment today's message count for a verified user and
         return the new count. One statement — safe across workers.
         """
+        return self.charge_daily_quota(user_key)[0]
+
+    def charge_daily_quota(self, user_key: str):
+        """increment_daily_quota, also returning the day charged, for a later refund."""
         with self._get_conn() as conn:
             cur = conn.cursor()
             cur.execute(
@@ -699,11 +703,28 @@ class PostgresConversationStore:
                 ON CONFLICT (user_key, day)
                 DO UPDATE SET msg_count = quotas.msg_count + 1,
                               updated_at = now()
-                RETURNING msg_count
+                RETURNING msg_count, day
                 """,
                 (user_key,),
             )
-            return int(cur.fetchone()[0])
+            count, day = cur.fetchone()
+            return int(count), day
+
+    def refund_daily_quota(self, user_key: str, day) -> None:
+        """
+        Give back one message charged on `day` (a turn that used no model answer).
+        Called at most once per charge, so the count never drops below its value
+        before that turn; the floor at 0 is a second guard.
+        """
+        with self._get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE quotas SET msg_count = msg_count - 1, updated_at = now()
+                WHERE user_key = %s AND day = %s AND msg_count > 0
+                """,
+                (user_key, day),
+            )
 
     def get_thread_owner(self, thread_id: str) -> Optional[str]:
         """

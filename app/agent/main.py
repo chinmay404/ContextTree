@@ -1,7 +1,8 @@
 
 from langgraph.graph import StateGraph, START, END
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
+import asyncio
 from app.agent.nodes.assistant_node import AgentNodes
 from app.agent.state import State
 from app.agent.prompts.prompt_formation import get_formated_prompt
@@ -752,6 +753,7 @@ class getGraphResponse():
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
         byok_only: bool = False,
+        on_key_rejected: Optional[Callable[[], None]] = None,
     ):
         try:
             (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
@@ -894,6 +896,8 @@ class getGraphResponse():
             # V3: the provider refused the user's key. One coded frame, no [DONE], nothing stored
             # (neither the question nor an answer): the board re-asks once a key is saved.
             logger.warning("V3 turn on thread %s: %s refused the user's key", thread_id, e.provider)
+            if on_key_rejected is not None:  # the route refunds the daily message (blocking DB call)
+                await asyncio.to_thread(on_key_rejected)
             yield f"data: {json.dumps(key_rejected_frame(e.provider))}\n\n"
         except Exception as e:
             logger.error(f"get_stream_response : {repr(e)}")

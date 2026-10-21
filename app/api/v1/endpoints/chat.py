@@ -125,18 +125,30 @@ _user_key = user_key  # canonical per-user key lives in app.api.limiter
 
 # ── Daily quota (durable, Postgres-backed — survives restarts/workers) ────────
 
-def _enforce_daily_quota(active_graph, user_id: str) -> None:
+def _enforce_daily_quota(active_graph, user_id: str):
+    """Charge one daily message; returns the charge (user, day) for a refund, or None."""
     try:
-        count = active_graph.mongo_store.increment_daily_quota(user_id)
+        count, day = active_graph.mongo_store.charge_daily_quota(user_id)
     except Exception as e:
         # Quota accounting must never take chat down; log and allow.
         logger.error(f"Quota accounting failed (allowing request): {e}")
-        return
+        return None
     if count > settings.DAILY_MESSAGE_LIMIT:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Daily message limit reached ({settings.DAILY_MESSAGE_LIMIT}/day). Resets at midnight UTC.",
         )
+    return user_id, day
+
+
+def _refund_daily_quota(active_graph, charge) -> None:
+    """Give back a turn's daily message (V3: the provider refused the user's key). Never raises."""
+    if charge is None:
+        return
+    try:
+        active_graph.mongo_store.refund_daily_quota(*charge)
+    except Exception as e:
+        logger.error("Quota refund failed: %s", type(e).__name__)
 
 
 # ── Ownership gate (tenancy: the launch-blocker check) ────────────────────────
@@ -579,6 +591,7 @@ async def get_response(
             detail="nodeId (conversation_id) is required",
         )
 
+    charge = None
     try:
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         turn_key: Optional[TurnKey] = None
@@ -587,7 +600,7 @@ async def get_response(
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
         else:
             turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
-        _enforce_daily_quota(active_graph, user_id)
+        charge = _enforce_daily_quota(active_graph, user_id)
 
         if card is None:
             access_error = validate_model_access(chat_message.model_name, user_id)
@@ -623,6 +636,7 @@ async def get_response(
         return {"message": res, "summary": summary or ""}
 
     except KeyRejectedError as e:
+        await run_in_threadpool(_refund_daily_quota, active_graph, charge)
         raise ApiError(400, "key_rejected", e.provider)
     except HTTPException:
         raise
@@ -648,6 +662,7 @@ async def stream_response(
             detail="nodeId (conversation_id) is required",
         )
 
+    charge = None
     try:
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         turn_key: Optional[TurnKey] = None
@@ -656,7 +671,7 @@ async def stream_response(
             _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
         else:
             turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
-        _enforce_daily_quota(active_graph, user_id)
+        charge = _enforce_daily_quota(active_graph, user_id)
 
         if card is None:
             access_error = validate_model_access(chat_message.model_name, user_id)
@@ -682,6 +697,7 @@ async def stream_response(
                 regenerate_last_user=chat_message.regenerate_last_user,
                 web_search=chat_message.web_search,
                 byok_only=turn_key is not None,
+                on_key_rejected=lambda: _refund_daily_quota(active_graph, charge),
                 **graph_kw,
             ),
             media_type="text/event-stream",
@@ -689,6 +705,7 @@ async def stream_response(
     except KeyRejectedError as e:
         # The branch-start summary was refused: same SSE frame as a refusal mid-answer.
         logger.warning("V3 turn on %s: %s refused the user's key", chat_message.conversation_id, e.provider)
+        await run_in_threadpool(_refund_daily_quota, active_graph, charge)
         return StreamingResponse(_key_rejected_stream(e.provider), media_type="text/event-stream")
     except HTTPException:
         raise

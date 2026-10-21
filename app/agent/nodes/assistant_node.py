@@ -263,7 +263,10 @@ class AgentNodes:
         byok_only = bool(state.get("byok_only"))
         try:
             from app.core.config import settings
-            prompt = get_formated_summury_prompt(state["messages"], state["summary"])
+            # V3: a refused question (still in the checkpoint) stays out of the stored summary.
+            to_summarise = (_drop_unanswered_questions(state["messages"]) if byok_only
+                            else state["messages"])
+            prompt = get_formated_summury_prompt(to_summarise, state["summary"])
             user_id = self._resolve_state_user_id(state)
             if byok_only:
                 # V3: the chat's own model on the user's key; SUMMARY_MODEL_NAME is a server key.

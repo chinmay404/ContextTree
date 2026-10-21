@@ -699,3 +699,81 @@ def test_v2_turn_unchanged(api, db, user, byok, route, monkeypatch):
     assert "v2 answer" in r.text
     assert seen["access"] == ["z-ai/glm-5.2"] and seen["get_llm"][0] == "z-ai/glm-5.2"
     assert byok.lookups == [] and byok.wire.calls == []
+
+
+# ── Task 7 review follow-ups: the daily quota on key errors, summaries without refused questions ──
+
+def _quota(db, user) -> int:
+    with db.cursor() as cur:
+        cur.execute("SELECT msg_count FROM quotas WHERE user_key = %s AND day = CURRENT_DATE", (user,))
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+
+@pytest.mark.parametrize("route", [STREAM, SYNC])
+def test_v3_missing_key_does_not_use_a_daily_message(api, db, user, byok, route):
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    r = _ask(api, c, bid, model=CLAUDE, route=route)
+    assert r.status_code == 400 and r.json()["error"] == "missing_key"
+    assert _quota(db, user) == 0  # the key is checked before the quota is charged
+
+
+@pytest.mark.parametrize("route", [STREAM, SYNC])
+def test_v3_refused_key_refunds_the_daily_message(api, db, user, byok, route):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    assert _ask(api, c, bid, route=route).status_code == 200  # one answered turn
+    assert _quota(db, user) == 1
+    byok.wire.mode = "reject"
+    r = _ask(api, c, bid, route=route)
+    if route == STREAM:
+        assert _frames(r.text)[-1]["code"] == "key_rejected"
+    else:
+        assert r.status_code == 400 and r.json()["error"] == "key_rejected"
+    assert _quota(db, user) == 1
+
+
+def test_v3_refused_first_turn_refund_never_goes_below_zero(api, db, user, byok):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    byok.wire.mode = "reject"
+    _ask(api, c, bid)
+    _ask(api, c, bid, route=SYNC)
+    assert _quota(db, user) == 0
+
+
+def test_v3_refused_branch_start_summary_refunds_the_daily_message(api, db, user, byok):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    child = _branch_with_history(db, user, bid)
+    byok.wire.mode = "reject"
+    r = _ask(api, child, bid)
+    assert _frames(r.text) == [{"error": "OpenAI turned this key down.", "code": "key_rejected",
+                                "provider": "openai"}]
+    assert _quota(db, user) == 0
+
+
+@pytest.mark.parametrize("byok_only, kept", [(True, False), (False, True)])
+def test_rolling_summary_leaves_out_a_refused_question(monkeypatch, byok_only, kept):
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    import app.agent.nodes.assistant_node as an
+    from tests.v3_support import FakeLLM
+
+    llm = FakeLLM("S")
+    monkeypatch.setattr(an, "get_v3_llm", lambda *a, **k: llm)
+    monkeypatch.setattr(an, "get_llm", lambda *a, **k: llm)
+    state = {
+        "messages": [HumanMessage(content="REFUSED QUESTION", id="m1"),
+                     HumanMessage(content="answered question", id="m2"),
+                     AIMessage(content="the answer", id="a2")],
+        "summary": "", "model": GPT, "user_id": "u@example.com", "byok_only": byok_only,
+    }
+    out = an.AgentNodes(mongo_store=None).summurize(state)
+    assert out["summary"] == "S"
+    prompt = str(llm.calls[0])
+    assert "answered question" in prompt and "the answer" in prompt
+    assert ("REFUSED QUESTION" in prompt) is kept  # V2 (byok_only off) is unchanged
