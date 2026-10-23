@@ -72,6 +72,25 @@ def test_startup_runs_no_migrations():
         assert "migrate" not in (ROOT / path).read_text(encoding="utf-8")
 
 
+def test_logger_imports_on_a_read_only_filesystem(monkeypatch):
+    import importlib
+    import logging
+
+    import app.core.logger as logger_mod
+
+    def read_only(*_a, **_k):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(logging, "FileHandler", read_only)
+    saved = logger_mod.logger.handlers[:]
+    logger_mod.logger.handlers.clear()
+    try:
+        importlib.reload(logger_mod)  # Vercel: /var/task is read-only
+        assert [type(h) for h in logger_mod.logger.handlers] == [logging.StreamHandler]
+    finally:
+        logger_mod.logger.handlers[:] = saved
+
+
 def test_health_reports_the_vercel_commit(monkeypatch):
     from app.core.deploy_info import get_deploy_info
 

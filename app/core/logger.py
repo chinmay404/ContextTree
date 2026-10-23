@@ -19,9 +19,13 @@ if not logger.handlers:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
 
-    file_handler = logging.FileHandler("app.log")
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(formatter)
-
     logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+
+    # Serverless (Vercel) has a read-only filesystem; stdout is captured there.
+    try:
+        file_handler = logging.FileHandler("app.log")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except OSError:
+        pass
