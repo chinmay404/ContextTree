@@ -11,14 +11,16 @@ from urllib.parse import quote
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 from app.agent.helpers.link_preview import (
-    PREVIEW_TIMEOUT_SECONDS, LinkBlocked, LinkUnreachable, fetch_link_preview,
+    PREVIEW_TIMEOUT_SECONDS, LinkBlocked, LinkUnreachable, afetch_link_preview,
 )
+from app.agent.helpers.safe_fetch import DEFAULT_PORTS
 from app.agent.helpers.web_fetch import host_is_public
 from app.agent.ingest import ingest_file_source, ingest_web_source
 from app.agent.store import card_store
@@ -167,6 +169,12 @@ def api_add_link(
         raise ApiError(400, "invalid", "invalid url")
     if u.scheme not in ("http", "https") or not host:
         raise ApiError(400, "invalid", "only http(s) links are supported")
+    try:
+        port = u.port
+    except ValueError:
+        raise ApiError(400, "invalid", "invalid url") from None
+    if port is not None and port != DEFAULT_PORTS[u.scheme]:
+        raise ApiError(400, "invalid", "only links on the standard port are supported")
     url = body.url.strip()
     desc = {"desc": body.desc} if body.desc else {}
 
@@ -254,7 +262,9 @@ def api_ingest_source(
 # ── Link preview for the paste box (contract amendment 2026-10-23) ─────────────
 
 LINK_PREVIEW_RATE = "60/minute"  # per user: each call makes an outbound request
+LINK_PREVIEW_IN_FLIGHT = 2       # per user, per instance
 MAX_PREVIEW_URL_CHARS = 2048
+_previews_in_flight: dict[str, int] = {}
 
 
 def _http_url_or_none(value) -> Optional[str]:
@@ -268,11 +278,13 @@ def _http_url_or_none(value) -> Optional[str]:
 
 @router.get("/links/preview")
 @limiter.limit(LINK_PREVIEW_RATE, key_func=user_key)
-def api_link_preview(request: Request, url: str = "", user_id: str = Depends(get_current_user_id)):
+async def api_link_preview(request: Request, url: str = "", user_id: str = Depends(get_current_user_id)):
     """{url, kind, title, site, description, image} for a pasted link; nothing is stored.
 
-    Blocked addresses are 400 `invalid`, pages that cannot be read are 422 `unreachable`.
-    Neither error carries anything the remote server sent.
+    Blocked addresses are 400 `invalid`, pages that cannot be read are 422 `unreachable`, a
+    third preview while two are running is 429 `busy`. No error carries anything the remote
+    server sent. Async: the fetch never blocks the event loop (DNS runs in a thread) and ends
+    within PREVIEW_TIMEOUT_SECONDS.
     """
     url = (url or "").strip()
     try:
@@ -281,13 +293,30 @@ def api_link_preview(request: Request, url: str = "", user_id: str = Depends(get
         scheme = ""
     if not url or len(url) > MAX_PREVIEW_URL_CHARS or scheme not in ("http", "https"):
         raise ApiError(400, "invalid", "paste an http(s) link")
+    if _previews_in_flight.get(user_id, 0) >= LINK_PREVIEW_IN_FLIGHT:
+        raise ApiError(429, "busy", "too many previews at once")
+    _previews_in_flight[user_id] = _previews_in_flight.get(user_id, 0) + 1
+    try:
+        return await _link_preview(url)
+    finally:
+        left = _previews_in_flight.get(user_id, 1) - 1
+        if left > 0:
+            _previews_in_flight[user_id] = left
+        else:
+            _previews_in_flight.pop(user_id, None)
+
+
+async def _link_preview(url: str) -> dict:
     if parse_youtube_id(url):
-        oembed = fetch_youtube_oembed(url, timeout=PREVIEW_TIMEOUT_SECONDS) or {}
+        oembed: dict = {}
+        with anyio.move_on_after(PREVIEW_TIMEOUT_SECONDS):
+            oembed = await anyio.to_thread.run_sync(
+                fetch_youtube_oembed, url, PREVIEW_TIMEOUT_SECONDS, abandon_on_cancel=True) or {}
         title = " ".join(str(oembed.get("title") or "").split())[:300] or None
         return {"url": url, "kind": "video", "title": title, "site": "YouTube", "description": None,
                 "image": _http_url_or_none(oembed.get("thumbnail_url"))}
     try:
-        preview = fetch_link_preview(url)
+        preview = await afetch_link_preview(url)
     except LinkBlocked:
         raise ApiError(400, "invalid", "this address can't be previewed") from None
     except LinkUnreachable:
