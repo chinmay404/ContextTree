@@ -16,6 +16,9 @@ from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
+from app.agent.helpers.link_preview import (
+    PREVIEW_TIMEOUT_SECONDS, LinkBlocked, LinkUnreachable, fetch_link_preview,
+)
 from app.agent.helpers.web_fetch import host_is_public
 from app.agent.ingest import ingest_file_source, ingest_web_source
 from app.agent.store import card_store
@@ -82,9 +85,10 @@ def parse_youtube_id(url: str) -> Optional[str]:
     return cand if cand and _YT_ID.fullmatch(cand) else None
 
 
-def fetch_youtube_oembed(url: str) -> Optional[dict]:
+def fetch_youtube_oembed(url: str, timeout: float = 5) -> Optional[dict]:
     try:
-        r = httpx.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"}, timeout=5)
+        r = httpx.get("https://www.youtube.com/oembed", params={"url": url, "format": "json"},
+                      timeout=timeout)
         r.raise_for_status()
         j = r.json()
         return {"title": j.get("title"), "thumbnail_url": j.get("thumbnail_url")}
@@ -245,6 +249,50 @@ def api_ingest_source(
         ingest_file_source(card_id, email)
     with store.tx() as cur:
         return fetch_card_json(cur, board_id, card_id)
+
+
+# ── Link preview for the paste box (contract amendment 2026-10-23) ─────────────
+
+LINK_PREVIEW_RATE = "60/minute"  # per user: each call makes an outbound request
+MAX_PREVIEW_URL_CHARS = 2048
+
+
+def _http_url_or_none(value) -> Optional[str]:
+    value = str(value or "").strip()
+    try:
+        scheme = urlparse(value).scheme
+    except ValueError:
+        return None
+    return value if scheme in ("http", "https") and len(value) <= MAX_PREVIEW_URL_CHARS else None
+
+
+@router.get("/links/preview")
+@limiter.limit(LINK_PREVIEW_RATE, key_func=user_key)
+def api_link_preview(request: Request, url: str = "", user_id: str = Depends(get_current_user_id)):
+    """{url, kind, title, site, description, image} for a pasted link; nothing is stored.
+
+    Blocked addresses are 400 `invalid`, pages that cannot be read are 422 `unreachable`.
+    Neither error carries anything the remote server sent.
+    """
+    url = (url or "").strip()
+    try:
+        scheme = urlparse(url).scheme
+    except ValueError:
+        scheme = ""
+    if not url or len(url) > MAX_PREVIEW_URL_CHARS or scheme not in ("http", "https"):
+        raise ApiError(400, "invalid", "paste an http(s) link")
+    if parse_youtube_id(url):
+        oembed = fetch_youtube_oembed(url, timeout=PREVIEW_TIMEOUT_SECONDS) or {}
+        title = " ".join(str(oembed.get("title") or "").split())[:300] or None
+        return {"url": url, "kind": "video", "title": title, "site": "YouTube", "description": None,
+                "image": _http_url_or_none(oembed.get("thumbnail_url"))}
+    try:
+        preview = fetch_link_preview(url)
+    except LinkBlocked:
+        raise ApiError(400, "invalid", "this address can't be previewed") from None
+    except LinkUnreachable:
+        raise ApiError(422, "unreachable", "couldn't read this page") from None
+    return {"url": url, "kind": "web", **preview}
 
 
 @router.get("/files/{card_id}/raw")
