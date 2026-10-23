@@ -35,6 +35,8 @@ MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
 DEFAULT_MAX_CHARS = 3500
 _ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml", "text/plain")
 _URL_RE = re.compile(r"https?://[^\s<>\"'\)\]\}]+", re.IGNORECASE)
+# NUL and other control characters (Postgres rejects NUL in text; none of them is readable).
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SKIP_TAGS = {"script", "style", "noscript", "template", "svg", "iframe", "head"}
 
 
@@ -145,10 +147,15 @@ def fetch_url_content(
     except Exception as e:  # noqa: BLE001 - fetching never blocks a turn or an ingest
         logger.warning("URL fetch failed (non-blocking): %s", type(e).__name__)
         return None
+    return _page(got, max_chars)
+
+
+def _page(got: "safe_fetch.Fetched", max_chars: int) -> Optional[dict]:
+    """{url, title, text} from a fetched body, or None when it has no readable text."""
     if not got.matched:
         logger.warning("URL fetch refused (content-type %s)", got.content_type)
         return None
-    title, text = _extract_text(got.content_type, got.text())
+    title, text = _extract_text(got.content_type, _CONTROL.sub(" ", got.text()))
     text = _clip(text, max_chars)
     if not text:
         return None
@@ -156,12 +163,20 @@ def fetch_url_content(
 
 
 def fetch_pages(urls: List[str], max_chars: int = DEFAULT_MAX_CHARS) -> List[dict]:
-    """Fetch up to MAX_FETCH_URLS urls; failures are silently dropped."""
+    """Fetch up to MAX_FETCH_URLS urls side by side under one FETCH_TIMEOUT_SECONDS deadline;
+    failures are silently dropped."""
+    try:
+        results = safe_fetch.fetch_many(urls[:MAX_FETCH_URLS], max_bytes=MAX_DOWNLOAD_BYTES,
+                                        timeout=FETCH_TIMEOUT_SECONDS, accept_types=_ALLOWED_CONTENT_TYPES)
+    except Exception as e:  # noqa: BLE001 - fetching never blocks a turn
+        logger.warning("URL fetch failed (non-blocking): %s", type(e).__name__)
+        return []
     pages: List[dict] = []
-    for u in urls[:MAX_FETCH_URLS]:
-        page = fetch_url_content(u, max_chars=max_chars)
-        if page:
-            pages.append(page)
+    for got in results:
+        if isinstance(got, safe_fetch.Fetched):
+            page = _page(got, max_chars)
+            if page:
+                pages.append(page)
     return pages
 
 

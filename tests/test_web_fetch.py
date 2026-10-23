@@ -247,3 +247,65 @@ def test_format_page_snippets_neutralise_citation_markers():
         [{"title": "Report [2]", "url": "https://example.test/p", "text": "see [3] and [1, 2]"}])
     assert line.startswith("[page 1 | ")
     assert line == "[page 1 | Report (2) | https://example.test/p] see (3) and (1, 2)"
+
+
+# ── NUL and control characters never reach stored text (Postgres rejects NUL) ──
+
+def test_fetch_strips_nul_and_control_characters(fake_httpx):
+    import gzip
+    body = gzip.compress(b"<html><head><title>T\x00itle\x1b</title></head><body><p>a\x00b\x07c</p></body></html>")
+    fake_httpx.routes["http://8.8.8.8/nul"] = respond(
+        headers={"content-type": "text/html", "content-encoding": "gzip"}, body=body)
+    page = fetch_url_content("http://8.8.8.8/nul")
+    assert page is not None
+    assert page["text"] == "a b c" and page["title"] == "T itle"
+
+
+def test_the_gzip_probe_page_stores_no_nul(fake_httpx):
+    import gzip
+    probe = gzip.compress(b"<html><head><title>x</title></head>" + b"\0" * (4 * 1024 * 1024), 9)
+    fake_httpx.routes["http://8.8.8.8/probe"] = respond(
+        headers={"content-type": "text/html", "content-encoding": "gzip"}, body=probe)
+    page = fetch_url_content("http://8.8.8.8/probe")
+    assert page is None or ("\x00" not in page["text"] and "\x00" not in page["title"])
+
+
+# ── pasted pages are fetched together, under one deadline ──
+
+def test_two_pages_are_fetched_concurrently(monkeypatch):
+    import asyncio
+    import time
+
+    from app.agent.helpers import web_fetch
+
+    async def handle(self, request):
+        await asyncio.sleep(1.5 if request.url.path == "/slow" else 1.0)
+        return httpx.Response(200, headers={"content-type": "text/plain"},
+                              content=_stream(request.url.path.encode()), request=request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    started = time.monotonic()
+    pages = web_fetch.fetch_pages(["http://8.8.8.8/one", "http://9.9.9.9/slow"])
+    took = time.monotonic() - started
+    assert [p["text"] for p in pages] == ["/one", "/slow"]
+    assert took < 2.3, took  # 1.0 s and 1.5 s side by side, not 2.5 s in a row
+
+
+def test_a_page_past_the_deadline_is_dropped_and_the_rest_kept(monkeypatch):
+    import asyncio
+    import time
+
+    from app.agent.helpers import web_fetch
+
+    async def handle(self, request):
+        if request.url.path == "/hang":
+            await asyncio.sleep(10)
+        return httpx.Response(200, headers={"content-type": "text/plain"},
+                              content=_stream(b"fast"), request=request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    monkeypatch.setattr(web_fetch, "FETCH_TIMEOUT_SECONDS", 1)
+    started = time.monotonic()
+    pages = web_fetch.fetch_pages(["http://9.9.9.9/hang", "http://8.8.8.8/fast"])
+    assert [p["text"] for p in pages] == ["fast"]
+    assert time.monotonic() - started < 2.0

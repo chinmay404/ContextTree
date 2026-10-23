@@ -204,6 +204,27 @@ async def afetch(url: str, *, max_bytes: int, timeout: float, accept_types: tupl
         raise FetchFailed() from None
 
 
+async def afetch_many(urls: list, *, max_bytes: int, timeout: float, accept_types: tuple) -> list:
+    """`afetch` for several URLs side by side under ONE deadline; each slot is a Fetched or an
+    exception (FetchBlocked / FetchFailed). A URL still running at the deadline is FetchFailed."""
+    results: list = [FetchFailed() for _ in urls]
+
+    async def one(i: int, url: str) -> None:
+        try:
+            results[i] = await _fetch(url, max_bytes, accept_types)
+        except (FetchBlocked, FetchFailed) as exc:
+            results[i] = exc
+        except Exception as exc:  # noqa: BLE001 - network errors, bad responses
+            logger.info("Guarded fetch failed (%s)", type(exc).__name__)
+            results[i] = FetchFailed()
+
+    with anyio.move_on_after(timeout):
+        async with anyio.create_task_group() as tg:
+            for i, url in enumerate(urls):
+                tg.start_soon(one, i, url)
+    return results
+
+
 # Sync callers (ingest, the chat's page fetch) run the fetch on its own event loop in a worker.
 _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="safe-fetch")
 
@@ -216,3 +237,16 @@ def fetch(url: str, *, max_bytes: int, timeout: float, accept_types: tuple) -> F
         return future.result(timeout=timeout + 1)
     except FutureTimeout:
         raise FetchFailed() from None
+
+
+def fetch_many(urls: list, *, max_bytes: int, timeout: float, accept_types: tuple) -> list:
+    """Blocking `afetch_many`."""
+    if not urls:
+        return []
+    future = _executor.submit(
+        asyncio.run, afetch_many(list(urls), max_bytes=max_bytes, timeout=timeout,
+                                 accept_types=accept_types))
+    try:
+        return future.result(timeout=timeout + 1)
+    except FutureTimeout:
+        return [FetchFailed() for _ in urls]
