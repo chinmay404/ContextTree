@@ -1,15 +1,15 @@
 """
 Webpage parser: fetch user-pasted URLs into <EXTERNAL_CONTEXT>.
 
-Security (SSRF guard): only http/https; every hop of every redirect is
-re-validated — the host must resolve exclusively to public unicast IPs.
-Loopback, RFC1918 private ranges, link-local (incl. the 169.254.169.254
-cloud metadata endpoint), reserved, multicast and unspecified addresses
-are all refused, for IPv4, IPv6 and v4-mapped-v6. Responses are streamed
-with a hard byte cap and only text-ish content types are parsed.
-(Known limitation: the classic DNS-rebinding TOCTOU between our resolve
-and the client's — mitigated by re-checking every redirect hop and by the
-short timeout; full IP pinning is a later hardening step.)
+Security (SSRF guard): the fetch goes through `safe_fetch` — http/https on
+the default ports only, every hop of every redirect re-validated, every
+resolved address public and globally routable (no loopback, private,
+link-local incl. 169.254.169.254, CGNAT 100.64.0.0/10, reserved, multicast,
+unspecified; IPv4, IPv6, v4-mapped), the connection pinned to the checked
+address (no DNS rebinding), env proxies ignored. Limits: one wall-clock
+deadline over DNS and every hop, `Accept-Encoding: identity` with only
+gzip/deflate decoded here and the byte cap applied to decoded bytes, and
+only text-ish content types are parsed.
 
 Context-window safety: at most MAX_FETCH_URLS pages per turn, each page's
 extracted text clipped to DEFAULT_MAX_CHARS — a pasted URL can never
@@ -24,14 +24,13 @@ import re
 import socket
 from html.parser import HTMLParser
 from typing import List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
 
 from app.agent.citations import neutralise_markers
+from app.agent.helpers import safe_fetch
 from app.core.logger import logger
 
 MAX_FETCH_URLS = 2
-MAX_REDIRECTS = 3
-FETCH_TIMEOUT_SECONDS = 8
+FETCH_TIMEOUT_SECONDS = 8  # the whole fetch, every hop included (safe_fetch)
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024  # 2 MB
 DEFAULT_MAX_CHARS = 3500
 _ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml", "text/plain")
@@ -83,17 +82,7 @@ def extract_urls(text: str, limit: int = MAX_FETCH_URLS) -> List[str]:
     return out
 
 
-def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+_ip_is_public = safe_fetch.ip_is_public  # one definition of "public", shared with safe_fetch
 
 
 def host_is_public(host: str) -> bool:
@@ -140,66 +129,30 @@ def _clip(text: str, max_chars: int) -> str:
 def fetch_url_content(
     url: str, max_chars: int = DEFAULT_MAX_CHARS
 ) -> Optional[dict]:
-    """Fetch one URL → {url, title, text} (clipped), or None on any refusal/error."""
+    """Fetch one URL → {url, title, text} (clipped), or None on any refusal/error.
+
+    The whole fetch (DNS, every redirect hop, the body) ends within FETCH_TIMEOUT_SECONDS.
+    """
     try:
-        import httpx
-    except ImportError:
-        logger.warning("httpx not installed — URL fetch unavailable")
+        got = safe_fetch.fetch(url, max_bytes=MAX_DOWNLOAD_BYTES, timeout=FETCH_TIMEOUT_SECONDS,
+                               accept_types=_ALLOWED_CONTENT_TYPES)
+    except safe_fetch.FetchBlocked:
+        logger.warning("URL fetch refused (scheme, port or non-public host)")
         return None
-
-    current = str(url or "").strip()
-    try:
-        for _ in range(MAX_REDIRECTS + 1):
-            parsed = urlparse(current)
-            if parsed.scheme not in ("http", "https"):
-                logger.warning("URL fetch refused (scheme): %s", current)
-                return None
-            if not host_is_public(parsed.hostname or ""):
-                logger.warning("URL fetch refused (non-public host): %s", current)
-                return None
-
-            with httpx.Client(
-                timeout=FETCH_TIMEOUT_SECONDS,
-                follow_redirects=False,
-                headers={"User-Agent": "ContextTree/1.0 (+https://contexttree.tech)"},
-            ) as client:
-                with client.stream("GET", current) as resp:
-                    if resp.status_code in (301, 302, 303, 307, 308):
-                        location = resp.headers.get("location")
-                        if not location:
-                            return None
-                        current = urljoin(current, location)
-                        continue  # next hop re-validated at loop top
-                    if resp.status_code != 200:
-                        logger.warning(
-                            "URL fetch got %s for %s", resp.status_code, current
-                        )
-                        return None
-                    ctype = (resp.headers.get("content-type") or "").lower()
-                    if not any(t in ctype for t in _ALLOWED_CONTENT_TYPES):
-                        logger.warning(
-                            "URL fetch refused (content-type %s): %s", ctype, current
-                        )
-                        return None
-                    raw = b""
-                    for chunk in resp.iter_bytes():
-                        raw += chunk
-                        if len(raw) >= MAX_DOWNLOAD_BYTES:
-                            break
-                    encoding = resp.encoding or "utf-8"
-
-            body = raw[:MAX_DOWNLOAD_BYTES].decode(encoding, errors="replace")
-            title, text = _extract_text(ctype, body)
-            text = _clip(text, max_chars)
-            if not text:
-                return None
-            return {"url": current, "title": title or (parsed.hostname or ""), "text": text}
-
-        logger.warning("URL fetch: too many redirects for %s", url)
+    except safe_fetch.FetchFailed:
+        logger.warning("URL fetch failed (unreachable, refused encoding or too slow)")
         return None
-    except Exception as e:
-        logger.warning(f"URL fetch failed (non-blocking) for {url}: {e}")
+    except Exception as e:  # noqa: BLE001 - fetching never blocks a turn or an ingest
+        logger.warning("URL fetch failed (non-blocking): %s", type(e).__name__)
         return None
+    if not got.matched:
+        logger.warning("URL fetch refused (content-type %s)", got.content_type)
+        return None
+    title, text = _extract_text(got.content_type, got.text())
+    text = _clip(text, max_chars)
+    if not text:
+        return None
+    return {"url": got.url, "title": title or got.host, "text": text}
 
 
 def fetch_pages(urls: List[str], max_chars: int = DEFAULT_MAX_CHARS) -> List[dict]:

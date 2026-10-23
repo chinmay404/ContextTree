@@ -4,6 +4,8 @@ No network, no DB: SSRF refusals trigger before any request is made, and
 the success/redirect paths use a fake httpx client.
 """
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -63,6 +65,8 @@ def test_extract_urls_empty_input():
         "::1",             # v6 loopback
         "::ffff:127.0.0.1",# v4-mapped loopback
         "0.0.0.0",         # unspecified
+        "100.64.0.1",      # shared address space (CGNAT), not global
+        "100.100.100.200", # a cloud metadata address inside 100.64.0.0/10
         "localhost",
         "foo.localhost",
         "",
@@ -120,51 +124,36 @@ def test_clip_caps_length():
     assert clipped.endswith("…")
 
 
-# ── Fetch flow with a fake httpx client ─────────────────────────
-
-
-class FakeResponse:
-    def __init__(self, status_code=200, headers=None, body=b"", encoding="utf-8"):
-        self.status_code = status_code
-        self.headers = headers or {}
-        self._body = body
-        self.encoding = encoding
-
-    def iter_bytes(self):
-        yield self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-
-class FakeClient:
-    routes: dict = {}
-
-    def __init__(self, **kwargs):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def stream(self, method, url):
-        return FakeClient.routes[url]
+# ── Fetch flow over a fake transport (the guarded fetch: app/agent/helpers/safe_fetch.py) ──
 
 
 @pytest.fixture
 def fake_httpx(monkeypatch):
-    FakeClient.routes = {}
-    monkeypatch.setattr(httpx, "Client", FakeClient)
-    return FakeClient
+    """routes: "http://<host><path>" -> httpx.Response factory; sent: every request."""
+    state = SimpleNamespace(routes={}, sent=[])
+
+    async def handle(self, request):
+        state.sent.append(request)
+        make = state.routes.get(f"{request.url.scheme}://{request.headers['host']}{request.url.path}")
+        if make is None:
+            return httpx.Response(404, request=request)
+        return make(request)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    return state
+
+
+async def _stream(body: bytes):
+    # A streamed body, as a real transport gives it (bytes content would be pre-read and decoded).
+    yield body
+
+
+def respond(status=200, headers=None, body=b""):
+    return lambda req: httpx.Response(status, headers=headers or {}, content=_stream(body), request=req)
 
 
 def test_fetch_success_html(fake_httpx):
-    fake_httpx.routes["http://8.8.8.8/page"] = FakeResponse(
+    fake_httpx.routes["http://8.8.8.8/page"] = respond(
         headers={"content-type": "text/html"},
         body=b"<html><head><title>T</title></head><body><p>Body text</p></body></html>",
     )
@@ -172,41 +161,77 @@ def test_fetch_success_html(fake_httpx):
     assert page is not None
     assert page["title"] == "T"
     assert "Body text" in page["text"]
+    assert fake_httpx.sent[0].headers["accept-encoding"] == "identity"
 
 
 def test_fetch_refuses_wrong_content_type(fake_httpx):
-    fake_httpx.routes["http://8.8.8.8/data"] = FakeResponse(
-        headers={"content-type": "application/json"}, body=b"{}"
-    )
+    fake_httpx.routes["http://8.8.8.8/data"] = respond(headers={"content-type": "application/json"}, body=b"{}")
     assert fetch_url_content("http://8.8.8.8/data") is None
 
 
 def test_fetch_follows_public_redirect(fake_httpx):
-    fake_httpx.routes["http://8.8.8.8/a"] = FakeResponse(
-        status_code=302, headers={"location": "http://9.9.9.9/b"}
-    )
-    fake_httpx.routes["http://9.9.9.9/b"] = FakeResponse(
-        headers={"content-type": "text/plain"}, body=b"dest"
-    )
+    fake_httpx.routes["http://8.8.8.8/a"] = respond(302, headers={"location": "http://9.9.9.9/b"})
+    fake_httpx.routes["http://9.9.9.9/b"] = respond(headers={"content-type": "text/plain"}, body=b"dest")
     page = fetch_url_content("http://8.8.8.8/a")
     assert page is not None and page["text"] == "dest"
     assert page["url"] == "http://9.9.9.9/b"
 
 
 def test_fetch_refuses_redirect_to_internal(fake_httpx):
-    fake_httpx.routes["http://8.8.8.8/evil"] = FakeResponse(
-        status_code=302, headers={"location": "http://169.254.169.254/latest/"}
-    )
+    fake_httpx.routes["http://8.8.8.8/evil"] = respond(302, headers={"location": "http://169.254.169.254/latest/"})
     assert fetch_url_content("http://8.8.8.8/evil") is None
+    assert [r.url.path for r in fake_httpx.sent] == ["/evil"]
 
 
 def test_fetch_caps_output_chars(fake_httpx):
-    fake_httpx.routes["http://8.8.8.8/big"] = FakeResponse(
-        headers={"content-type": "text/plain"}, body=b"x" * 50_000
-    )
+    fake_httpx.routes["http://8.8.8.8/big"] = respond(headers={"content-type": "text/plain"}, body=b"x" * 50_000)
     page = fetch_url_content("http://8.8.8.8/big")
     assert page is not None
     assert len(page["text"]) <= DEFAULT_MAX_CHARS
+
+
+@pytest.mark.parametrize("encoding", ["br", "zstd"])
+def test_fetch_refuses_brotli_and_zstd(fake_httpx, encoding):
+    fake_httpx.routes["http://8.8.8.8/e"] = respond(
+        headers={"content-type": "text/html", "content-encoding": encoding}, body=b"....")
+    assert fetch_url_content("http://8.8.8.8/e") is None
+
+
+def test_fetch_caps_a_gzip_bomb_on_decoded_bytes(fake_httpx, monkeypatch):
+    import gzip
+
+    from app.agent.helpers import web_fetch
+    plain = b"<title>bomb</title>" + b"a" * (30 * 1024 * 1024)
+    fake_httpx.routes["http://8.8.8.8/bomb"] = respond(
+        headers={"content-type": "text/html", "content-encoding": "gzip"}, body=gzip.compress(plain, 6))
+    seen = []
+    real = web_fetch._extract_text
+    monkeypatch.setattr(web_fetch, "_extract_text", lambda ctype, body: seen.append(len(body)) or real(ctype, body))
+    page = fetch_url_content("http://8.8.8.8/bomb")
+    assert page is not None and page["title"] == "bomb"
+    assert seen and seen[0] <= web_fetch.MAX_DOWNLOAD_BYTES
+
+
+def test_fetch_has_one_deadline_including_dns(monkeypatch):
+    import time
+
+    from app.agent.helpers import safe_fetch, web_fetch
+
+    def hung(*a, **k):
+        time.sleep(5)
+        raise OSError("late")
+
+    monkeypatch.setattr(safe_fetch, "_getaddrinfo", hung)
+    monkeypatch.setattr(web_fetch, "FETCH_TIMEOUT_SECONDS", 1)
+    started = time.monotonic()
+    assert fetch_url_content("http://example.com/") is None
+    assert time.monotonic() - started < 2.5
+
+
+@pytest.mark.parametrize("url", ["http://8.8.8.8:8080/", "http://100.64.0.1/", "http://100.100.100.200/"])
+def test_fetch_refuses_other_ports_and_shared_address_space(fake_httpx, url):
+    assert fetch_url_content(url) is None
+    assert fake_httpx.sent == []
 
 
 def test_format_page_snippets_labels():
