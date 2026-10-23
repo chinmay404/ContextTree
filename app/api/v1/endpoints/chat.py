@@ -532,14 +532,33 @@ def _graph_kwargs(chat_message: ChatMessage, card: Optional[dict], email: Option
     last_k = chat_message.last_k_messages
     if carry == "whole" and last_k is None:
         last_k = 50
-    return dict(
+    reads = resolve_reads(board_store, email, card["canvas_id"], card["id"])
+    kw = dict(
         context_node_ids=None,
-        board_reads=resolve_reads(board_store, email, card["canvas_id"], card["id"]),
+        board_reads=reads,
         budget_tokens=budget if isinstance(budget, int) and not isinstance(budget, bool) else None,
         last_k_messages=last_k,
         external_context_top_k=card_top_k(data),
         user_email=email,
     )
+    if chat_message.web_search:  # S1: what the search-query rewrite knows about this chat
+        kw["search_hint"] = {"chat_name": data.get("name"),
+                             "source_titles": _read_source_titles(email, reads)}
+    return kw
+
+
+def _read_source_titles(email: str, reads) -> list[str]:
+    """Titles of the sources this chat reads, oldest first (one short query)."""
+    ids = [i.card_id for i in reads.readable()]
+    if not ids:
+        return []
+    with board_store.tx() as cur:
+        cur.execute(
+            "SELECT data->>'title' AS title FROM nodes WHERE id = ANY(%s) AND user_email = %s "
+            "AND kind = 'source' AND deleted_at IS NULL ORDER BY created_at, id",
+            (ids, email),
+        )
+        return [r["title"] for r in cur.fetchall() if r["title"]]
 
 
 # ── V3 key gate (BYOK: a V3 turn runs on the user's own key only) ─────────────

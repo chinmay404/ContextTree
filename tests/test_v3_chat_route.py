@@ -302,20 +302,28 @@ def wire(monkeypatch):
     """Fake provider endpoints. `mode` is "ok" (answers `text`) or "reject" (401 for every call)."""
     import httpx
 
-    state = SimpleNamespace(mode="ok", text="ok", calls=[], others=[])
+    state = SimpleNamespace(mode="ok", text="ok", rewrite=None, calls=[], others=[])
 
     def reply(request):
         if request.url.host != "api.openai.com":
             state.others.append(str(request.url.host))
             return httpx.Response(500, json={"error": "unexpected host in test"}, request=request)
         body = json.loads(request.content.decode() or "{}")
+        messages = body.get("messages") or []
         state.calls.append({"auth": request.headers.get("authorization"), "path": request.url.path,
-                            "model": body.get("model"), "messages": body.get("messages") or []})
+                            "model": body.get("model"), "messages": messages,
+                            "max_completion_tokens": body.get("max_completion_tokens"),
+                            "reasoning_effort": body.get("reasoning_effort")})
         if state.mode == "reject":
             return httpx.Response(401, json={"error": {"message": "Incorrect API key provided",
                                                        "type": "invalid_request_error",
                                                        "code": "invalid_api_key"}}, request=request)
-        content, ctype = _completion(state.text, bool(body.get("stream")))
+        text = state.text
+        if state.rewrite is not None:  # S1: the search-query rewrite gets its own reply
+            from app.agent.helpers.web_query import REWRITE_MARKER
+            if REWRITE_MARKER in json.dumps(messages):
+                text = state.rewrite
+        content, ctype = _completion(text, bool(body.get("stream")))
         return httpx.Response(200, content=content, headers={"content-type": ctype}, request=request)
 
     def handle(self, request):
@@ -777,3 +785,96 @@ def test_rolling_summary_leaves_out_a_refused_question(monkeypatch, byok_only, k
     prompt = str(llm.calls[0])
     assert "answered question" in prompt and "the answer" in prompt
     assert ("REFUSED QUESTION" in prompt) is kept  # V2 (byok_only off) is unchanged
+
+
+# ── S1: the web search query is rewritten by the chat's model on the user's key ──
+
+def _zap_chat(db, user, bid):
+    q = seed_card(db, user, bid, kind="chat", data={"name": "OWASP ZAP"})
+    # Positions start at 1: hydration reads messages after position 0.
+    seed_message(db, user, q, "user", "What is OWASP ZAP?", 1)
+    seed_message(db, user, q, "assistant", "ZAP is an open-source web app security scanner.", 2)
+    seed_card(db, user, bid, kind="source", source_type="note", status="ready", desk_id=q,
+              data={"title": "ZAP user guide", "text": "Spider, active scan, passive scan."})
+    return q
+
+
+@pytest.fixture
+def searched(byok, monkeypatch):
+    queries = []
+
+    def search(query, *a, **k):
+        queries.append(query)
+        return [{"title": "ZAP docs", "url": "https://www.zaproxy.org/docs/", "snippet": "Features"}]
+
+    monkeypatch.setattr(byok.main, "search_web", search)
+    return queries
+
+
+def test_v3_follow_up_searches_with_a_standalone_query(api, db, user, byok, searched):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    q = _zap_chat(db, user, bid)
+    byok.wire.rewrite = "OWASP ZAP capabilities"
+    r = _ask(api, q, bid, message="what it can do for me", webSearch=True)
+    assert r.status_code == 200, r.text
+    frames = _frames(r.text)
+    assert searched == ["OWASP ZAP capabilities"]
+    [web] = [f["web_search"] for f in frames if isinstance(f, dict) and "web_search" in f]
+    assert web["query"] == "OWASP ZAP capabilities"
+    assert web["results"] == [{"title": "ZAP docs", "url": "https://www.zaproxy.org/docs/"}]
+    rewrite, answer = byok.wire.calls  # one rewrite, then the answer
+    prompt = json.dumps(rewrite["messages"])
+    for part in ("OWASP ZAP", "What is OWASP ZAP?", "ZAP user guide", "what it can do for me"):
+        assert part in prompt
+    assert rewrite["auth"] == f"Bearer {byok.user_key}" and rewrite["model"] == "gpt-5-mini"
+    assert rewrite["max_completion_tokens"] == 32 and rewrite["reasoning_effort"] == "minimal"
+    assert byok.lookups == [(user, "openai")]  # no extra key lookup for the rewrite
+    assert _quota(db, user) == 1  # the rewrite is not a daily message
+    assert [row[0] for row in _rows(db, q)] == ["user", "assistant", "user", "assistant"]
+    assert "OWASP ZAP capabilities" not in json.dumps(_rows(db, q))  # never stored
+
+
+def test_v3_rewrite_on_a_refused_key_falls_back_then_reports_key_rejected(api, db, user, byok, searched):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    q = _zap_chat(db, user, bid)
+    byok.wire.mode = "reject"
+    r = _ask(api, q, bid, message="what it can do for me", webSearch=True)
+    frames = _frames(r.text)
+    assert searched == ["OWASP ZAP what it can do for me"]
+    assert frames[0]["web_search"]["query"] == "OWASP ZAP what it can do for me"
+    assert frames[-1] == {"error": "OpenAI turned this key down.", "code": "key_rejected",
+                          "provider": "openai"}
+    assert byok.lookups == [(user, "openai")]
+
+
+def test_v3_without_web_search_makes_no_rewrite_call(api, db, user, byok, searched):
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    q = _zap_chat(db, user, bid)
+    byok.wire.rewrite = "SHOULD NOT BE ASKED"
+    r = _ask(api, q, bid, message="what it can do for me")
+    assert r.status_code == 200 and searched == [] and len(byok.wire.calls) == 1
+
+
+@pytest.mark.parametrize("route", [STREAM, SYNC])
+def test_v2_web_search_keeps_the_raw_message(api, db, user, byok, searched, route, monkeypatch):
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+    import app.agent.nodes.assistant_node as an
+
+    monkeypatch.setattr(byok.chat, "validate_model_access", lambda *a, **k: None)
+    monkeypatch.setattr(an, "get_llm", lambda *a, **k: FakeListChatModel(responses=["v2 answer"]))
+    v2 = seed_board(db, user, version=2)
+    nid = new_id("n")
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO nodes (id, canvas_id, user_email, data) VALUES (%s,%s,%s,'{}'::jsonb)",
+                    (nid, v2, user))
+    r = api.post(route, json={"message": "what it can do for me", "message_id": new_id("m"),
+                              "nodeId": nid, "model": "z-ai/glm-5.2", "webSearch": True})
+    assert r.status_code == 200, r.text
+    assert searched == ["what it can do for me"]
+    if route == STREAM:
+        [web] = [f["web_search"] for f in _frames(r.text) if isinstance(f, dict) and "web_search" in f]
+        assert set(web) == {"results"}
+    assert byok.wire.calls == []

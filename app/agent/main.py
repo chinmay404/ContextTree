@@ -20,6 +20,7 @@ from app.agent.reads import Reads, _top_k as _default_top_k
 from app.agent.utils.embeddings import get_embedding
 from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
+from app.agent.helpers.web_query import rewrite_search_query
 from app.agent.helpers.web_fetch import extract_urls, fetch_pages, format_page_snippets
 from app.agent.helpers.v3_llm import KeyRejectedError, key_rejected_frame
 from app.core.config import settings
@@ -129,6 +130,20 @@ def _budget_history(current_state, initial_messages) -> list:
     return list(values.get("messages") or [])
 
 
+def _v3_web_query(query, config, current_state, initial_messages, web_search, byok_only,
+                  search_hint) -> Optional[str]:
+    """V3 web search: one standalone query rewritten by the chat's model (S1). None on V2."""
+    if not (web_search and byok_only and search_hint is not None
+            and getattr(settings, "WEB_SEARCH_ENABLED", True)):
+        return None
+    return rewrite_search_query(
+        query, config,
+        chat_name=search_hint.get("chat_name"),
+        history=_budget_history(current_state, initial_messages),
+        source_titles=search_hint.get("source_titles"),
+    )
+
+
 def _build_memory_saver():
     """Best-effort in-memory fallback for local/dev when PostgresSaver is unavailable."""
     try:
@@ -232,6 +247,7 @@ class getGraphResponse():
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
         byok_only: bool = False,
+        search_hint: Optional[dict] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -259,10 +275,13 @@ class getGraphResponse():
             existing_memory_facts = self.mongo_store.get_thread_memory_facts(user_id, thread_id)
             prompt_summary = _clip_text(existing_summary, MAX_SUMMARY_CHARS)
             passages: Optional[dict] = {} if board_reads is not None else None
+            web_query = _v3_web_query(query, config, current_state, initial_messages,
+                                      web_search, byok_only, search_hint)
             context_snippets, external_context_str, _web_hits, linked_answers = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
                 web_search=web_search,
+                web_query=web_query,
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
                 user_email=user_email,
@@ -456,6 +475,7 @@ class getGraphResponse():
         budget_tokens: Optional[int] = None,
         user_email: Optional[str] = None,
         byok_only: bool = False,
+        search_hint: Optional[dict] = None,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -480,10 +500,13 @@ class getGraphResponse():
         # Built after hydration so the token budget can count the history.
         # V3 turns collect the numbered passages they send (n -> Citation); V2 turns pass None.
         passages: Optional[dict] = {} if board_reads is not None else None
+        web_query = _v3_web_query(query, config, current_state, initial_messages,
+                                  web_search, byok_only, search_hint)
         context_snippets, external_context_str, web_hits, linked_answers = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
             web_search=web_search,
+            web_query=web_query,
             board_reads=board_reads,
             budget_tokens=budget_tokens,
             user_email=user_email,
@@ -560,7 +583,8 @@ class getGraphResponse():
             "user_email": user_email,
         }
 
-        return graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits, passages
+        return (graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits, passages,
+                web_query)
 
     def _hydrate_recent_messages(
         self,
@@ -608,8 +632,10 @@ class getGraphResponse():
         fixed_chars: int = 0,
         user_email: Optional[str] = None,
         passages: Optional[dict] = None,
+        web_query: Optional[str] = None,
     ):
-        """`passages` (V3 only) is filled with n -> Citation for every numbered passage sent."""
+        """`passages` (V3 only) is filled with n -> Citation for every numbered passage sent.
+        `web_query` (V3 only) is the standalone search query; V2 searches the raw message."""
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
         web_hits: list[dict] = []
@@ -617,7 +643,7 @@ class getGraphResponse():
         # Web search is embedding-independent: it must work even when the
         # embedding provider is down, and it never blocks the turn.
         if web_search and getattr(settings, "WEB_SEARCH_ENABLED", True):
-            web_hits = search_web(query, max_results=WEB_CONTEXT_LIMIT)
+            web_hits = search_web(web_query or query, max_results=WEB_CONTEXT_LIMIT)
             if web_hits:
                 logger.info(
                     "Web search injected %s snippets for thread %s", len(web_hits), thread_id
@@ -754,10 +780,11 @@ class getGraphResponse():
         user_email: Optional[str] = None,
         byok_only: bool = False,
         on_key_rejected: Optional[Callable[[], None]] = None,
+        search_hint: Optional[dict] = None,
     ):
         try:
             (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
-             passages) = self._prepare_stream_input(
+             passages, web_query) = self._prepare_stream_input(
                 query,
                 config,
                 user_id,
@@ -773,6 +800,7 @@ class getGraphResponse():
                 budget_tokens=budget_tokens,
                 user_email=user_email,
                 byok_only=byok_only,
+                search_hint=search_hint,
             )
 
             full_response = ""
@@ -783,7 +811,10 @@ class getGraphResponse():
             # tokens start, so the UI can render "Searched the web · N
             # sources" chips while the model is still thinking.
             if web_hits:
-                yield f"data: {json.dumps({'web_search': {'results': [{'title': h.get('title'), 'url': h.get('url')} for h in web_hits]}})}\n\n"
+                web_frame = {'results': [{'title': h.get('title'), 'url': h.get('url')} for h in web_hits]}
+                if web_query:  # V3: the query that was searched, for the web results header
+                    web_frame = {'query': web_query, **web_frame}
+                yield f"data: {json.dumps({'web_search': web_frame})}\n\n"
 
             # Try async streaming with async graph first
             stream_graph = self.async_graph if self.async_graph else None
