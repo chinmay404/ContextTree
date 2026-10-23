@@ -56,9 +56,7 @@ V3_ROUTES: dict[str, Route] = {
     "anthropic/claude-sonnet-4-20250514": Route("anthropic", "claude-sonnet-4-20250514"),
     "openai/gpt-5-mini": Route("openai", "gpt-5-mini"),
     "gemini/gemini-3-flash-preview": Route("google", "models/gemini-3-flash-preview"),
-    "meta-llama/llama-4-maverick-17b-128e-instruct": Route(
-        "groq", "meta-llama/llama-4-maverick-17b-128e-instruct"
-    ),
+    "openai/gpt-oss-120b": Route("groq", "openai/gpt-oss-120b"),
     "deepseek/deepseek-chat": Route("deepseek", "deepseek-chat"),
     "mistral/mistral-large-latest": Route("mistral", "mistral-large-latest"),
     "moonshot/kimi-k2-0905-preview": Route("moonshot", "kimi-k2-0905-preview"),
@@ -81,7 +79,12 @@ _FIRST_PARTY_BASE = {
 # Providers whose API rejects temperature above 1.0.
 _TEMPERATURE_CEILING = {"anthropic": 1.0, "moonshot": 1.0}
 
-_LEGACY_GROQ = {"openai/gpt-oss-120b", "openai/gpt-oss-20b"}
+_LEGACY_GROQ = {"openai/gpt-oss-20b"}
+# Groq retired the Llama 4 models; chats that still name one answer on the board's Groq model.
+_RETIRED_GROQ = {
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+}
 
 
 class MissingKeyError(Exception):
@@ -134,6 +137,8 @@ def v3_route(model_id: str | None) -> Route:
 
     if model_id in _LEGACY_GROQ:
         return Route("groq", model_id)
+    if model_id in _RETIRED_GROQ:
+        return Route("groq", "openai/gpt-oss-120b")
     if model_id.startswith("deepseek-ai/"):
         return Route("deepseek", "deepseek-chat")
     if model_id.startswith("mistralai/"):

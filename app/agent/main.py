@@ -838,6 +838,8 @@ class getGraphResponse():
 
             if not full_response:
                 logger.error("Agent produced no output in stream")
+                # an error frame, so the client says what happened instead of "cut off"
+                yield f"data: {json.dumps({'error': 'The model sent back no answer. Try again, or pick another model.'})}\n\n"
                 return
 
             # V3: the passages the finished answer cited, right after the last delta. Always sent

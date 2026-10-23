@@ -34,7 +34,7 @@ BOARD_MODEL_IDS = {
     "claude": "anthropic/claude-sonnet-4-20250514",
     "gpt": "openai/gpt-5-mini",
     "gemini": "gemini/gemini-3-flash-preview",
-    "llama": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "gptoss": "openai/gpt-oss-120b",
     "deepseek": "deepseek/deepseek-chat",
     "mistral": "mistral/mistral-large-latest",
     "kimi": "moonshot/kimi-k2-0905-preview",
@@ -48,8 +48,8 @@ EXPECTED = {
         ("openai", "ChatOpenAI", "openai_api_key", "model_name", "gpt-5-mini"),
     "gemini/gemini-3-flash-preview":
         ("google", "ChatGoogleGenerativeAI", "google_api_key", "model", "models/gemini-3-flash-preview"),
-    "meta-llama/llama-4-maverick-17b-128e-instruct":
-        ("groq", "ChatGroq", "groq_api_key", "model_name", "meta-llama/llama-4-maverick-17b-128e-instruct"),
+    "openai/gpt-oss-120b":
+        ("groq", "ChatGroq", "groq_api_key", "model_name", "openai/gpt-oss-120b"),
     "deepseek/deepseek-chat":
         ("deepseek", "ChatOpenAI", "openai_api_key", "model_name", "deepseek-chat"),
     "mistral/mistral-large-latest":
@@ -122,8 +122,8 @@ def test_first_party_clients_ignore_base_url_env(keys):
     assert openai.openai_api_base == "https://api.openai.com/v1"
     claude = v3_llm.get_v3_llm("anthropic/claude-sonnet-4-20250514", "me@example.test")
     assert claude.anthropic_api_url == "https://api.anthropic.com"
-    llama = v3_llm.get_v3_llm("meta-llama/llama-4-maverick-17b-128e-instruct", "me@example.test")
-    assert llama.groq_api_base == "https://api.groq.com"
+    groq = v3_llm.get_v3_llm("openai/gpt-oss-120b", "me@example.test")
+    assert groq.groq_api_base == "https://api.groq.com"
 
 
 def test_no_stored_key_is_missing_key_even_with_env_key(keys, monkeypatch):
@@ -164,6 +164,8 @@ def test_missing_key_does_not_build_a_client(keys, monkeypatch):
     [
         ("openai/gpt-oss-120b", "groq", "openai/gpt-oss-120b"),
         ("openai/gpt-oss-20b", "groq", "openai/gpt-oss-20b"),
+        ("meta-llama/llama-4-maverick-17b-128e-instruct", "groq", "openai/gpt-oss-120b"),
+        ("meta-llama/llama-4-scout-17b-16e-instruct", "groq", "openai/gpt-oss-120b"),
         ("deepseek-ai/deepseek-v4-pro", "deepseek", "deepseek-chat"),
         ("deepseek-ai/deepseek-v3.1", "deepseek", "deepseek-chat"),
         ("mistralai/mistral-large-3-675b-instruct-2512", "mistral", "mistral-large-latest"),
@@ -496,14 +498,14 @@ def test_resolved_key_for_another_provider_is_refused_before_a_client(keys, wire
 
 
 def test_resolved_legacy_id_on_the_same_provider_is_accepted(keys):
-    resolved = v3_llm.v3_require_key("openai/gpt-oss-120b", "me@example.test")  # groq
+    resolved = v3_llm.v3_require_key("openai/gpt-oss-20b", "me@example.test")  # groq
     llm = v3_llm.get_v3_llm("meta-llama/llama-4-maverick-17b-128e-instruct", "me@example.test",
                             resolved=resolved)
     assert llm.groq_api_key.get_secret_value() == "user-groq"
 
 
 def test_groq_requests_keep_a_user_agent(keys, wire):
-    model_id = "meta-llama/llama-4-maverick-17b-128e-instruct"
+    model_id = "openai/gpt-oss-120b"
     _invoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
     _ainvoke(v3_llm.get_v3_llm(model_id, "me@example.test"))
     assert len(wire) >= 2
