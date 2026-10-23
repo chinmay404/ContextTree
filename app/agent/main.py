@@ -783,8 +783,12 @@ class getGraphResponse():
         search_hint: Optional[dict] = None,
     ):
         try:
+            # Everything blocking (DB reads, embeddings, web search, the query rewrite, page
+            # fetches, the model call, the writes) runs in a worker thread, never on the event
+            # loop: one slow turn must not stall every other request on the instance.
             (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
-             passages, web_query) = self._prepare_stream_input(
+             passages, web_query) = await asyncio.to_thread(
+                self._prepare_stream_input,
                 query,
                 config,
                 user_id,
@@ -856,7 +860,7 @@ class getGraphResponse():
 
             # Sync fallback
             if not streamed:
-                result = self.graph.invoke(graph_input, config)
+                result = await asyncio.to_thread(self.graph.invoke, graph_input, config)
                 ai_messages = result.get("messages", []) if result else []
                 ai_responses = [msg for msg in ai_messages if isinstance(msg, AIMessage)]
                 if ai_responses:
@@ -888,9 +892,10 @@ class getGraphResponse():
             #   normal               → save both.
             should_save_user = (not is_duplicate) and (not regenerate_last_user)
             should_save_assistant = regenerate_last_user or (not is_duplicate)
-            try:
+
+            def save_turn():
                 if should_save_user or should_save_assistant:
-                    updated_memory_facts = self._update_thread_memory_facts(
+                    self._update_thread_memory_facts(
                         user_id=user_id,
                         thread_id=thread_id,
                         previous_facts=existing_memory_facts,
@@ -917,11 +922,15 @@ class getGraphResponse():
                             embed_summary_fn=get_embedding, context_fn=[],
                             citations=citations,
                         )
+
+            try:
+                await asyncio.to_thread(save_turn)
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
 
             # Include updated summary in the done signal so frontend can update
-            done_data = {"summary": self.mongo_store.get_thread_summary(user_id, thread_id)}
+            done_data = {"summary": await asyncio.to_thread(
+                self.mongo_store.get_thread_summary, user_id, thread_id)}
             yield f"data: {json.dumps(done_data)}\n\n"
             yield "data: [DONE]\n\n"
 

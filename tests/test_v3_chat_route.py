@@ -878,3 +878,105 @@ def test_v2_web_search_keeps_the_raw_message(api, db, user, byok, searched, rout
         [web] = [f["web_search"] for f in _frames(r.text) if isinstance(f, dict) and "web_search" in f]
         assert set(web) == {"results"}
     assert byok.wire.calls == []
+
+
+# ── A turn's blocking work never runs on the event loop (one instance serves everyone) ──
+
+import threading as _threading
+import time as _time
+
+
+def _health_while(start_turn, busy: "_threading.Event"):
+    """Start a turn on a shared-loop client; once its slow step is running, time GET /health/."""
+    from fastapi.testclient import TestClient
+
+    from app.api.server import app
+
+    out = {}
+    with TestClient(app) as client:  # one event loop for every request, as in production
+        t = _threading.Thread(target=lambda: out.update(turn=start_turn(client)))
+        t.start()
+        assert busy.wait(20), "the slow step never started"
+        started = _time.monotonic()
+        out["health"] = client.get("/api/v1/health/").status_code
+        out["health_s"] = _time.monotonic() - started
+        t.join(30)
+    return out
+
+
+def _slow(fn, busy, seconds=2.0):
+    def run(*a, **k):
+        busy.set()
+        _time.sleep(seconds)
+        return fn(*a, **k)
+    return run
+
+
+def test_preparing_a_turn_does_not_block_other_requests(api, db, user, byok, monkeypatch):
+    busy = _threading.Event()
+    monkeypatch.setattr(byok.main, "search_web", _slow(lambda *a, **k: [], busy))  # DuckDuckGo: up to 6 s
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+
+    def start(client):
+        return client.post("/api/v1/chat/stream", headers=api.h, json={
+            "message": "hi", "message_id": new_id("m"), "nodeId": c, "boardId": bid,
+            "model": GPT, "webSearch": True})
+
+    out = _health_while(start, busy)
+    assert out["health"] == 200 and out["health_s"] < 0.5, out["health_s"]
+    assert out["turn"].status_code == 200 and "[DONE]" in out["turn"].text
+
+
+def _slow_provider(monkeypatch, busy):
+    import httpx
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", _slow(httpx.HTTPTransport.handle_request, busy))
+
+
+def test_the_answer_call_does_not_block_other_requests(api, db, user, byok, monkeypatch):
+    busy = _threading.Event()
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    _slow_provider(monkeypatch, busy)
+
+    def start(client):
+        return client.post("/api/v1/chat/stream", headers=api.h, json={
+            "message": "hi", "message_id": new_id("m"), "nodeId": c, "boardId": bid, "model": GPT})
+
+    out = _health_while(start, busy)
+    assert out["health"] == 200 and out["health_s"] < 0.5, out["health_s"]
+    assert out["turn"].status_code == 200 and _text(_frames(out["turn"].text)) == "ok"
+
+
+def test_the_sync_route_does_not_block_other_requests(api, db, user, byok, monkeypatch):
+    busy = _threading.Event()
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    c = seed_card(db, user, bid, kind="chat")
+    _slow_provider(monkeypatch, busy)
+
+    def start(client):
+        return client.post("/api/v1/chat/", headers=api.h, json={
+            "message": "hi", "message_id": new_id("m"), "nodeId": c, "boardId": bid, "model": GPT})
+
+    out = _health_while(start, busy)
+    assert out["health"] == 200 and out["health_s"] < 0.5, out["health_s"]
+    assert out["turn"].status_code == 200 and out["turn"].json()["message"] == "ok"
+
+
+def test_a_branch_start_summary_does_not_block_other_requests(api, db, user, byok, monkeypatch):
+    busy = _threading.Event()
+    byok.put_key("openai", byok.user_key)
+    bid = seed_board(db, user)
+    child = _branch_with_history(db, user, bid)
+    _slow_provider(monkeypatch, busy)  # the first provider call is the branch-start summary
+
+    def start(client):
+        return client.post("/api/v1/chat/stream", headers=api.h, json={
+            "message": "hi", "message_id": new_id("m"), "nodeId": child, "boardId": bid, "model": GPT})
+
+    out = _health_while(start, busy)
+    assert out["health"] == 200 and out["health_s"] < 0.5, out["health_s"]
+    assert out["turn"].status_code == 200

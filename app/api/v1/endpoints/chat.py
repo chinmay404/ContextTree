@@ -615,18 +615,20 @@ async def get_response(
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         turn_key: Optional[TurnKey] = None
         if card is None:
-            _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
-            _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+            await run_in_threadpool(_assert_thread_access, active_graph, user_id, chat_message.conversation_id)
+            await run_in_threadpool(_assert_thread_access, active_graph, user_id, chat_message.parent_thread_id)
         else:
             turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
-        charge = _enforce_daily_quota(active_graph, user_id)
+        charge = await run_in_threadpool(_enforce_daily_quota, active_graph, user_id)
 
         if card is None:
-            access_error = validate_model_access(chat_message.model_name, user_id)
+            access_error = await run_in_threadpool(validate_model_access, chat_message.model_name, user_id)
             if access_error:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "http", user_id, carry=carry, turn_key=turn_key)
+        # Blocking work (the branch-start summary calls a model) runs off the event loop.
+        await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "http", user_id,
+                                carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
@@ -634,7 +636,8 @@ async def get_response(
             config["configurable"][TURN_KEY_CONFIG] = turn_key
         logger.info(f"Chat request: node={chat_message.conversation_id} model={chat_message.model_name}")
 
-        res = active_graph.get_response(
+        res = await run_in_threadpool(
+            active_graph.get_response,
             query=chat_message.message,
             msg_id=chat_message.message_id,
             config=config,
@@ -649,8 +652,8 @@ async def get_response(
         if not res:
             raise HTTPException(status_code=500, detail="Failed to generate AI response")
 
-        summary = active_graph.mongo_store.get_thread_summary(
-            user_id, chat_message.conversation_id
+        summary = await run_in_threadpool(
+            active_graph.mongo_store.get_thread_summary, user_id, chat_message.conversation_id
         )
         return {"message": res, "summary": summary or ""}
 
@@ -686,18 +689,20 @@ async def stream_response(
         card, v3_email, carry = await run_in_threadpool(_v3_gate, user_id, chat_message)
         turn_key: Optional[TurnKey] = None
         if card is None:
-            _assert_thread_access(active_graph, user_id, chat_message.conversation_id)
-            _assert_thread_access(active_graph, user_id, chat_message.parent_thread_id)
+            await run_in_threadpool(_assert_thread_access, active_graph, user_id, chat_message.conversation_id)
+            await run_in_threadpool(_assert_thread_access, active_graph, user_id, chat_message.parent_thread_id)
         else:
             turn_key = await run_in_threadpool(_v3_turn_key, chat_message, v3_email)
-        charge = _enforce_daily_quota(active_graph, user_id)
+        charge = await run_in_threadpool(_enforce_daily_quota, active_graph, user_id)
 
         if card is None:
-            access_error = validate_model_access(chat_message.model_name, user_id)
+            access_error = await run_in_threadpool(validate_model_access, chat_message.model_name, user_id)
             if access_error:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
-        _init_fork_if_needed(chat_message, active_graph, "sse", user_id, carry=carry, turn_key=turn_key)
+        # Blocking work (the branch-start summary calls a model) runs off the event loop.
+        await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "sse", user_id,
+                                carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
