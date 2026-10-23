@@ -24,6 +24,7 @@ Keys never appear in logs, exception text or exception chains raised from here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from typing import Any
@@ -79,6 +80,10 @@ _FIRST_PARTY_BASE = {
 # Providers whose API rejects temperature above 1.0.
 _TEMPERATURE_CEILING = {"anthropic": 1.0, "moonshot": 1.0}
 
+_LIVE_ID = re.compile(
+    r"^(anthropic|openai|google|groq|deepseek|mistral|moonshot):([A-Za-z0-9][A-Za-z0-9._:/@-]{0,127})$"
+)
+
 _LEGACY_GROQ = {"openai/gpt-oss-20b"}
 # Groq retired the Llama 4 models; chats that still name one answer on the board's Groq model.
 _RETIRED_GROQ = {
@@ -127,11 +132,23 @@ class V3ConfigError(RuntimeError):
     """The server environment rules out a user-key-only client (an operator fix)."""
 
 
+def _live_route(model_id: str) -> Route | None:
+    """`<provider>:<provider's own model id>`: a model the board listed from the provider's
+    /models with the user's key (ContextTree-src app/api/user-api-keys/models)."""
+    m = _LIVE_ID.match(model_id)
+    if not m or ".." in m.group(2):
+        return None
+    provider, wire = m.groups()
+    if provider == "google" and not wire.startswith("models/"):
+        wire = f"models/{wire}"
+    return Route(provider, wire)
+
+
 def v3_route(model_id: str | None) -> Route:
-    """The route for a V3 model id: the board's seven, then legacy ids on old chats."""
+    """The route for a V3 model id: the board's seven, a live-listed model, then legacy ids on old chats."""
     if not model_id:
         raise UnsupportedModelError(model_id)
-    route = V3_ROUTES.get(model_id)
+    route = V3_ROUTES.get(model_id) or _live_route(model_id)
     if route is not None:
         return route
 

@@ -183,6 +183,38 @@ def test_legacy_ids_route_to_the_matching_provider(legacy, provider, wire):
     assert v3_llm.v3_route(legacy) == v3_llm.Route(provider, wire)
 
 
+@pytest.mark.parametrize(
+    "live, provider, wire",
+    [
+        ("groq:qwen/qwen3.8-27b", "groq", "qwen/qwen3.8-27b"),
+        ("groq:openai/gpt-oss-20b", "groq", "openai/gpt-oss-20b"),
+        ("openai:gpt-5.1", "openai", "gpt-5.1"),
+        ("anthropic:claude-opus-4-1-20250805", "anthropic", "claude-opus-4-1-20250805"),
+        ("google:gemini-2.5-pro", "google", "models/gemini-2.5-pro"),
+        ("google:models/gemini-2.5-pro", "google", "models/gemini-2.5-pro"),
+        ("deepseek:deepseek-reasoner", "deepseek", "deepseek-reasoner"),
+        ("mistral:mistral-medium-latest", "mistral", "mistral-medium-latest"),
+        ("moonshot:kimi-k2-turbo-preview", "moonshot", "kimi-k2-turbo-preview"),
+    ],
+)
+def test_live_listed_ids_route_to_their_provider(live, provider, wire):
+    assert v3_llm.v3_route(live) == v3_llm.Route(provider, wire)
+
+
+@pytest.mark.parametrize(
+    "bad", ["groq:", "nvidia:llama", "groq:../v1/x", "google:models/../x", "groq: qwen", "groq:-x", "groq:" + "a" * 129],
+)
+def test_malformed_live_ids_are_unsupported(bad):
+    with pytest.raises(v3_llm.UnsupportedModelError):
+        v3_llm.v3_route(bad)
+
+
+def test_live_id_builds_on_its_provider_key(keys):
+    llm = v3_llm.get_v3_llm("groq:qwen/qwen3.8-27b", "me@example.test")
+    assert llm.groq_api_key.get_secret_value() == "user-groq"
+    assert llm.model_name == "qwen/qwen3.8-27b"
+
+
 def test_legacy_id_builds_on_the_new_provider_key(keys):
     llm = v3_llm.get_v3_llm("moonshotai/kimi-k2-instruct", "me@example.test")
     assert llm.openai_api_base == "https://api.moonshot.ai/v1"
