@@ -19,6 +19,7 @@ from app.agent.context_compile import compile_board_context
 from app.agent.graph_card import build_graph_card
 from app.agent.helpers import jev
 from app.agent.store import trace_store
+from app.agent.turn_issues import note, shown_to_user
 from app.agent.citations import CITE_INSTRUCTION, extract_citations
 from app.agent.reads import Reads, _top_k as _default_top_k
 from app.agent.utils.embeddings import get_embedding, get_passage_embedding
@@ -192,18 +193,25 @@ def _event_usage(event) -> Optional[dict]:
     return None
 
 
-def _v3_turn_parts(graph, query, thread_id, board_reads, user_email, history):
+def _v3_turn_parts(graph, query, thread_id, board_reads, user_email, history, turn_issues=None):
     """(board map, inherited summary, search text, trace) for a V3 turn; empty on V2."""
     if board_reads is None:
         return "", "", None, None
+    search_text = _search_text(query, history)
+    trace = {"searchText": search_text}
+    for code in turn_issues or []:
+        note(trace, code, thread_id)
     graph_card = ""
     try:
         graph_card = build_graph_card(board_store, board_reads, user_email)
     except Exception as e:  # the map helps the model; a failure must not cost the turn
-        logger.error("Board map failed for %s: %s", thread_id, type(e).__name__)
+        note(trace, "board_map_failed", thread_id, e)
+    trace["boardMap"] = bool(graph_card)
     lineage = graph.mongo_store.get_thread_lineage_summary(thread_id)
-    search_text = _search_text(query, history)
-    return graph_card, lineage, search_text, {"searchText": search_text, "boardMap": bool(graph_card)}
+    if lineage is None:
+        note(trace, "history_unavailable", thread_id)
+        lineage = ""
+    return graph_card, lineage, search_text, trace
 
 
 def _v3_web_query(query, config, current_state, initial_messages, web_search, byok_only,
@@ -324,6 +332,7 @@ class getGraphResponse():
         user_email: Optional[str] = None,
         byok_only: bool = False,
         search_hint: Optional[dict] = None,
+        turn_issues: Optional[list] = None,
     ):
         try:
             # Check for existing state in LangGraph
@@ -354,7 +363,8 @@ class getGraphResponse():
             web_query = _v3_web_query(query, config, current_state, initial_messages,
                                       web_search, byok_only, search_hint)
             graph_card, lineage_summary, search_text, trace = _v3_turn_parts(
-                self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages))
+                self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages),
+                turn_issues)
             context_snippets, external_context_str, _web_hits, linked_answers = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
@@ -538,6 +548,8 @@ class getGraphResponse():
                         )
                 except Exception as e:
                     logger.error(f"getGraphResponse Convo save : {e}")
+                    note(trace, "not_saved", thread_id, e)
+                    self._save_trace(thread_id, user_email, msg_id, trace)
                     return False
                 self._save_trace(thread_id, user_email, msg_id, trace)
                 if byok_only:
@@ -568,6 +580,7 @@ class getGraphResponse():
         user_email: Optional[str] = None,
         byok_only: bool = False,
         search_hint: Optional[dict] = None,
+        turn_issues: Optional[list] = None,
     ):
         """Shared preparation logic for both sync and async streaming."""
         # Check for existing state in LangGraph
@@ -595,7 +608,8 @@ class getGraphResponse():
         web_query = _v3_web_query(query, config, current_state, initial_messages,
                                   web_search, byok_only, search_hint)
         graph_card, lineage_summary, search_text, trace = _v3_turn_parts(
-            self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages))
+            self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages),
+            turn_issues)
         context_snippets, external_context_str, web_hits, linked_answers = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
@@ -694,7 +708,7 @@ class getGraphResponse():
         try:
             trace_store.save_trace(board_store, thread_id, user_email, msg_id, trace)
         except Exception as e:  # the trace explains a turn; it is never worth failing one
-            logger.error("Context trace not saved for %s: %s", thread_id, type(e).__name__)
+            note(None, "trace_not_saved", thread_id, e)
 
     def _hydrate_recent_messages(
         self,
@@ -760,6 +774,8 @@ class getGraphResponse():
         # embedding provider is down, and it never blocks the turn.
         if web_search and getattr(settings, "WEB_SEARCH_ENABLED", True):
             web_hits = search_web(web_query or query, max_results=WEB_CONTEXT_LIMIT)
+            if not web_hits and board_reads is not None:
+                note(trace, "web_search_empty", thread_id)
             if web_hits:
                 logger.info(
                     "Web search injected %s snippets for thread %s", len(web_hits), thread_id
@@ -790,6 +806,8 @@ class getGraphResponse():
         embedded = _has_meaningful_embedding(query_embedding)
         if trace is not None:
             trace["embeddingFailed"] = not embedded
+            if not embedded:
+                note(trace, "embedding_down", thread_id)
 
         # V3: the server read set decides what is read (contextNodeIds is ignored).
         # Notes, linked answers and keyword search need no embedding, so they go in either way.
@@ -811,6 +829,7 @@ class getGraphResponse():
             except Exception as e:
                 logger.exception("Board context build failed for chat %s (thread %s)",
                                  board_reads.chat_id, thread_id)
+                note(trace, "sources_unavailable", thread_id, e)
 
         def add_board_blocks() -> Optional[str]:
             """Numbered notes and kept chunks join EXTERNAL_CONTEXT; returns the LINKED_ANSWERS block.
@@ -854,6 +873,8 @@ class getGraphResponse():
                 )
         except Exception as e:
             logger.error(f"Similarity search failed: {e}")
+            if board_reads is not None:
+                note(trace, "past_search_failed", thread_id, e)
 
         if board_reads is not None:
             if board_ctx is not None:
@@ -905,6 +926,7 @@ class getGraphResponse():
         byok_only: bool = False,
         on_key_rejected: Optional[Callable[[], None]] = None,
         search_hint: Optional[dict] = None,
+        turn_issues: Optional[list] = None,
     ):
         try:
             # Everything blocking (DB reads, embeddings, web search, the query rewrite, page
@@ -929,6 +951,7 @@ class getGraphResponse():
                 user_email=user_email,
                 byok_only=byok_only,
                 search_hint=search_hint,
+                turn_issues=turn_issues,
             )
 
             full_response = ""
@@ -950,6 +973,9 @@ class getGraphResponse():
                 context_frame = {"embeddingFailed": bool(trace.get("embeddingFailed")),
                                  "agentSteps": [s["tool"] for s in agent_steps]}
                 yield f"data: {json.dumps({'context': context_frame})}\n\n"
+            told = shown_to_user(trace)
+            if told:
+                yield f"data: {json.dumps({'issues': told})}\n\n"
             if trace and (trace.get("sideQuestion") or 0.0) >= SIDE_QUESTION_SURE:
                 yield f"data: {json.dumps({'suggest': {'branch': True}})}\n\n"
 
@@ -1066,6 +1092,12 @@ class getGraphResponse():
                 await asyncio.to_thread(save_turn)
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
+                if trace is not None:
+                    note(trace, "not_saved", thread_id, e)
+                    late = shown_to_user(trace, {i["code"] for i in told})
+                    if late:
+                        yield f"data: {json.dumps({'issues': late})}\n\n"
+                    await asyncio.to_thread(self._save_trace, thread_id, user_email, msg_id, trace)
 
             if byok_only and should_save_assistant:
                 # A small call of its own: a hidden line inside the answer could leak into the stream.

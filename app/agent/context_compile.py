@@ -17,6 +17,7 @@ from app.agent.helpers import jev
 from app.agent.helpers.v3_llm import get_v3_llm, turn_key_from, v3_route
 from app.agent.reads import Reads
 from app.agent.store.board_store import store as board_store
+from app.agent.turn_issues import note
 from app.core.config import settings
 
 
@@ -59,6 +60,10 @@ def compile_board_context(ctx: BoardContext, reads: Reads, question: str, graph_
     fit = fit_to_budget(ctx, found + ranked, fixed_chars, budget_tokens, scores)
     numbered = number_passages(fit.ctx, fit.chunks)
 
+    if judgement.status == "error":
+        note(trace, "jev_failed", reads.chat_id)
+    if agent_failed:
+        note(trace, "agent_failed", reads.chat_id)
     if trace is not None:
         trace.update({
             "jev": judgement.status,

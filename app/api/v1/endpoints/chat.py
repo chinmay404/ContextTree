@@ -39,6 +39,7 @@ from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
 from app.agent.reads import _top_k as card_top_k, resolve_reads
 from app.agent.summary_blocks import cover_messages
+from app.agent.turn_issues import alert
 from app.agent.store.board_store import store as board_store
 from app.api.errors import ApiError
 from app.api.limiter import limiter, user_key
@@ -194,9 +195,18 @@ def _whole_carry_split(messages: list) -> tuple[list, list]:
     return messages[:buffer_start], messages[buffer_start:]
 
 
+class BranchInitFailed(ApiError):
+    """The branch has no history and would answer as if it never had any. Nothing was sent."""
+
+    def __init__(self):
+        super().__init__(503, "branch_init_failed",
+                         "This branch couldn't load its history, so your message wasn't sent. Try again.")
+
+
 def _inherit_lineage(active_graph, user_id: str, parent_thread_id: str, messages: list,
-                     chat_message: ChatMessage, turn_key: TurnKey) -> str:
-    """The parent's own inheritance, then frozen blocks over its messages up to the fork."""
+                     chat_message: ChatMessage, turn_key: TurnKey) -> tuple[str, bool]:
+    """(the parent's own inheritance, then frozen blocks over its messages up to the fork; did it
+    all work?)."""
     store_ = active_graph.mongo_store
     llm = get_v3_llm(chat_message.model_name, None, resolved=turn_key.resolved())
 
@@ -212,6 +222,7 @@ def _inherit_lineage(active_graph, user_id: str, parent_thread_id: str, messages
         return sanitize_summary_text(invoke_on_user_key(traced, prompt, turn_key.provider).content)
 
     above = store_.get_thread_lineage_summary(parent_thread_id)
+    complete = above is not None
     try:
         email = board_store.resolve_user_email(user_id)
         blocks = cover_messages(board_store, email, parent_thread_id, messages, summarize)
@@ -220,15 +231,17 @@ def _inherit_lineage(active_graph, user_id: str, parent_thread_id: str, messages
     except Exception as e:  # the branch still starts, with its verbatim buffer and what is above
         logger.error("Summary blocks failed (V3 turn): %s", type(e).__name__)
         blocks = ""
-    return "\n\n".join(part for part in (above, blocks) if part)
+        complete = False
+    return "\n\n".join(part for part in (above, blocks) if part), complete
 
 
 def _init_fork_if_needed(
     chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary",
     turn_key: Optional[TurnKey] = None,
-) -> None:
+) -> Optional[list]:
     """
     On the first message of a branched node, seed the new thread from the parent.
+    Returns the issue codes the turn should report, if any.
 
     carry modes (spec 5.4):
       summary (default) - compressed summary of the lineage + the last
@@ -407,14 +420,17 @@ def _init_fork_if_needed(
     new_memory_facts = parent_memory_facts if fork_source.get("skip_resummarize") else extract_memory_facts({}, messages_data)
     new_summary_embedding = []
     lineage_summary = None
+    fork_issues: list = []
 
     # V3 branch from a known message: inherit frozen blocks. Siblings reuse them, later messages in
     # the parent can't leak in, and the lineage above the parent comes along with them.
     if (turn_key is not None and carry == "summary" and not force_summarize
             and fork_source.get("mode") == "scoped-fork-point"):
-        lineage_summary = _inherit_lineage(
+        lineage_summary, complete = _inherit_lineage(
             active_graph, user_id, parent_thread_id, messages_to_summarize, chat_message, turn_key
         )
+        if not complete:
+            fork_issues.append("history_partial")
         new_summary = ""
         messages_to_summarize = []
 
@@ -495,7 +511,7 @@ def _init_fork_if_needed(
     # written under a transaction-scoped advisory lock keyed on the new
     # thread_id. Concurrent first-message requests for the same fork serialize
     # at this point and the loser observes is_initialized=true and returns.
-    active_graph.mongo_store.fork_thread(
+    forked = active_graph.mongo_store.fork_thread(
         user_id=user_id,
         source_thread_id=parent_thread_id,
         new_thread_id=chat_message.conversation_id,
@@ -506,11 +522,15 @@ def _init_fork_if_needed(
         memory_facts=new_memory_facts,
         lineage_summary=lineage_summary,
     )
+    if not forked and turn_key is not None:
+        alert("branch_init_failed", str(chat_message.conversation_id))
+        raise BranchInitFailed()
     logger.info(
         f"Fork initialised: {parent_thread_id} → {chat_message.conversation_id} "
         f"at message {fork_at_message_id} "
         f"(buffer={len(buffer_messages)}, summary_chars={len(new_summary or '')})"
     )
+    return fork_issues
 
 
 # ── V3 card gate ──────────────────────────────────────────────────────────────
@@ -671,8 +691,8 @@ async def get_response(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         # Blocking work (the branch-start summary calls a model) runs off the event loop.
-        await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "http", user_id,
-                                carry=carry, turn_key=turn_key)
+        fork_issues = await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "http", user_id,
+                                              carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "http", user_id)
@@ -691,6 +711,7 @@ async def get_response(
             regenerate_last_user=chat_message.regenerate_last_user,
             web_search=chat_message.web_search,
             byok_only=turn_key is not None,
+            turn_issues=fork_issues,
             **graph_kw,
         )
         if not res:
@@ -704,6 +725,9 @@ async def get_response(
     except KeyRejectedError as e:
         await run_in_threadpool(_refund_daily_quota, active_graph, charge)
         raise ApiError(400, "key_rejected", e.provider)
+    except BranchInitFailed:
+        await run_in_threadpool(_refund_daily_quota, active_graph, charge)
+        raise
     except HTTPException:
         raise
     except Exception as e:
@@ -745,8 +769,8 @@ async def stream_response(
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=access_error)
 
         # Blocking work (the branch-start summary calls a model) runs off the event loop.
-        await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "sse", user_id,
-                                carry=carry, turn_key=turn_key)
+        fork_issues = await run_in_threadpool(_init_fork_if_needed, chat_message, active_graph, "sse", user_id,
+                                              carry=carry, turn_key=turn_key)
         graph_kw = await run_in_threadpool(_graph_kwargs, chat_message, card, v3_email, carry)
 
         config = _build_chat_run_config(chat_message, "sse", user_id)
@@ -766,6 +790,7 @@ async def stream_response(
                 web_search=chat_message.web_search,
                 byok_only=turn_key is not None,
                 on_key_rejected=lambda: _refund_daily_quota(active_graph, charge),
+                turn_issues=fork_issues,
                 **graph_kw,
             ),
             media_type="text/event-stream",
@@ -775,6 +800,9 @@ async def stream_response(
         logger.warning("V3 turn on %s: %s refused the user's key", chat_message.conversation_id, e.provider)
         await run_in_threadpool(_refund_daily_quota, active_graph, charge)
         return StreamingResponse(_key_rejected_stream(e.provider), media_type="text/event-stream")
+    except BranchInitFailed:
+        await run_in_threadpool(_refund_daily_quota, active_graph, charge)
+        raise
     except HTTPException:
         raise
     except Exception as e:

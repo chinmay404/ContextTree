@@ -279,8 +279,9 @@ class PostgresConversationStore:
             logger.error(f"Error getting thread messages: {e}")
             return []
 
-    def get_thread_lineage_summary(self, thread_id: str) -> str:
-        """What this branch inherited, frozen at its fork ('' for a root or a V2 branch)."""
+    def get_thread_lineage_summary(self, thread_id: str) -> Optional[str]:
+        """What this branch inherited, frozen at its fork ('' for a root or a V2 branch).
+        None means it could not be read, which the caller must not mistake for "nothing"."""
         try:
             with self._get_conn() as conn:
                 cur = conn.cursor()
@@ -289,7 +290,7 @@ class PostgresConversationStore:
                 return (row[0] or "") if row else ""
         except Exception as e:
             logger.error(f"Error getting lineage summary: {e}")
-            return ""
+            return None
 
     def get_thread_recent_messages(self, user_id: str, thread_id: str, limit: int) -> List[dict]:
         try:
