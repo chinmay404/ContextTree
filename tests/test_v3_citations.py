@@ -521,3 +521,13 @@ def test_v2_stream_has_no_citations_frame_and_stores_none(api, db, user, fake_mo
     with db.cursor() as cur:
         cur.execute("SELECT role, citations FROM messages WHERE node_id = %s ORDER BY position", (node,))
         assert cur.fetchall() == [("user", None), ("assistant", None)]
+
+
+def test_v3_prompt_says_the_desk_is_what_the_question_is_about():
+    """Owner 2026-10-24: a note strung to a chat, "Give me description for the repo", and the model
+    asked which repo. The V3 instructions now read desk sources as what the user means."""
+    from app.agent.helpers.load_prompt import load_prompt_from_yaml
+
+    prompt = load_prompt_from_yaml("SYSTEM_PROMPT_V3")
+    assert "on purpose" in prompt and "the repo" in prompt
+    assert prompt.index("Answer from them first") < prompt.index("ask a short clarifying question")
