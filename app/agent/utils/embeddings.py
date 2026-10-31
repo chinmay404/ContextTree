@@ -3,6 +3,7 @@ import hashlib
 import math
 from functools import lru_cache
 from typing import List
+import httpx
 from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from app.core.logger import logger
@@ -11,6 +12,13 @@ from app.core.config import settings
 load_dotenv()
 
 EXPECTED_EMBEDDING_DIM = int(os.getenv("GOOGLE_EMBEDDING_DIM", "768"))
+
+NIM_URL = "https://integrate.api.nvidia.com/v1/embeddings"
+NIM_BATCH = 64
+# The model allows keeping its first 1024 or 512 values. 512 fits the vector(768) column with no
+# schema change: the unused values stay zero, which cosine similarity ignores.
+NIM_KEEP_DIMS = 512
+NIM_TIMEOUT_SECONDS = 30
 
 _EMBEDDING_MODEL_CANDIDATES = tuple(
     model_name
@@ -69,7 +77,46 @@ def _embed_documents_with_model(model_name: str, texts: List[str]) -> List[List[
     return [_shape_embedding(vector) for vector in vectors]
 
 
+def _nim_transport() -> httpx.BaseTransport | None:
+    return None  # httpx's default; tests replace it
+
+
+def _nim_request(texts: List[str]) -> List[List[float] | None]:
+    """One call; a 400 splits the batch, so one oversized text can't lose its batchmates."""
+    with httpx.Client(transport=_nim_transport(), timeout=NIM_TIMEOUT_SECONDS) as client:
+        reply = client.post(
+            NIM_URL,
+            headers={"Authorization": f"Bearer {settings.NVIDIA_API_KEY}"},
+            json={"model": settings.NIM_EMBEDDING_MODEL, "input": texts, "encoding_format": "float"},
+        )
+    if reply.status_code == 400:
+        if len(texts) == 1:
+            logger.warning("NIM refused a text as too long or invalid; it gets no embedding")
+            return [None]
+        middle = len(texts) // 2
+        return _nim_request(texts[:middle]) + _nim_request(texts[middle:])
+    if reply.status_code != 200:
+        raise RuntimeError(f"NIM embeddings answered HTTP {reply.status_code}")
+    rows = sorted(reply.json()["data"], key=lambda row: row["index"])
+    return [_shape_embedding(row["embedding"][:NIM_KEEP_DIMS]) for row in rows]
+
+
+def _embed_with_nim(texts: List[str]) -> List[List[float]]:
+    if not settings.NVIDIA_API_KEY:
+        raise RuntimeError("NVIDIA_API_KEY is not set")
+    out: List[List[float]] = [[0.0] * EXPECTED_EMBEDDING_DIM for _ in texts]  # blank text has no meaning to embed
+    filled = [i for i, text in enumerate(texts) if (text or "").strip()]
+    for start in range(0, len(filled), NIM_BATCH):
+        part = filled[start:start + NIM_BATCH]
+        for i, vector in zip(part, _nim_request([texts[i] for i in part])):
+            if vector is not None:
+                out[i] = vector
+    return out
+
+
 def _embed_query(text: str) -> List[float]:
+    if settings.EMBEDDING_PROVIDER == "nim":
+        return _embed_with_nim([text])[0]
     last_error: Exception | None = None
     for model_name in _EMBEDDING_MODEL_CANDIDATES:
         try:
@@ -82,6 +129,8 @@ def _embed_query(text: str) -> List[float]:
 
 
 def _embed_documents(texts: List[str]) -> List[List[float]]:
+    if settings.EMBEDDING_PROVIDER == "nim":
+        return _embed_with_nim(texts)
     last_error: Exception | None = None
     for model_name in _EMBEDDING_MODEL_CANDIDATES:
         try:
