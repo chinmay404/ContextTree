@@ -16,7 +16,7 @@ from app.core.deploy_info import get_deploy_info
 from fastapi import Request
 
 # The newest file in db/migrations (a test keeps this true): a deploy ahead of its migration shows here.
-EXPECTED_MIGRATION = "011_context_engine.sql"
+EXPECTED_MIGRATION = "012_board_marks.sql"
 
 
 router = APIRouter()

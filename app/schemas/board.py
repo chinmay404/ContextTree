@@ -1,6 +1,6 @@
 """Pydantic v2 models for the V3 board API (camelCase on the wire)."""
 from copy import deepcopy
-from typing import Any, Literal, Optional
+from typing import Annotated, List, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -93,6 +93,18 @@ class EdgeCreate(_Model):
     kind: Literal["wire", "answer"]
     from_: str = Field(alias="from", pattern=ID_PATTERN)
     to: str = Field(pattern=ID_PATTERN)
+
+
+class MarkCreate(_Model):
+    id: str = Field(pattern=ID_PATTERN)
+    kind: Literal["pen", "arrow", "highlight"]
+    color: Literal["ink", "red", "blue"]
+    size: float = Field(default=3, gt=0, le=400)  # world units, chosen for the zoom it was drawn at
+    # [x, y] or [x, y, pressure]. World units, or relative to the anchor when there is one.
+    points: List[Annotated[List[float], Field(min_length=2, max_length=3)]] = Field(min_length=1, max_length=5000)
+    anchor_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
+    note_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
+    touches: List[str] = Field(default_factory=list, max_length=50)
 
 
 class EdgeWhy(_Model):
