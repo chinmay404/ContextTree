@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     # google (Gemini, the default) or nim. Vectors from two models can't be compared, so switching
     # means running scripts/reembed.py, and one provider never falls back to the other.
     EMBEDDING_PROVIDER: str = "google"
-    NIM_EMBEDDING_MODEL: str = "nvidia/nemotron-3-embed-1b"
+    NIM_EMBEDDING_MODEL: str = "nvidia/nemotron-3.5-embed-1b"
     # Total prompt budget for a V3 chat that sets none of its own.
     CONTEXT_BUDGET_TOKENS: int = 12000
     CONTEXT_MIN_SOURCE_TOKENS: int = 4000

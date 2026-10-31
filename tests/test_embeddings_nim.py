@@ -48,6 +48,34 @@ def test_request_shape_and_auth(wire):
     assert body["model"] == settings.NIM_EMBEDDING_MODEL and body["input"] == ["hello"]
 
 
+def test_a_question_and_a_stored_text_are_marked_differently(wire):
+    """Without this flag the live model scored 3 of 12 on a small check; with it, 12 of 12."""
+    embeddings.get_embedding("a question")
+    embeddings.get_embeddings(["a document"])
+    embeddings.get_passage_embedding("an answer to keep")
+    assert [b["input_type"] for _, b in wire.requests] == ["query", "passage", "passage"]
+
+
+def test_stored_messages_are_embedded_as_passages(wire, monkeypatch):
+    from app.agent import main
+    monkeypatch.setattr(main, "get_embedding", lambda t: (_ for _ in ()).throw(AssertionError("query path")))
+    assert any(main._stored_embedding("an answer to keep"))
+    assert wire.requests[-1][1]["input_type"] == "passage"
+
+
+def test_with_gemini_stored_text_keeps_the_one_kind_of_call(monkeypatch):
+    from app.agent import main
+    monkeypatch.setattr(settings, "EMBEDDING_PROVIDER", "google")
+    monkeypatch.setattr(main, "get_embedding", lambda t: [1.0] * 768)
+    assert main._stored_embedding("text") == [1.0] * 768
+
+
+def test_very_long_text_is_clipped_not_refused(wire):
+    wire.reject_over = embeddings.NIM_MAX_CHARS
+    assert any(embeddings.get_embedding("x" * 80_000))
+    assert len(wire.requests[-1][1]["input"][0]) == embeddings.NIM_MAX_CHARS
+
+
 def test_vector_fits_the_768_column_and_is_a_unit_vector(wire):
     vector = embeddings.get_embedding("hello")
     assert len(vector) == 768
@@ -66,7 +94,7 @@ def test_large_lists_go_in_batches(wire):
     assert [len(b["input"]) for _, b in wire.requests] == [embeddings.NIM_BATCH, embeddings.NIM_BATCH, 1]
 
 
-def test_one_oversized_text_does_not_lose_its_batchmates(wire):
+def test_one_refused_text_does_not_lose_its_batchmates(wire):
     wire.reject_over = 10
     out = embeddings.get_embeddings(["short", "x" * 50, "also"])
     assert len(out) == 3

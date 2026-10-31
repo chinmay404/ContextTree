@@ -21,7 +21,7 @@ from app.agent.helpers import jev
 from app.agent.store import trace_store
 from app.agent.citations import CITE_INSTRUCTION, extract_citations
 from app.agent.reads import Reads, _top_k as _default_top_k
-from app.agent.utils.embeddings import get_embedding
+from app.agent.utils.embeddings import get_embedding, get_passage_embedding
 from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
 from app.agent.helpers.web_query import rewrite_search_query
@@ -137,6 +137,13 @@ def _budget_history(current_state, initial_messages) -> list:
         return initial_messages
     values = getattr(current_state, "values", None) or {}
     return list(values.get("messages") or [])
+
+
+def _stored_embedding(text: str) -> list:
+    """A message being stored. NIM embeds stored text differently from a question; Gemini doesn't."""
+    if settings.EMBEDDING_PROVIDER == "nim":
+        return get_passage_embedding(text)
+    return get_embedding(text)
 
 
 def _search_text(query: str, history) -> str:
@@ -506,7 +513,7 @@ class getGraphResponse():
                             role="user",
                             text=query,
                             message_id=msg_id,
-                            embedding=get_embedding(query) or [],
+                            embedding=_stored_embedding(query) or [],
                             summary=updated_summary,
                             summarize_fn="None",
                             embed_summary_fn=get_embedding,
@@ -521,7 +528,7 @@ class getGraphResponse():
                             role="assistant",
                             message_id=f"{msg_id}_ai",
                             text=answer_text,
-                            embedding=get_embedding(str(final_message)) or [],
+                            embedding=_stored_embedding(str(final_message)) or [],
                             summary=updated_summary,
                             summarize_fn="None",
                             embed_summary_fn=get_embedding,
@@ -1039,7 +1046,7 @@ class getGraphResponse():
                         self.mongo_store.add_message(
                             user_id=user_id, thread_id=thread_id,
                             role="user", text=raw_query, message_id=msg_id,
-                            embedding=get_embedding(raw_query) or [],
+                            embedding=_stored_embedding(raw_query) or [],
                             summary=updated_summary, summarize_fn="None",
                             embed_summary_fn=get_embedding, context_fn=[]
                         )
@@ -1048,7 +1055,7 @@ class getGraphResponse():
                             user_id=user_id, thread_id=thread_id,
                             role="assistant", message_id=f"{msg_id}_ai",
                             text=full_response,
-                            embedding=get_embedding(full_response) or [],
+                            embedding=_stored_embedding(full_response) or [],
                             summary=updated_summary, summarize_fn="None",
                             embed_summary_fn=get_embedding, context_fn=[],
                             citations=citations,
