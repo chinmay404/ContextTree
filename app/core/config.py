@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # (SSRF-guarded + char-capped; see app/agent/helpers/web_fetch.py).
     WEB_FETCH_ENABLED: bool = True
 
+    # ── YouTube transcripts (app/agent/helpers/youtube.py) ─────────────────────
+    # YouTube blocks most cloud IPs; a residential proxy URL gets around that (paid, not guaranteed).
+    YOUTUBE_PROXY_URL: Optional[str] = None
+    # Off by default: when captions fail, Gemini transcribes the video on GOOGLE_API_KEY's quota.
+    YOUTUBE_GEMINI_FALLBACK: bool = False
+    YOUTUBE_GEMINI_MODEL: str = "gemini-2.5-flash"
+
     # ── Context assembly ───────────────────────────────────────────────────────
     # Max tokens reserved for rolling summary
     MAX_SUMMARY_TOKENS: int = 500

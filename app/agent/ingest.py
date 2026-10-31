@@ -18,6 +18,10 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.agent.helpers.get_llm import get_llm
 from app.agent.helpers.web_fetch import fetch_url_content
+from app.agent.helpers.youtube import (
+    YT_ID, TranscriptError, duration_label, fetch_ai_transcript, fetch_captions, parse_timed_lines,
+    transcript_chunks,
+)
 from app.agent.memory import sanitize_summary_text
 from app.agent.store.board_store import BoardStore, store
 from app.agent.utils.embeddings import get_embedding, get_embeddings
@@ -35,6 +39,17 @@ OVERVIEW_MAX_CHARS = 600
 WEB_INGEST_MAX_CHARS = 60_000
 DOC_TEXT_MAX_CHARS = 100_000
 MAX_EMBED_CHUNKS = 300  # bound embedding work per source; the first N chunks are kept
+THIN_PAGE_CHARS = 40  # less than this is a loading screen or an empty app shell, not a page
+AI_TRANSCRIPTS_PER_DAY = 5  # per user: each one spends the engine's own Google quota
+TIMED_PASTE_SHARE = 0.8  # a paste counts as timed when most of it sits under its timestamps
+TIME_LABEL_CHARS = 8  # roughly what one "[00:10] " takes up in a pasted transcript
+THIN_PAGE_ERROR = "This page has almost no readable text. It may need a browser to load."
+
+_VIDEO_ERRORS = {
+    "no_captions": "This video has no captions. You can paste its transcript instead.",
+    "blocked": "YouTube didn't let our server read this video. You can paste its transcript instead.",
+    "failed": "Couldn't read this video's transcript. You can paste it instead.",
+}
 
 _OVERVIEW_PROMPT = (
     "Summarise this source in 2–3 plain sentences for someone deciding whether to read it.\n\n"
@@ -260,6 +275,125 @@ def ingest_file_source(card_id: str, user_email: str) -> None:
         _fail(card_id, user_email, str(e) or "Ingestion failed")
 
 
+def _save_text_file(card_id: str, user_email: str, canvas_id, name: str, file_type: str, text: str,
+                    file_id: Optional[str] = None) -> str:
+    """A card's text file row (web page, transcript), made or replaced; returns its id."""
+    file_id = file_id or f"file_{card_id}"
+    with store.tx() as cur:
+        cur.execute(
+            "INSERT INTO external_files (id, user_email, node_id, canvas_id, file_name, file_type, "
+            "mime_type, content, data, processed) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,false) "
+            "ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, processed = false, "
+            "updated_at = NOW() WHERE external_files.user_email = EXCLUDED.user_email",
+            (file_id, user_email, card_id, canvas_id, _clip_text(name, 200), file_type, file_type, text),
+        )
+    return file_id
+
+
+def _ingest_linked_pdf(card_id: str, user_email: str, canvas_id, page: dict) -> None:
+    """A web link that turned out to be a PDF becomes a PDF source, read by the file path."""
+    raw = page["pdf"]
+    if not raw.startswith(b"%PDF-"):
+        _fail(card_id, user_email, "Couldn't read this page")
+        return
+    name = _clip_text(page.get("title") or "document.pdf", 200)
+    stem = name[:-4] if name.lower().endswith(".pdf") else name
+    patch = {"title": stem or name, "fileName": name, "fileType": "application/pdf", "fileSize": len(raw)}
+    with store.tx() as cur:
+        cur.execute(
+            "INSERT INTO external_files (id, user_email, node_id, canvas_id, file_name, file_type, "
+            "file_size, data, mime_type, processed) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,false) "
+            "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, file_size = EXCLUDED.file_size, "
+            "processed = false, updated_at = NOW() WHERE external_files.user_email = EXCLUDED.user_email",
+            (f"file_{card_id}", user_email, card_id, canvas_id, name, "application/pdf", len(raw), raw,
+             "application/pdf"),
+        )
+        cur.execute(
+            "UPDATE nodes SET source_type = 'pdf', data = coalesce(data,'{}') || %s::jsonb, updated_at = now() "
+            "WHERE id = %s AND user_email = %s AND status = 'processing' AND deleted_at IS NULL",
+            (json.dumps(patch), card_id, user_email),
+        )
+    ingest_file_source(card_id, user_email)
+
+
+def _ai_transcripts_today(user_email: str) -> int:
+    with store.tx() as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM nodes WHERE user_email = %s AND source_type = 'video' "
+            "AND data->>'transcriptOrigin' = 'ai' AND updated_at > now() - interval '1 day'",
+            (user_email,),
+        )
+        return cur.fetchone()["n"]
+
+
+def _ai_parts(video_id: str, user_email: str) -> list[dict]:
+    """Gemini's transcript when the fallback is on and the user has some left today, else []."""
+    if not settings.YOUTUBE_GEMINI_FALLBACK or _ai_transcripts_today(user_email) >= AI_TRANSCRIPTS_PER_DAY:
+        return []
+    return fetch_ai_transcript(video_id)
+
+
+def _finish_transcript(card_id, user_email, canvas_id, title, chunks, metas, text, patch) -> None:
+    file_id = _save_text_file(card_id, user_email, canvas_id, title, "text/plain", text)
+    _embed_and_finish(card_id, file_id, user_email, chunks, metas, text, patch)
+
+
+def ingest_video_source(card_id: str, user_email: str) -> None:
+    try:
+        with store.tx() as cur:
+            cur.execute(
+                "SELECT data->>'ytid' AS ytid, data->>'title' AS title, canvas_id FROM nodes "
+                "WHERE id = %s AND user_email = %s",
+                (card_id, user_email),
+            )
+            row = cur.fetchone()
+        if not row or not YT_ID.fullmatch(row["ytid"] or ""):
+            _fail(card_id, user_email, _VIDEO_ERRORS["failed"])
+            return
+        origin, label = "captions", "YouTube"
+        try:
+            parts = fetch_captions(row["ytid"])
+        except TranscriptError as e:
+            logger.warning("YouTube captions unavailable for a video (%s)", e.reason)
+            parts = _ai_parts(row["ytid"], user_email)
+            if not parts:
+                _fail(card_id, user_email, _VIDEO_ERRORS[e.reason])
+                return
+            origin, label = "ai", "YouTube · AI transcript"
+        chunks, metas, text = transcript_chunks(parts)
+        patch = {"meta": f"{label} · {duration_label(parts)}", "transcriptOrigin": origin, "error": None}
+        _finish_transcript(card_id, user_email, row["canvas_id"], row["title"] or "YouTube video",
+                           chunks, metas, text, patch)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"ingest_video_source({card_id}) failed: {e}")
+        _fail(card_id, user_email, _VIDEO_ERRORS["failed"])
+
+
+def ingest_pasted_transcript(card_id: str, user_email: str, pasted: str) -> None:
+    """The user's own transcript of a video: kept timed when it has timestamps, else in sections."""
+    try:
+        with store.tx() as cur:
+            cur.execute("SELECT data->>'title' AS title, canvas_id FROM nodes WHERE id = %s AND user_email = %s",
+                        (card_id, user_email))
+            row = cur.fetchone()
+        if not row:
+            return
+        parts = parse_timed_lines(pasted)
+        kept = sum(len(p["text"]) + TIME_LABEL_CHARS for p in parts)
+        if len(parts) >= 2 and kept >= TIMED_PASTE_SHARE * len(pasted.strip()):
+            chunks, metas, text = transcript_chunks(parts)
+        else:
+            text = pasted.strip()
+            chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(text)
+            metas = add_locators("video", [{} for _ in chunks])
+        patch = {"meta": "YouTube · pasted transcript", "transcriptOrigin": "pasted", "error": None}
+        _finish_transcript(card_id, user_email, row["canvas_id"], row["title"] or "YouTube video",
+                           chunks, metas, text, patch)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"ingest_pasted_transcript({card_id}) failed: {e}")
+        _fail(card_id, user_email, "Couldn't read that transcript")
+
+
 def ingest_web_source(card_id: str, user_email: str) -> None:
     try:
         with store.tx() as cur:
@@ -272,21 +406,21 @@ def ingest_web_source(card_id: str, user_email: str) -> None:
             _fail(card_id, user_email, "Couldn't read this page")
             return
         page = fetch_url_content(row["url"], WEB_INGEST_MAX_CHARS)
+        if page and page.get("error"):
+            _fail(card_id, user_email, page["error"])
+            return
+        if page and page.get("pdf"):
+            _ingest_linked_pdf(card_id, user_email, row["canvas_id"], page)
+            return
         if not page or not (page.get("text") or "").strip():
             _fail(card_id, user_email, "Couldn't read this page")
             return
         text = page["text"]
-        file_id = f"file_{card_id}"
-        with store.tx() as cur:
-            cur.execute(
-                "INSERT INTO external_files (id, user_email, node_id, canvas_id, file_name, file_type, "
-                "mime_type, content, data, processed) "
-                "VALUES (%s,%s,%s,%s,%s,'text/html','text/html',%s,NULL,false) "
-                "ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, processed = false, "
-                "updated_at = NOW() WHERE external_files.user_email = EXCLUDED.user_email",
-                (file_id, user_email, card_id, row["canvas_id"],
-                 _clip_text(page.get("title") or row["url"], 200), text),
-            )
+        if len(text.strip()) < THIN_PAGE_CHARS:
+            _fail(card_id, user_email, THIN_PAGE_ERROR)
+            return
+        file_id = _save_text_file(card_id, user_email, row["canvas_id"], page.get("title") or row["url"],
+                                  "text/html", text)
         chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(text)
         if not chunks:
             _fail(card_id, user_email, "Couldn't read this page")

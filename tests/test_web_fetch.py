@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from app.agent.helpers import safe_fetch, web_fetch
 from app.agent.helpers.web_fetch import (
     DEFAULT_MAX_CHARS,
     MAX_FETCH_URLS,
@@ -272,6 +273,22 @@ def test_the_gzip_probe_page_stores_no_nul(fake_httpx):
 
 # ── pasted pages are fetched together, under one deadline ──
 
+def test_fetch_pages_can_take_a_shorter_deadline(monkeypatch):
+    seen = {}
+
+    def fetch_many(urls, **kw):
+        seen.update(kw)
+        return []
+
+    monkeypatch.setattr(safe_fetch, "fetch_many", fetch_many)
+    web_fetch.fetch_pages(["http://8.8.8.8/a"], 100, timeout=4)
+    assert seen["timeout"] == 4
+
+
+def test_format_page_snippets_can_continue_a_numbering():
+    assert format_page_snippets([{"title": "T", "url": "u", "text": "x"}], start=3) == ["[page 3 | T | u] x"]
+
+
 def test_two_pages_are_fetched_concurrently(monkeypatch):
     import asyncio
     import time
@@ -309,3 +326,70 @@ def test_a_page_past_the_deadline_is_dropped_and_the_rest_kept(monkeypatch):
     pages = web_fetch.fetch_pages(["http://9.9.9.9/hang", "http://8.8.8.8/fast"])
     assert [p["text"] for p in pages] == ["fast"]
     assert time.monotonic() - started < 2.0
+
+
+# ── main-content extraction (connectors) ───────────────────────
+
+
+ARTICLE = (
+    "<html><head><title>A long read</title></head><body>"
+    "<nav><a href='/'>Home</a><a href='/pricing'>Pricing</a><a href='/login'>Sign in</a></nav>"
+    "<article><h1>A long read</h1>"
+    + "".join(f"<p>Paragraph {i} explains how the river changes its course over many years of slow erosion.</p>"
+              for i in range(12))
+    + "</article><footer>Copyright Example Corp. Cookie settings. Privacy policy.</footer></body></html>"
+)
+
+
+def test_extract_text_keeps_the_article_and_drops_menus_and_footers():
+    title, text = _extract_text("text/html", ARTICLE)
+    assert title == "A long read"
+    assert "Paragraph 11 explains" in text
+    assert "Sign in" not in text and "Cookie settings" not in text
+
+
+def test_extract_text_keeps_paragraph_breaks_for_the_splitter():
+    _, text = _extract_text("text/html", ARTICLE)
+    assert "\n" in text
+
+
+def test_extract_text_falls_back_to_all_text_when_the_extractor_finds_little(monkeypatch):
+    import trafilatura
+    monkeypatch.setattr(trafilatura, "extract", lambda *a, **k: "tiny")
+    _, text = _extract_text("text/html", ARTICLE)
+    assert "Paragraph 11 explains" in text and "Sign in" in text
+
+
+def test_extract_text_survives_an_extractor_that_raises(monkeypatch):
+    import trafilatura
+
+    def boom(*a, **k):
+        raise ValueError("bad tree")
+
+    monkeypatch.setattr(trafilatura, "extract", boom)
+    _, text = _extract_text("text/html", ARTICLE)
+    assert "Paragraph 11 explains" in text
+
+
+def _pdf_fetched(body=b"%PDF-1.7 bytes", url="https://8.8.8.8/papers/Deep%20Dive.pdf"):
+    return safe_fetch.Fetched(url, "8.8.8.8", "application/pdf", True, body, "utf-8")
+
+
+def test_fetch_returns_the_bytes_of_a_linked_pdf(monkeypatch):
+    seen = {}
+
+    def fake(url, **kw):
+        seen.update(kw)
+        return _pdf_fetched()
+
+    monkeypatch.setattr(safe_fetch, "fetch", fake)
+    page = fetch_url_content("https://8.8.8.8/papers/Deep%20Dive.pdf")
+    assert page["pdf"] == b"%PDF-1.7 bytes" and page["title"] == "Deep Dive.pdf"
+    assert "application/pdf" in seen["accept_types"]
+
+
+def test_fetch_says_when_a_linked_pdf_is_over_the_cap(monkeypatch):
+    big = _pdf_fetched(body=b"x" * web_fetch.MAX_PDF_BYTES)
+    monkeypatch.setattr(safe_fetch, "fetch", lambda url, **kw: big)
+    page = fetch_url_content("https://8.8.8.8/big.pdf")
+    assert "pdf" not in page and "4 MB" in page["error"]

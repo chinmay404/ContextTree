@@ -808,6 +808,7 @@ def searched(byok, monkeypatch):
         return [{"title": "ZAP docs", "url": "https://www.zaproxy.org/docs/", "snippet": "Features"}]
 
     monkeypatch.setattr(byok.main, "search_web", search)
+    monkeypatch.setattr(byok.main, "fetch_pages", lambda *a, **k: [])
     return queries
 
 

@@ -39,6 +39,9 @@ from fastapi import HTTPException
 SIMILAR_CONTEXT_LIMIT = 3
 FILE_CONTEXT_LIMIT = 3
 WEB_CONTEXT_LIMIT = 3
+SEARCH_PAGES_READ = 2  # V3: a snippet rarely holds the answer, so the top results are read in full
+SEARCH_PAGE_CHARS = 3000
+SEARCH_PAGE_TIMEOUT_SECONDS = 4  # both pages together; what is not back by then stays a snippet
 SIDE_QUESTION_SURE = 0.8  # below this the board stays quiet: a wrong nudge costs more than a missed one
 RELATIONS_TIMEOUT_SECONDS = 8
 RELATIONS_MAX_TOKENS = 300
@@ -769,6 +772,7 @@ class getGraphResponse():
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
         web_hits: list[dict] = []
+        search_pages: list[dict] = []
 
         # Web search is embedding-independent: it must work even when the
         # embedding provider is down, and it never blocks the turn.
@@ -783,6 +787,10 @@ class getGraphResponse():
             external_context_snippets.extend(
                 format_web_snippets(web_hits, MAX_WEB_SNIPPET_CHARS)
             )
+            if web_hits and board_reads is not None:
+                top = [h["url"] for h in web_hits if h.get("url")][:SEARCH_PAGES_READ]
+                search_pages = fetch_pages(top, SEARCH_PAGE_CHARS, timeout=SEARCH_PAGE_TIMEOUT_SECONDS)
+                external_context_snippets.extend(format_page_snippets(search_pages))
 
         # Webpage parser: URLs the user pasted are fetched directly (SSRF-
         # guarded, size- and char-capped in web_fetch) regardless of the web
@@ -796,7 +804,8 @@ class getGraphResponse():
                     logger.info(
                         "URL fetch injected %s pages for thread %s", len(pages), thread_id
                     )
-                    external_context_snippets.extend(format_page_snippets(pages))
+                    external_context_snippets.extend(
+                        format_page_snippets(pages, start=len(search_pages) + 1))
                     web_hits = list(web_hits) + [
                         {"title": p.get("title"), "url": p.get("url"), "snippet": ""}
                         for p in pages

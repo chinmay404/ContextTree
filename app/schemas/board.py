@@ -111,6 +111,10 @@ class EdgeWhy(_Model):
     why: str = Field(max_length=200)  # empty clears it
 
 
+class TranscriptCreate(_Model):
+    text: str = Field(min_length=1, max_length=200_000)
+
+
 class LinkCreate(_Model):
     id: str = Field(pattern=ID_PATTERN)
     url: str = Field(min_length=1, max_length=2048)
@@ -118,3 +122,4 @@ class LinkCreate(_Model):
     y: float
     desk_id: Optional[str] = Field(default=None, pattern=ID_PATTERN)
     desc: Optional[str] = Field(default=None, max_length=2000)
+    crawl: bool = False  # also read the pages this web link leads to (agent/crawl.py)

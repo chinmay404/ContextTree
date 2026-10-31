@@ -103,12 +103,12 @@ def test_upload_counts_toward_card_limit_409(api, db, rec):
     assert r.status_code == 409 and r.json()["error"] == "card_limit"
 
 
-def test_link_youtube_soon_with_oembed_title(api, monkeypatch, rec):
+def test_link_youtube_processing_with_oembed_title(api, monkeypatch, rec):
     b = make_board(api)["id"]
     monkeypatch.setattr(sources, "fetch_youtube_oembed", lambda u: {"title": "How to price a developer tool", "thumbnail_url": "https://i.ytimg.com/vi/abcdefghijk/hq.jpg"})
     r = link(api, b, "https://www.youtube.com/watch?v=abcdefghijk")
     c = r.json()
-    assert r.status_code == 202 and (c["sourceType"], c["status"]) == ("video", "soon")
+    assert r.status_code == 202 and (c["sourceType"], c["status"]) == ("video", "processing")
     assert c["data"]["ytid"] == "abcdefghijk" and c["data"]["title"] == "How to price a developer tool"
     assert "thumbnail" not in c["data"] and rec.web_calls == []
 
@@ -265,8 +265,8 @@ def test_parse_youtube_id_rejects_trailing_newline():
     assert sources.parse_youtube_id("https://youtu.be/abcdefghijk\n") is None
     assert sources.parse_youtube_id("https://www.youtube.com/watch?v=abcdefghijk%0A") is None
     assert sources.parse_youtube_id("https://youtu.be/abcdefghijk") == "abcdefghijk"
-    assert sources._YT_ID.fullmatch("abcdefghijk\n") is None
-    assert sources._YT_ID.fullmatch("abcdefghijk") is not None
+    assert sources.YT_ID.fullmatch("abcdefghijk\n") is None
+    assert sources.YT_ID.fullmatch("abcdefghijk") is not None
 
 
 def test_link_repost_does_no_network(api, monkeypatch, rec):
@@ -395,7 +395,7 @@ def test_passages_processing_or_failed_returns_empty_200(api, db):
         assert r.status_code == 200 and r.json() == {"passages": []}
 
 
-@pytest.mark.parametrize("kind,stype", [("chat", None), ("note", None), ("source", "video"),
+@pytest.mark.parametrize("kind,stype", [("chat", None), ("note", None), ("source", "audio"),
                                         ("source", "image"), ("source", "audio")])
 def test_passages_other_kinds_400_invalid(api, db, kind, stype):
     b = make_board(api)["id"]

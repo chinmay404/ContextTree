@@ -36,7 +36,8 @@ CARD_SELECT = (
 
 # Keys the engine keeps inside nodes.data that must never reach the client.
 # ingestLease: epoch seconds when POST .../ingest started on this source (sources.py).
-_INTERNAL_DATA_KEYS = ("memoryFacts", "ingestLease")
+# crawl: where a site crawl has got to (agent/crawl.py); it holds URLs the engine will fetch.
+_INTERNAL_DATA_KEYS = ("memoryFacts", "ingestLease", "crawl")
 
 
 def dumps_json(value) -> str:

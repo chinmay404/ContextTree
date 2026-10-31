@@ -200,6 +200,63 @@ def test_build_retrieved_context_v3_zero_embedding_keeps_4_tuple(board, monkeypa
     assert la.startswith("<LINKED_ANSWERS>")
 
 
+HITS = [{"title": n, "url": f"https://{n}.example/page", "snippet": f"snippet of {n}"} for n in ("a", "b", "c")]
+
+
+def _search(monkeypatch, pages_for):
+    """search_web answers HITS; fetch_pages is the stand-in given, and its calls are recorded."""
+    import app.agent.main as main_module
+    calls = []
+
+    def fetch_pages(urls, max_chars=None, timeout=None):
+        calls.append({"urls": urls, "max_chars": max_chars, "timeout": timeout})
+        return pages_for(urls)
+
+    monkeypatch.setattr(main_module, "search_web", lambda q, max_results: HITS)
+    monkeypatch.setattr(main_module, "fetch_pages", fetch_pages)
+    return calls
+
+
+@requires_db
+def test_v3_web_search_reads_the_top_results_in_full(board, monkeypatch):
+    g = _graph(monkeypatch, unit_emb(1))
+    calls = _search(monkeypatch, lambda urls: [{"url": u, "title": "T", "text": f"full text of {u}"} for u in urls])
+    reads = resolve_reads(store, board["email"], board["b"], board["q"])
+    _, ext, hits, _ = g._build_retrieved_context("hello", board["email"], board["q"], web_search=True, board_reads=reads)
+    assert calls[0]["urls"] == ["https://a.example/page", "https://b.example/page"]
+    assert calls[0]["timeout"] <= 5, "a search turn waits a few seconds at most"
+    assert "full text of https://a.example/page" in ext and "full text of https://b.example/page" in ext
+    assert "snippet of c" in ext, "the snippets stay"
+    assert hits == HITS, "pages already in the results add no chips"
+
+
+@requires_db
+def test_v3_web_search_keeps_the_snippets_when_no_page_can_be_read(board, monkeypatch):
+    g = _graph(monkeypatch, unit_emb(1))
+    _search(monkeypatch, lambda urls: [])
+    reads = resolve_reads(store, board["email"], board["b"], board["q"])
+    _, ext, _, _ = g._build_retrieved_context("hello", board["email"], board["q"], web_search=True, board_reads=reads)
+    assert "snippet of a" in ext
+
+
+def test_v2_web_search_stays_snippets_only(monkeypatch):
+    g = _graph(monkeypatch, [0.0] * 768)
+    calls = _search(monkeypatch, lambda urls: pytest.fail("V2 must not read pages"))
+    g._build_retrieved_context("hello", "u", "t", web_search=True)
+    assert calls == []
+
+
+@requires_db
+def test_search_pages_and_pasted_pages_number_apart(board, monkeypatch):
+    g = _graph(monkeypatch, unit_emb(1))
+    _search(monkeypatch, lambda urls: [{"url": u, "title": "T", "text": "words"} for u in urls])
+    reads = resolve_reads(store, board["email"], board["b"], board["q"])
+    _, ext, hits, _ = g._build_retrieved_context("see https://pasted.example/x", board["email"], board["q"],
+                                                 web_search=True, board_reads=reads)
+    assert ext.count("[page 1 |") == 1 and ext.count("[page 3 |") == 1
+    assert hits[-1]["url"] == "https://pasted.example/x"
+
+
 def test_build_retrieved_context_v2_zero_embedding_4_tuple(monkeypatch):
     g = _graph(monkeypatch, [0.0] * 768)
     assert g._build_retrieved_context("hello", "u", "t") == ([], None, [], None)

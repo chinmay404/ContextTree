@@ -58,3 +58,7 @@ langchain-text-splitters
 
 PyJWT>=2.8.0
 ddgs
+
+# Connectors: a page's main text (parsing only; pages are fetched by safe_fetch) and YouTube captions
+trafilatura
+youtube-transcript-api

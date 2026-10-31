@@ -22,14 +22,18 @@ from app.agent.helpers.link_preview import (
 )
 from app.agent.helpers.safe_fetch import DEFAULT_PORTS
 from app.agent.helpers.web_fetch import host_is_public
-from app.agent.ingest import ingest_file_source, ingest_web_source
+from app.agent.crawl import ingest_crawl_slice
+from app.agent.helpers.youtube import YT_ID
+from app.agent.ingest import (
+    ingest_file_source, ingest_pasted_transcript, ingest_video_source, ingest_web_source,
+)
 from app.agent.store import card_store
 from app.agent.store.board_store import fetch_card_json, require_board, require_card, store
 from app.api.auth import get_current_user_id
 from app.api.errors import ApiError
 from app.api.limiter import BOARD_RATE, limiter, user_key
 from app.core.logger import logger
-from app.schemas.board import ID_PATTERN, CardCreate, LinkCreate
+from app.schemas.board import ID_PATTERN, CardCreate, LinkCreate, TranscriptCreate
 
 router = APIRouter()
 
@@ -55,7 +59,6 @@ MIME_BY_EXT = {
     "gif": "image/gif", "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav",
 }
 
-_YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 
 
@@ -84,7 +87,7 @@ def parse_youtube_id(url: str) -> Optional[str]:
             cand = u.path[len("/shorts/"):].split("/")[0]
     elif host == "youtu.be":
         cand = u.path.lstrip("/").split("/")[0]
-    return cand if cand and _YT_ID.fullmatch(cand) else None
+    return cand if cand and YT_ID.fullmatch(cand) else None
 
 
 def fetch_youtube_oembed(url: str, timeout: float = 5) -> Optional[dict]:
@@ -188,7 +191,7 @@ def api_add_link(
     ytid = parse_youtube_id(url)
     if ytid:
         oembed = fetch_youtube_oembed(url) or {}
-        source_type, status = "video", "soon"
+        source_type, status = "video", None
         data = {"url": url, "ytid": ytid, "title": oembed.get("title") or "YouTube video",
                 "meta": "YouTube", **desc}
     else:
@@ -196,6 +199,8 @@ def api_add_link(
             raise ApiError(400, "invalid", "this address can't be fetched")
         source_type, status = "web", None
         data = {"url": url, "title": host, "meta": host, **desc}
+        if body.crawl:
+            data["crawled"] = {"pages": 0, "done": False}
 
     card_body = CardCreate(id=body.id, kind="source", source_type=source_type, x=body.x, y=body.y,
                            desk_id=body.desk_id, status=status, data=data)
@@ -207,7 +212,7 @@ def api_add_link(
 # ── Ingest (inside the request) ───────────────────────────────────────────────
 
 INGEST_LEASE_SECONDS = 300  # Vercel Hobby's per-request limit; an older lease is a dead run
-_INGEST_KIND = {"pdf": "file", "doc": "file", "csv": "file", "web": "web"}
+_INGEST_KIND = {"pdf": "file", "doc": "file", "csv": "file", "web": "web", "video": "video"}
 
 
 def claim_ingest_lease(cur, card_id: str, user_email: str) -> bool:
@@ -246,15 +251,57 @@ def api_ingest_source(
         if card["kind"] != "source":
             raise ApiError(400, "invalid", "only sources are ingested")
         kind = _INGEST_KIND.get(card["source_type"])
-        if card["status"] != "processing" or kind is None:
+        if kind == "video" and card["status"] == "soon":  # added before videos could be read
+            _set_processing(cur, card_id, email)
+        elif card["status"] != "processing" or kind is None:
             return fetch_card_json(cur, board_id, card_id)
         claimed = claim_ingest_lease(cur, card_id, email)
     if not claimed:
         return JSONResponse({"status": "processing"}, status_code=202)
-    if kind == "web":
+    if kind == "web" and isinstance((card["data"] or {}).get("crawled"), dict):
+        ingest_crawl_slice(card_id, email)  # one slice; the client calls again while it stays processing
+    elif kind == "web":
         ingest_web_source(card_id, email)
+    elif kind == "video":
+        ingest_video_source(card_id, email)
     else:
         ingest_file_source(card_id, email)
+    with store.tx() as cur:
+        return fetch_card_json(cur, board_id, card_id)
+
+
+def _set_processing(cur, card_id: str, user_email: str) -> None:
+    """Back to processing from a finished state; that run's lease is over, so it goes too."""
+    cur.execute(
+        "UPDATE nodes SET status = 'processing', data = coalesce(data, '{}'::jsonb) - 'ingestLease', "
+        "updated_at = now() "
+        "WHERE id = %s AND user_email = %s AND deleted_at IS NULL",
+        (card_id, user_email),
+    )
+
+
+@router.post("/boards/{board_id}/cards/{card_id}/transcript")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_paste_transcript(
+    board_id: str, card_id: str, body: TranscriptCreate, request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """Read a transcript the user pasted, for a video whose own could not be fetched. Same shape
+    as ingest: it runs in this request, and a call that finds an ingest running answers 202."""
+    email = store.email_for(user_id)
+    if not body.text.strip():
+        raise ApiError(400, "invalid", "paste the transcript's text")
+    with store.tx() as cur:
+        require_board(cur, board_id, email)
+        card = require_card(cur, board_id, card_id, email)
+        if card["kind"] != "source" or card["source_type"] != "video":
+            raise ApiError(400, "invalid", "only a video takes a transcript")
+        if card["status"] != "processing":
+            _set_processing(cur, card_id, email)
+        claimed = claim_ingest_lease(cur, card_id, email)
+    if not claimed:
+        return JSONResponse({"status": "processing"}, status_code=202)
+    ingest_pasted_transcript(card_id, email, body.text)
     with store.tx() as cur:
         return fetch_card_json(cur, board_id, card_id)
 
@@ -356,7 +403,7 @@ def api_raw_file(card_id: str, request: Request, user_id: str = Depends(get_curr
     )
 
 
-PASSAGE_SOURCE_TYPES = ("pdf", "doc", "web", "csv")
+PASSAGE_SOURCE_TYPES = ("pdf", "doc", "web", "csv", "video")
 
 
 @router.get("/files/{card_id}/passages")
