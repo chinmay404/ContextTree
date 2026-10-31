@@ -533,7 +533,7 @@ def test_v3_summary_uses_chat_model_on_user_key(api, db, user, byok, monkeypatch
     monkeypatch.setattr(an, "get_v3_llm", recording)
     byok.put_key("openai", byok.user_key)
     bid = seed_board(db, user)
-    c = seed_card(db, user, bid, kind="chat")
+    c = seed_card(db, user, bid, kind="chat", data={"name": "Named"})  # an unnamed chat also asks for a name
     byok.wire.text = "THE SUMMARY"
     r = _ask(api, c, bid)
     assert r.status_code == 200, r.text
