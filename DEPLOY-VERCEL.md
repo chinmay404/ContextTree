@@ -58,6 +58,15 @@ on each user's own key.
 `DAILY_MESSAGE_LIMIT` (default 500), `LANGSMITH_TRACING` (set `false` unless you trace),
 `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`, `SUMMARY_MODEL_NAME`.
 
+YouTube transcripts work without these, unless YouTube refuses Vercel's addresses. The logs then
+say `YouTube captions unavailable for a video (blocked)` and users can paste the transcript.
+
+- `YOUTUBE_GEMINI_FALLBACK=true`: when captions fail, Gemini transcribes the public video on
+  `GOOGLE_API_KEY`'s quota, at most 5 videos per user per day. Off by default because it spends quota.
+- `YOUTUBE_GEMINI_MODEL`: the model for that (default `gemini-2.5-flash`).
+- `YOUTUBE_PROXY_URL`: a proxy for caption requests. Rotating residential proxies are what the
+  library's maintainers suggest. It costs money and is not guaranteed to work.
+
 ### Must NOT be set
 
 | Name | Why |

@@ -60,5 +60,5 @@ PyJWT>=2.8.0
 ddgs
 
 # Connectors: a page's main text (parsing only; pages are fetched by safe_fetch) and YouTube captions
-trafilatura
-youtube-transcript-api
+trafilatura>=2,<3
+youtube-transcript-api>=1.2,<2
