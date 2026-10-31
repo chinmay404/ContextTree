@@ -93,7 +93,9 @@ def sanitize_chat_response_text(content: Any) -> str:
     return cleaned or text
 
 
-def extract_memory_facts(previous_facts: dict[str, Any] | None, messages: Iterable[Any]) -> dict[str, Any]:
+def extract_memory_facts(previous_facts: dict[str, Any] | None, messages: Iterable[Any],
+                         rules: bool = True) -> dict[str, Any]:
+    """`rules=False` keeps only the name patterns: Jev is filing decisions and constraints."""
     facts = _coerce_memory_facts(previous_facts)
 
     for role, text in _iter_messages(messages):
@@ -108,6 +110,8 @@ def extract_memory_facts(previous_facts: dict[str, Any] | None, messages: Iterab
         if assistant_name:
             facts["assistant_profile"]["preferred_name"] = assistant_name
 
+        if not rules:
+            continue
         lowered = text.lower()
         if "?" not in text and any(marker in lowered for marker in _DECISION_MARKERS):
             _append_unique(facts["decisions"], _compact_fact_text(text))

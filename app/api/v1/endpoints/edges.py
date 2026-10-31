@@ -6,7 +6,7 @@ from app.agent.store import edge_store
 from app.agent.store.board_store import store
 from app.api.auth import get_current_user_id
 from app.api.limiter import BOARD_RATE, limiter, user_key
-from app.schemas.board import EdgeCreate
+from app.schemas.board import EdgeCreate, EdgeWhy
 
 router = APIRouter()
 
@@ -21,6 +21,17 @@ def api_create_edge(
     with store.tx() as cur:
         edge, created = edge_store.create_edge(cur, email, board_id, body)
     return JSONResponse(edge, status_code=201 if created else 200)
+
+
+@router.patch("/{board_id}/edges/{edge_id}")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_update_edge_why(
+    board_id: str, edge_id: str, body: EdgeWhy, request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        return edge_store.update_edge_why(cur, email, board_id, edge_id, body.why.strip())
 
 
 @router.delete("/{board_id}/edges/{edge_id}")

@@ -95,6 +95,10 @@ class EdgeCreate(_Model):
     to: str = Field(pattern=ID_PATTERN)
 
 
+class EdgeWhy(_Model):
+    why: str = Field(max_length=200)  # empty clears it
+
+
 class LinkCreate(_Model):
     id: str = Field(pattern=ID_PATTERN)
     url: str = Field(min_length=1, max_length=2048)

@@ -9,6 +9,8 @@ from app.agent.prompts.prompt_formation import get_formated_prompt
 from langchain_core.messages import AIMessage, HumanMessage
 import json
 from app.agent.memory import extract_memory_facts
+from app.agent.context_judge import facts_from_jev
+from app.agent.relations import write_relations
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.store.board_store import store as board_store
@@ -24,7 +26,9 @@ from app.agent.utils.text import clip_text
 from app.agent.helpers.web_search import search_web, format_web_snippets
 from app.agent.helpers.web_query import rewrite_search_query
 from app.agent.helpers.web_fetch import extract_urls, fetch_pages, format_page_snippets
-from app.agent.helpers.v3_llm import KeyRejectedError, key_rejected_frame
+from app.agent.helpers.v3_llm import (
+    KeyRejectedError, get_v3_llm, key_rejected_frame, turn_key_from, v3_route,
+)
 from app.core.config import settings
 from app.core.logger import logger
 
@@ -34,6 +38,9 @@ from fastapi import HTTPException
 SIMILAR_CONTEXT_LIMIT = 3
 FILE_CONTEXT_LIMIT = 3
 WEB_CONTEXT_LIMIT = 3
+SIDE_QUESTION_SURE = 0.8  # below this the board stays quiet: a wrong nudge costs more than a missed one
+RELATIONS_TIMEOUT_SECONDS = 8
+RELATIONS_MAX_TOKENS = 300
 MAX_WEB_SNIPPET_CHARS = 600
 MAX_SUMMARY_CHARS = 2400
 MAX_RECENT_MESSAGE_CHARS = 1400
@@ -141,6 +148,15 @@ def _search_text(query: str, history) -> str:
             if last and last != str(query).strip():
                 return f"{last}\n{query}"
     return str(query)
+
+
+def _recent_text(history, limit: int = 4) -> str:
+    """The last few turns as plain text, for the side-question check."""
+    lines = []
+    for m in list(history or [])[-limit:]:
+        role = "User" if isinstance(m, HumanMessage) else "Assistant"
+        lines.append(f"{role}: {_clip_text(_content_to_text(m.content), 400)}")
+    return "\n".join(lines)
 
 
 def _usage_of(message) -> Optional[dict]:
@@ -347,6 +363,7 @@ class getGraphResponse():
                 graph_card=graph_card,
                 trace=trace,
                 config=config,
+                recent=_recent_text(_budget_history(current_state, initial_messages)) if byok_only else "",
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -479,6 +496,7 @@ class getGraphResponse():
                             {"role": "user", "text": query},
                             {"role": "assistant", "text": final_message},
                         ],
+                        typed=byok_only,
                     )
 
                     if should_save_user:
@@ -515,6 +533,8 @@ class getGraphResponse():
                     logger.error(f"getGraphResponse Convo save : {e}")
                     return False
                 self._save_trace(thread_id, user_email, msg_id, trace)
+                if byok_only:
+                    self._after_first_answer(config, thread_id, user_email, query, str(final_message))
 
             return final_message
         except KeyRejectedError:
@@ -584,6 +604,7 @@ class getGraphResponse():
             graph_card=graph_card,
             trace=trace,
             config=config,
+            recent=_recent_text(_budget_history(current_state, initial_messages)) if byok_only else "",
         )
 
         prompt = get_formated_prompt(query, user_id)
@@ -719,6 +740,7 @@ class getGraphResponse():
         graph_card: str = "",
         trace: Optional[dict] = None,
         config: Optional[dict] = None,
+        recent: str = "",
     ):
         """`passages` (V3 only) is filled with n -> Citation for every numbered passage sent.
         `web_query` (V3 only) is the standalone search query; V2 searches the raw message.
@@ -793,7 +815,7 @@ class getGraphResponse():
             budget = budget_tokens if budget_tokens is not None else max(
                 settings.CONTEXT_BUDGET_TOKENS, fixed // 4 + settings.CONTEXT_MIN_SOURCE_TOKENS)
             numbered = compile_board_context(board_ctx, board_reads, query, graph_card, board_email,
-                                             board_top_k, budget, fixed, config, trace)
+                                             board_top_k, budget, fixed, config, trace, recent)
             external_context_snippets.extend(numbered.notes + numbered.sources)
             if passages is not None:
                 passages.update(numbered.passages)
@@ -921,6 +943,8 @@ class getGraphResponse():
                 context_frame = {"embeddingFailed": bool(trace.get("embeddingFailed")),
                                  "agentSteps": [s["tool"] for s in agent_steps]}
                 yield f"data: {json.dumps({'context': context_frame})}\n\n"
+            if trace and (trace.get("sideQuestion") or 0.0) >= SIDE_QUESTION_SURE:
+                yield f"data: {json.dumps({'suggest': {'branch': True}})}\n\n"
 
             # Try async streaming with async graph first
             stream_graph = self.async_graph if self.async_graph else None
@@ -1009,6 +1033,7 @@ class getGraphResponse():
                             {"role": "user", "text": raw_query},
                             {"role": "assistant", "text": full_response},
                         ],
+                        typed=byok_only,
                     )
                     if should_save_user:
                         self.mongo_store.add_message(
@@ -1035,6 +1060,19 @@ class getGraphResponse():
             except Exception as e:
                 logger.error(f"getStreamResponse Convo save : {e}")
 
+            if byok_only and should_save_assistant:
+                # A small call of its own: a hidden line inside the answer could leak into the stream.
+                try:
+                    suggestion = await asyncio.wait_for(
+                        asyncio.to_thread(self._after_first_answer, config, thread_id, user_email,
+                                          raw_query, full_response),
+                        RELATIONS_TIMEOUT_SECONDS,
+                    )
+                    if suggestion:
+                        yield f"data: {json.dumps({'suggest': suggestion})}\n\n"
+                except asyncio.TimeoutError:
+                    logger.warning("Relations took too long for %s", thread_id)
+
             # Include updated summary in the done signal so frontend can update
             done_data = {"summary": await asyncio.to_thread(
                 self.mongo_store.get_thread_summary, user_id, thread_id)}
@@ -1052,6 +1090,14 @@ class getGraphResponse():
             logger.error(f"get_stream_response : {repr(e)}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+    def _after_first_answer(self, config, thread_id, user_email, question, answer) -> Optional[dict]:
+        turn_key = turn_key_from(config)
+        model = ((config or {}).get("configurable") or {}).get("model")
+        if turn_key is None or not model or not user_email:
+            return None
+        llm = get_v3_llm(model, None, max_output_tokens=RELATIONS_MAX_TOKENS, resolved=turn_key.resolved())
+        return write_relations(board_store, user_email, thread_id, llm, v3_route(model).provider, question, answer)
+
     def _update_thread_memory_facts(
         self,
         *,
@@ -1059,7 +1105,16 @@ class getGraphResponse():
         thread_id: str,
         previous_facts: dict | None,
         new_messages: list[dict],
+        typed: bool = False,
     ) -> dict:
-        updated_memory_facts = extract_memory_facts(previous_facts, new_messages)
+        """`typed` (V3): Jev files decisions when it is on; the rules run when it is off or fails."""
+        updated_memory_facts = None
+        if typed:
+            user_text = next((m["text"] for m in new_messages if m.get("role") == "user"), "")
+            filed = facts_from_jev(previous_facts, user_text)
+            if filed is not None:
+                updated_memory_facts = extract_memory_facts(filed, new_messages, rules=False)
+        if updated_memory_facts is None:
+            updated_memory_facts = extract_memory_facts(previous_facts, new_messages)
         self.mongo_store.update_thread_memory_facts(user_id, thread_id, updated_memory_facts)
         return updated_memory_facts

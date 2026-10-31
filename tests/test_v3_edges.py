@@ -52,10 +52,23 @@ def test_answer_between_siblings_201(api, g):
     assert r.json()["kind"] == "answer"
 
 
-def test_answer_to_ancestor_or_descendant_409(api, g):
-    for frm, to in ((g.a, g.q1), (g.q1, g.a)):
-        r = _post(api, g, "answer", frm, to)
-        assert r.status_code == 409 and r.json()["error"] == "not_allowed"
+def test_answer_into_own_ancestor_409(api, g):
+    frm, to = (g.q1, g.a) if g.a in _ancestors(api, g, g.q1) else (g.a, g.q1)
+    r = _post(api, g, "answer", frm, to)
+    assert r.status_code == 409 and r.json()["error"] == "not_allowed"
+
+
+def test_parent_answer_may_be_strung_to_its_own_branch(api, g):
+    """A branch is frozen at its fork; a string is how it follows its parent on purpose."""
+    parent, child = (g.a, g.q1) if g.a in _ancestors(api, g, g.q1) else (g.q1, g.a)
+    assert _post(api, g, "answer", parent, child).status_code == 201
+
+
+def _ancestors(api, g, card_id):
+    from app.agent.store.board_store import store
+    with store.tx() as cur:
+        cur.execute("SELECT ancestor_ids FROM nodes WHERE id = %s", (card_id,))
+        return list(cur.fetchone()["ancestor_ids"] or [])
 
 
 def test_answer_to_self_409(api, g):

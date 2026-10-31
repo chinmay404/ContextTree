@@ -29,12 +29,12 @@ def _estimate(fit, fixed_chars: int) -> int:
 
 def compile_board_context(ctx: BoardContext, reads: Reads, question: str, graph_card: str, user_email: str,
                           top_k: int, budget_tokens: int | None, fixed_chars: int, config: dict | None,
-                          trace: dict | None) -> NumberedContext:
+                          trace: dict | None, recent: str = "") -> NumberedContext:
     outlines = None
     if jev.enabled() and ctx.chunks:
         with board_store.tx() as cur:
             outlines = load_outlines(cur, user_email, list({c.card_id for c in ctx.chunks}))
-    judgement = judge_context(question, graph_card, ctx, ctx.chunks, outlines)
+    judgement = judge_context(question, graph_card, ctx, ctx.chunks, outlines, recent)
     scores = dict(judgement.scores) if judgement.scores is not None else None
 
     turn_key = turn_key_from(config)
@@ -63,6 +63,7 @@ def compile_board_context(ctx: BoardContext, reads: Reads, question: str, graph_
         trace.update({
             "jev": judgement.status,
             "enough": judgement.enough,
+            "sideQuestion": judgement.side,
             "budgetTokens": budget_tokens,
             "estimatedTokens": _estimate(fit, fixed_chars),
             "sent": [{"n": p["n"], "cardId": p["cardId"], "loc": p["loc"],

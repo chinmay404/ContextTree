@@ -5,11 +5,11 @@ by user_email. Missing, deleted or foreign rows are 404 (never 403).
 """
 from __future__ import annotations
 
-from app.agent.store.board_store import edge_to_json, lock_board, require_board, touch_board
+from app.agent.store.board_store import dumps_json, edge_to_json, lock_board, require_board, touch_board
 from app.api.errors import ApiError
 from app.schemas.board import EdgeCreate
 
-_EDGE_COLS = "id, canvas_id, kind, from_node, to_node, created_at"
+_EDGE_COLS = "id, canvas_id, kind, from_node, to_node, created_at, data"
 
 
 def _existing_own(cur, user_email: str, board_id: str, edge_id: str):
@@ -39,9 +39,26 @@ def _can_plug(kind: str, src: dict, dst: dict) -> bool:
     if kind == "wire":
         return (src["kind"] == "source" and dst["kind"] == "chat"
                 and src["desk_id"] != dst["id"])
+    # A parent's answer may be strung to its own branch: that is how a frozen branch follows its
+    # parent on purpose (owner, 2026-10-30). A branch's answer into its own ancestor stays out.
     return (src["kind"] == "chat" and dst["kind"] == "chat" and src["id"] != dst["id"]
-            and dst["id"] not in (src["ancestor_ids"] or [])
-            and src["id"] not in (dst["ancestor_ids"] or []))
+            and dst["id"] not in (src["ancestor_ids"] or []))
+
+
+def update_edge_why(cur, user_email: str, board_id: str, edge_id: str, why: str) -> dict:
+    """The user's own words for why this string exists; they outrank anything an LLM wrote."""
+    require_board(cur, board_id, user_email)
+    patch = {"why": why, "whyBy": "user"} if why else {"why": None, "whyBy": None}
+    cur.execute(
+        "UPDATE edges SET data = COALESCE(data, '{}'::jsonb) || %s::jsonb WHERE id = %s AND canvas_id = %s "
+        f"AND user_email = %s AND kind IN ('wire','answer') AND deleted_at IS NULL RETURNING {_EDGE_COLS}",
+        (dumps_json(patch), edge_id, board_id, user_email),
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ApiError(404, "not_found", "edge not found")
+    touch_board(cur, board_id)
+    return edge_to_json(row)
 
 
 def create_edge(cur, user_email: str, board_id: str, body: EdgeCreate) -> tuple[dict, bool]:

@@ -12,6 +12,7 @@ from math import sqrt
 
 from app.agent.board_context import BoardContext, ScoredChunk
 from app.agent.helpers import jev
+from app.agent.memory import _append_unique, _coerce_memory_facts, _compact_fact_text
 from app.agent.utils.text import clip_text
 
 PASSAGE_CHARS = 900
@@ -21,6 +22,7 @@ MAX_SECTIONS = 30
 DROP_BELOW = 0.25  # "sure it does not help"; anything above stays in the running
 ENOUGH_NO = 0.35   # the agent spends the user's key, so only a clear no sends it exploring
 ENOUGH_YES = 0.65
+FACT_SURE = 0.65
 
 
 @dataclass
@@ -28,11 +30,13 @@ class Judgement:
     status: str  # ok | off | error | skipped
     scores: dict[tuple[str, str | None], float] | None = None
     enough: bool | None = None
+    side: float | None = None  # chance this message is a side question, when there is a conversation
 
 
 def judge_context(question: str, graph_card: str, ctx: BoardContext, chunks: list[ScoredChunk],
-                  outlines: dict[str, list[str]] | None = None) -> Judgement:
-    if not (chunks or ctx.note_parts or ctx.answer_parts):
+                  outlines: dict[str, list[str]] | None = None, recent: str = "") -> Judgement:
+    has_material = bool(chunks or ctx.note_parts or ctx.answer_parts)
+    if not has_material and not recent:
         return Judgement("skipped", enough=False)  # nothing to read: only exploring could help
     if not jev.enabled():
         return Judgement("off")
@@ -61,8 +65,13 @@ def judge_context(question: str, graph_card: str, ctx: BoardContext, chunks: lis
     questions = {pid: f"Does passage {pid} help answer the question?" for pid in passages}
     questions.update({sid: f"Is source {sid} likely to hold what the question needs, "
                            "judging by its sections and best passage?" for sid in sources})
-    questions["enough"] = ("Taken together, do these passages hold what is needed to answer the question well? "
-                           "Answer no if the question needs a part of a source that is not here.")
+    if has_material:
+        questions["enough"] = ("Taken together, do these passages hold what is needed to answer the question well? "
+                               "Answer no if the question needs a part of a source that is not here.")
+    if recent:
+        state["recent_conversation"] = clip_text(recent, QUESTION_CHARS)
+        questions["side"] = ("Is the question a side question, off the topic of the recent conversation, "
+                             "that would be better in its own branch?")
 
     answers = jev.ask_nouls(state, questions)
     if answers is None:
@@ -73,9 +82,38 @@ def judge_context(question: str, graph_card: str, ctx: BoardContext, chunks: lis
     for pid, key in keys.items():
         p = answers[pid]
         scores[key] = sqrt(p * source_of[key[0]]) if pid.startswith("p") else p
-    enough_p = answers["enough"]
-    enough = False if enough_p <= ENOUGH_NO else True if enough_p >= ENOUGH_YES else None
-    return Judgement("ok", scores, enough)
+    enough = False  # no material at all: only exploring could help
+    if has_material:
+        enough_p = answers["enough"]
+        enough = False if enough_p <= ENOUGH_NO else True if enough_p >= ENOUGH_YES else None
+    return Judgement("ok", scores, enough, answers.get("side"))
+
+
+def facts_from_jev(previous: dict | None, user_text: str) -> dict | None:
+    """Files the user's own sentence as a decision or constraint and retires what it replaces.
+    Extractive: Jev only sorts the user's words, so it cannot put a claim in their mouth. None when
+    Jev is off or fails, and the rules run instead."""
+    if not jev.enabled():
+        return None
+    facts = _coerce_memory_facts(previous)
+    items = facts["decisions"] + facts["constraints"]
+    questions = {
+        "decision": "Does the new message state a decision the user has made, to keep following later?",
+        "constraint": "Does the new message state a lasting rule or limit the user wants kept?",
+    }
+    questions.update({f"r{i}": f"Does the new message replace or contradict item r{i}?" for i in range(len(items))})
+    answers = jev.ask_nouls({"new_message": clip_text(user_text, QUESTION_CHARS),
+                             "items": {f"r{i}": item for i, item in enumerate(items)}}, questions)
+    if answers is None:
+        return None
+    retired = {items[i] for i in range(len(items)) if answers[f"r{i}"] >= FACT_SURE}
+    for key in ("decisions", "constraints"):
+        facts[key] = [item for item in facts[key] if item not in retired]
+    if answers["decision"] >= FACT_SURE:
+        _append_unique(facts["decisions"], _compact_fact_text(user_text))
+    if answers["constraint"] >= FACT_SURE:
+        _append_unique(facts["constraints"], _compact_fact_text(user_text))
+    return _coerce_memory_facts(facts)
 
 
 def rank_chunks(chunks: list[ScoredChunk], scores: dict[tuple[str, str | None], float] | None, per_source: int,

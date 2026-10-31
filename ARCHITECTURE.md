@@ -60,6 +60,31 @@ Working + Episodic + Semantic + Retrieved → assembled by
 
 ---
 
+## 1b. V3 turns: the context compiler (2026-10-31)
+
+V3 board turns no longer use the block order above. Drawn in `../context-eng.excalidraw`.
+
+| Step | Who | Where |
+|---|---|---|
+| Walk the graph (the read set is the canvas: parents, desks, piles, strings) | code | `reads.py` |
+| Board map: where this chat is and why each thing is connected | code | `graph_card.py` |
+| Search text: the question plus the user's previous message | code | `main.py` `_search_text` |
+| Gather: vector + keyword per source, fused by rank | code | `board_context.py` |
+| Rank, "is this enough?", "is this a side question?" | Jev, optional | `context_judge.py`, `helpers/jev.py` |
+| Go deeper when Jev is sure it is not enough | agent, read-only | `context_agent.py` |
+| Fit every block in the budget, log what was dropped | code | `board_context.fit_to_budget` |
+| Prompt: stable first, sources as data in the last user message | code | `prompt_layout.py` |
+| After the first answer: one line of why per connection, a name | LLM | `relations.py` |
+
+A branch inherits frozen `summary_blocks` (`summary_blocks.py`) into `nodes.lineage_summary`: siblings
+share them, and a later parent message cannot reach a branch. Desks stay live. `context_traces` holds
+what each turn sent and dropped (`GET /boards/{b}/cards/{c}/context-trace`).
+
+Jev is off without `TYPESAFE_API_KEY`. Off or failing, the search order stands and the agent does not
+run. With it on, board text goes to TypeSafe, so the privacy policy must say so first.
+
+---
+
 ## 2. Schema (post-2026-04-26)
 
 ```

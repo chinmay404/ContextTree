@@ -99,7 +99,7 @@ def card_to_json(row: dict) -> dict:
 
 
 def edge_to_json(row: dict) -> dict:
-    return {
+    out = {
         "id": row["id"],
         "boardId": row["canvas_id"],
         "kind": row["kind"],
@@ -107,6 +107,10 @@ def edge_to_json(row: dict) -> dict:
         "to": row["to_node"],
         "createdAt": _iso(row.get("created_at")),
     }
+    why = (row.get("data") or {}).get("why")
+    if why:  # only when there is one, so older clients see the shape they know
+        out["why"] = why
+    return out
 
 
 # ── Guards ────────────────────────────────────────────────────────────────────
@@ -203,7 +207,7 @@ def list_cards_json(cur, board_id: str) -> list[dict]:
 
 def list_edges_json(cur, board_id: str) -> list[dict]:
     cur.execute(
-        "SELECT e.id, e.canvas_id, e.kind, e.from_node, e.to_node, e.created_at FROM edges e "
+        "SELECT e.id, e.canvas_id, e.kind, e.from_node, e.to_node, e.created_at, e.data FROM edges e "
         "JOIN nodes a ON a.id = e.from_node AND a.deleted_at IS NULL "
         "JOIN nodes b ON b.id = e.to_node AND b.deleted_at IS NULL "
         "WHERE e.canvas_id = %s AND e.deleted_at IS NULL AND e.kind IS NOT NULL "
