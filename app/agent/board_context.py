@@ -7,7 +7,7 @@ skipped, notes and image summaries go in whole, linked chats become a LINKED_ANS
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import ceil
 
 from app.agent.citations import QUOTE_MAX_CHARS, neutralise_markers, strip_markers
@@ -23,6 +23,10 @@ TYPE_LABEL = {"pdf": "PDF", "doc": "Document", "csv": "CSV", "web": "Web page", 
 DESC_HEADER_CHARS = 160
 LABEL_CHARS = 120
 IMAGE_SUMMARY_CHARS = 4000
+RRF_K = 60  # the standard reciprocal-rank constant: rank matters, raw scores don't have to compare
+# Without model scores, notes and linked answers may fill this share of the room while file
+# passages are waiting; the rest is theirs. Otherwise a note-heavy desk sends no documents at all.
+NON_CHUNK_SHARE = 0.6
 _DELIMS = re.compile(
     r"<\s*/?\s*(EXTERNAL_CONTEXT|LINKED_ANSWERS|THREAD_SUMMARY|MEMORY_FACTS|RELEVANT_CONTEXT)\s*>", re.I)
 
@@ -123,6 +127,73 @@ def search_board_chunks(cur, user_email: str, card_ids: list[str], query_embeddi
             for r in cur.fetchall()]
 
 
+_OFF_FILTER = ("AND NOT EXISTS (SELECT 1 FROM unnest(%s::text[], %s::text[]) AS o(n, l) "
+               "WHERE o.n = ef.node_id AND o.l = fc.metadata->>'loc') ")
+
+
+def gather_board_chunks(cur, user_email: str, card_ids: list[str], query_embedding: list[float] | None,
+                        search_text: str | None, per_source: int,
+                        off: dict[str, set[str]] | None = None) -> list[ScoredChunk]:
+    """The best `per_source` passages of each card, by vector and keyword rank fused (RRF).
+
+    Ranks are taken inside each card, so a large source cannot use up a small one's slots. Both
+    searches run over this chat's cards only, which keeps an unindexed tsvector cheap. Keyword
+    search needs no embedding provider, so documents survive an embedding outage.
+    """
+    if not card_ids or per_source <= 0:
+        return []
+    pairs = [(c, loc) for c, locs in (off or {}).items() for loc in locs]
+    off_args = ([c for c, _ in pairs], [loc for _, loc in pairs])
+    found: dict[int, ScoredChunk] = {}
+    fused: dict[int, float] = {}
+
+    def take(rows):
+        for r in rows:
+            cid = r["id"]
+            if cid not in found:
+                found[cid] = ScoredChunk(r["node_id"], r["loc"], _safe(r["chunk_text"]), 0.0, _page(r["page"]))
+            fused[cid] = fused.get(cid, 0.0) + 1.0 / (RRF_K + r["rn"])
+
+    if has_meaningful_embedding(query_embedding):
+        cur.execute(
+            "SELECT * FROM (SELECT fc.id, ef.node_id, fc.metadata->>'loc' AS loc, fc.metadata->>'page' AS page, "
+            "fc.chunk_text, ROW_NUMBER() OVER (PARTITION BY ef.node_id ORDER BY fc.embedding <=> %s::vector, fc.id) AS rn "
+            "FROM file_chunks fc JOIN external_files ef ON fc.file_id = ef.id "
+            "WHERE ef.node_id = ANY(%s) AND ef.user_email = %s AND fc.embedding IS NOT NULL "
+            + _OFF_FILTER + ") s WHERE rn <= %s",
+            (_vec(query_embedding), list(card_ids), user_email, *off_args, per_source),
+        )
+        take(cur.fetchall())
+    if (search_text or "").strip():
+        # plainto_tsquery ANDs its terms; a question rarely has them all in one passage, so OR them.
+        cur.execute(
+            "SELECT * FROM (SELECT fc.id, ef.node_id, fc.metadata->>'loc' AS loc, fc.metadata->>'page' AS page, "
+            "fc.chunk_text, ROW_NUMBER() OVER (PARTITION BY ef.node_id "
+            "ORDER BY ts_rank_cd(to_tsvector('english', fc.chunk_text), q.q) DESC, fc.id) AS rn "
+            "FROM file_chunks fc JOIN external_files ef ON fc.file_id = ef.id, "
+            "(SELECT NULLIF(replace(plainto_tsquery('english', %s)::text, ' & ', ' | '), '')::tsquery AS q) q "
+            "WHERE ef.node_id = ANY(%s) AND ef.user_email = %s AND to_tsvector('english', fc.chunk_text) @@ q.q "
+            + _OFF_FILTER + ") s WHERE rn <= %s",
+            (search_text, list(card_ids), user_email, *off_args, per_source),
+        )
+        take(cur.fetchall())
+
+    chunks = [replace(found[cid], score=score) for cid, score in fused.items()]
+    chunks.sort(key=lambda c: -c.score)
+    return chunks
+
+
+def keep_per_source(chunks: list[ScoredChunk], per_source: int) -> list[ScoredChunk]:
+    """The first `per_source` of each card, in the given (best-first) order."""
+    seen: dict[str, int] = {}
+    kept = []
+    for c in chunks:
+        seen[c.card_id] = seen.get(c.card_id, 0) + 1
+        if seen[c.card_id] <= per_source:
+            kept.append(c)
+    return kept
+
+
 def _off_locs(data: dict) -> set[str]:
     ex = data.get("excerpts")
     if not isinstance(ex, list):
@@ -144,8 +215,9 @@ def _add_note(ctx: BoardContext, cid: str, header: str, text, limit: int) -> Non
 
 
 def build_board_context(store, reads: Reads, user_email: str, query_embedding: list[float] | None,
-                        top_k: int) -> BoardContext:
-    """`user_email` is the already-resolved tenancy key (the one used for resolve_reads)."""
+                        top_k: int, search_text: str | None = None) -> BoardContext:
+    """`user_email` is the already-resolved tenancy key (the one used for resolve_reads).
+    `top_k` is passages per source, the same limit the read-set token meter counts."""
     ctx = BoardContext()
     ready_ids = [i.card_id for i in reads.readable()]
     if not ready_ids:
@@ -205,8 +277,8 @@ def build_board_context(store, reads: Reads, user_email: str, query_embedding: l
                 off[cid] = _off_locs(data)
         ctx.linked_answers = _linked_answers(entries)
 
-        if file_ids and top_k > 0 and has_meaningful_embedding(query_embedding):
-            ctx.chunks = search_board_chunks(cur, user_email, file_ids, query_embedding, top_k, off)
+        if file_ids and top_k > 0:
+            ctx.chunks = gather_board_chunks(cur, user_email, file_ids, query_embedding, search_text, top_k, off)
     return ctx
 
 
@@ -259,6 +331,59 @@ def render_source_blocks(ctx: BoardContext, chunks: list[ScoredChunk]) -> list[s
         by_card[c.card_id].append(prefix + clip_text(c.text, FILE_SNIPPET_CHARS))
     return [(ctx.headers.get(cid) or f"[source | {cid}]") + "\n" + "\n".join(by_card[cid])
             for cid in order]
+
+
+@dataclass
+class Fit:
+    ctx: BoardContext  # note_parts / answer_parts hold only what was kept
+    chunks: list[ScoredChunk]
+    dropped: list[dict]  # {cardId, loc, score, reason}, what the budget left out
+
+
+def fit_to_budget(ctx: BoardContext, chunks: list[ScoredChunk], fixed_chars: int, budget_tokens: int | None,
+                  scores: dict[tuple[str, str | None], float] | None = None) -> Fit:
+    """Choose what fits in `budget_tokens`, counting every block, and say what did not.
+
+    With model `scores` ({(cardId, loc): chance it helps}) everything competes on score. Without
+    them, notes and answers go first up to NON_CHUNK_SHARE of the room when files are waiting,
+    then the passages best-first, then any notes and answers that still fit.
+    """
+    if budget_tokens is None:
+        return Fit(ctx, chunks, [])
+    room = budget_tokens * 4 - fixed_chars
+    # (kind, index, cardId, loc, chars, score)
+    others = [("note", i, p[0], None, len(p[1]) + len(p[2]), None) for i, p in enumerate(ctx.note_parts)]
+    others += [("answer", i, p[0], None, sum(map(len, p[1])) + len(p[2]), None) for i, p in enumerate(ctx.answer_parts)]
+    passages = [("chunk", i, c.card_id, c.loc, len(_rendered(c)), c.score) for i, c in enumerate(chunks)]
+    kept: set[tuple[str, int]] = set()
+
+    def offer(items, limit=None):
+        nonlocal room
+        left = []
+        spent = 0
+        for item in items:
+            chars = item[4]
+            if chars <= room and (limit is None or spent + chars <= limit):
+                room -= chars
+                spent += chars
+                kept.add(item[:2])
+            else:
+                left.append(item)
+        return left
+
+    if scores is not None:
+        left = offer(sorted(others + passages, key=lambda it: -scores.get((it[2], it[3]), 0.0)))
+    else:
+        left = offer(others, limit=NON_CHUNK_SHARE * max(room, 0) if passages else None)
+        left = offer(sorted(passages, key=lambda it: -it[5])) + left
+        left = offer(left)
+    dropped = [{"cardId": card_id, "loc": loc, "reason": "budget",
+                "score": scores.get((card_id, loc)) if scores is not None else score}
+               for _, _, card_id, loc, _, score in left]
+    out = replace(ctx,
+                  note_parts=[p for i, p in enumerate(ctx.note_parts) if ("note", i) in kept],
+                  answer_parts=[p for i, p in enumerate(ctx.answer_parts) if ("answer", i) in kept])
+    return Fit(out, [c for i, c in enumerate(chunks) if ("chunk", i) in kept], dropped)
 
 
 def trim_chunks_to_budget(chunks: list[ScoredChunk], fixed_chars: int,

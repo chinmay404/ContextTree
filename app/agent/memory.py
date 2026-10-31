@@ -47,7 +47,10 @@ _CONSTRAINT_MARKERS = (
     "never ",
     "always ",
     "need to ",
-    "only ",
+)
+# "I don't know" and friends are the user thinking aloud, not a rule for the model to keep.
+_NOT_A_CONSTRAINT_RE = re.compile(
+    r"\bi\s+(?:don'?t|do not)\s+(?:know|think|understand|get|remember|see)\b|\bnot sure\b", re.IGNORECASE
 )
 _MAX_FACT_ITEMS = 6
 _MAX_FACT_TEXT_CHARS = 180
@@ -109,7 +112,7 @@ def extract_memory_facts(previous_facts: dict[str, Any] | None, messages: Iterab
         if "?" not in text and any(marker in lowered for marker in _DECISION_MARKERS):
             _append_unique(facts["decisions"], _compact_fact_text(text))
 
-        if any(marker in lowered for marker in _CONSTRAINT_MARKERS):
+        if any(marker in lowered for marker in _CONSTRAINT_MARKERS) and not _NOT_A_CONSTRAINT_RE.search(text):
             _append_unique(facts["constraints"], _compact_fact_text(text))
 
     return _trim_memory_facts(facts)
@@ -230,7 +233,7 @@ def _coerce_fact_list(value: Any) -> list[str]:
         cleaned = _clean_fact_value(entry)
         if cleaned:
             _append_unique(items, cleaned)
-    return items[:_MAX_FACT_ITEMS]
+    return items[-_MAX_FACT_ITEMS:]  # the newest win: a later decision usually replaces an older one
 
 
 def _clean_fact_value(value: Any) -> str | None:
@@ -262,7 +265,4 @@ def _extract_first_match(patterns: Iterable[re.Pattern[str]], text: str) -> str 
 
 
 def _trim_memory_facts(memory_facts: dict[str, Any]) -> dict[str, Any]:
-    facts = _coerce_memory_facts(memory_facts)
-    facts["decisions"] = facts["decisions"][:_MAX_FACT_ITEMS]
-    facts["constraints"] = facts["constraints"][:_MAX_FACT_ITEMS]
-    return facts
+    return _coerce_memory_facts(memory_facts)
