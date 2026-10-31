@@ -279,6 +279,18 @@ class PostgresConversationStore:
             logger.error(f"Error getting thread messages: {e}")
             return []
 
+    def get_thread_lineage_summary(self, thread_id: str) -> str:
+        """What this branch inherited, frozen at its fork ('' for a root or a V2 branch)."""
+        try:
+            with self._get_conn() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT lineage_summary FROM nodes WHERE id = %s", (thread_id,))
+                row = cur.fetchone()
+                return (row[0] or "") if row else ""
+        except Exception as e:
+            logger.error(f"Error getting lineage summary: {e}")
+            return ""
+
     def get_thread_recent_messages(self, user_id: str, thread_id: str, limit: int) -> List[dict]:
         try:
             with self._get_conn() as conn:
@@ -936,6 +948,7 @@ class PostgresConversationStore:
         summary_embedding: List[float] = None,
         initial_messages: List[dict] = [],
         memory_facts: Optional[dict] = None,
+        lineage_summary: Optional[str] = None,
     ) -> bool:
         """
         Atomically initialize a forked node.
@@ -1010,6 +1023,7 @@ class PostgresConversationStore:
                             forked_from_message_id = %s,
                             summary = %s,
                             summary_embedding = %s,
+                            lineage_summary = %s,
                             ancestor_ids = %s,
                             is_initialized = true,
                             data = jsonb_set(
@@ -1020,7 +1034,7 @@ class PostgresConversationStore:
                         """,
                         (
                             canvas_id, user_email, source_thread_id, fork_at_message_id,
-                            summary, se, child_ancestors,
+                            summary, se, lineage_summary, child_ancestors,
                             facts_payload, facts_payload,
                             new_thread_id,
                         ),
@@ -1030,16 +1044,16 @@ class PostgresConversationStore:
                         """
                         INSERT INTO nodes (
                             id, canvas_id, user_email, parent_node_id,
-                            forked_from_message_id, summary, summary_embedding,
+                            forked_from_message_id, summary, summary_embedding, lineage_summary,
                             ancestor_ids, is_initialized, created_at, is_primary,
                             data
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, true, %s, false,
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, true, %s, false,
                                   jsonb_build_object('memoryFacts', %s::jsonb,
                                                      'data', jsonb_build_object('memoryFacts', %s::jsonb)))
                         """,
                         (
                             new_thread_id, canvas_id, user_email, source_thread_id,
-                            fork_at_message_id, summary, se, child_ancestors, now,
+                            fork_at_message_id, summary, se, lineage_summary, child_ancestors, now,
                             facts_payload, facts_payload,
                         ),
                     )

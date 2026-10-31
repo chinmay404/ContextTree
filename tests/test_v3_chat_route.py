@@ -573,7 +573,7 @@ def test_v3_branch_start_summary_uses_chat_model_on_user_key(api, db, user, byok
     assert {call["model"] for call in byok.wire.calls} == {"gpt-5-mini"}
     assert byok.lookups == [(user, "openai")]
     with db.cursor() as cur:
-        cur.execute("SELECT summary, is_initialized FROM nodes WHERE id = %s", (child,))
+        cur.execute("SELECT lineage_summary, is_initialized FROM nodes WHERE id = %s", (child,))
         assert cur.fetchone() == ("BRANCH SUMMARY", True)
 
 

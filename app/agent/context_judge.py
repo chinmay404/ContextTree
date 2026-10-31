@@ -82,11 +82,7 @@ def rank_chunks(chunks: list[ScoredChunk], scores: dict[tuple[str, str | None], 
                 protect: set[str] | None = None) -> tuple[list[ScoredChunk], list[dict]]:
     """Best first, at most `per_source` of each card; passages Jev is sure about go. `protect` names
     cards that keep their best passage even so: strings, on a model that cannot go and open them."""
-    if scores is None:
-        ordered, misses = list(chunks), []
-    else:
-        ordered = sorted(chunks, key=lambda c: -scores.get((c.card_id, c.loc), 0.0))
-        misses = []
+    ordered = list(chunks) if scores is None else sorted(chunks, key=lambda c: -scores.get((c.card_id, c.loc), 0.0))
     seen: dict[str, int] = {}
     kept: list[ScoredChunk] = []
     dropped: list[dict] = []
@@ -100,4 +96,4 @@ def rank_chunks(chunks: list[ScoredChunk], scores: dict[tuple[str, str | None], 
         else:
             seen[c.card_id] = count + 1
             kept.append(c)
-    return kept, misses + dropped
+    return kept, dropped

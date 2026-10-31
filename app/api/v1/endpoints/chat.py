@@ -38,6 +38,7 @@ from app.agent.memory import extract_memory_facts, sanitize_summary_text
 from app.agent.prompts.prompt_formation import get_formated_summury_prompt
 from app.agent.utils.embeddings import get_embedding
 from app.agent.reads import _top_k as card_top_k, resolve_reads
+from app.agent.summary_blocks import cover_messages
 from app.agent.store.board_store import store as board_store
 from app.api.errors import ApiError
 from app.api.limiter import limiter, user_key
@@ -193,6 +194,35 @@ def _whole_carry_split(messages: list) -> tuple[list, list]:
     return messages[:buffer_start], messages[buffer_start:]
 
 
+def _inherit_lineage(active_graph, user_id: str, parent_thread_id: str, messages: list,
+                     chat_message: ChatMessage, turn_key: TurnKey) -> str:
+    """The parent's own inheritance, then frozen blocks over its messages up to the fork."""
+    store_ = active_graph.mongo_store
+    llm = get_v3_llm(chat_message.model_name, None, resolved=turn_key.resolved())
+
+    def summarize(rows: list, previous: str = "") -> str:
+        lc_messages = [HumanMessage(content=m["text"]) if m["role"] == "user" else AIMessage(content=m["text"])
+                       for m in rows if m["role"] in ("user", "assistant", "ai")]
+        prompt = get_formated_summury_prompt(lc_messages, previous)
+        traced = llm.with_config(build_langsmith_trace_config(
+            run_name="contexttree_summary_block", conversation_id=chat_message.conversation_id,
+            user_id=user_id, message_id=chat_message.message_id, model_name=chat_message.model_name,
+            node_name="fork-init", parent_thread_id=parent_thread_id, tags=["summary"],
+        ))
+        return sanitize_summary_text(invoke_on_user_key(traced, prompt, turn_key.provider).content)
+
+    above = store_.get_thread_lineage_summary(parent_thread_id)
+    try:
+        email = board_store.resolve_user_email(user_id)
+        blocks = cover_messages(board_store, email, parent_thread_id, messages, summarize)
+    except KeyRejectedError:
+        raise
+    except Exception as e:  # the branch still starts, with its verbatim buffer and what is above
+        logger.error("Summary blocks failed (V3 turn): %s", type(e).__name__)
+        blocks = ""
+    return "\n\n".join(part for part in (above, blocks) if part)
+
+
 def _init_fork_if_needed(
     chat_message: ChatMessage, active_graph, transport: str, user_id: str, carry: str = "summary",
     turn_key: Optional[TurnKey] = None,
@@ -283,7 +313,9 @@ def _init_fork_if_needed(
                     user_id, chat_message.conversation_id
                 )
             )
-            if not own_summary:
+            if not own_summary and not active_graph.mongo_store.get_thread_lineage_summary(
+                chat_message.conversation_id
+            ):
                 logger.info(
                     "Fork %s has no inherited summary — re-running inheritance",
                     chat_message.conversation_id,
@@ -374,6 +406,17 @@ def _init_fork_if_needed(
     new_summary = existing_summary
     new_memory_facts = parent_memory_facts if fork_source.get("skip_resummarize") else extract_memory_facts({}, messages_data)
     new_summary_embedding = []
+    lineage_summary = None
+
+    # V3 branch from a known message: inherit frozen blocks. Siblings reuse them, later messages in
+    # the parent can't leak in, and the lineage above the parent comes along with them.
+    if (turn_key is not None and carry == "summary" and not force_summarize
+            and fork_source.get("mode") == "scoped-fork-point"):
+        lineage_summary = _inherit_lineage(
+            active_graph, user_id, parent_thread_id, messages_to_summarize, chat_message, turn_key
+        )
+        new_summary = ""
+        messages_to_summarize = []
 
     if messages_to_summarize and (force_summarize or carry == "whole" or not fork_source.get("skip_resummarize")):
         lc_messages = []
@@ -434,7 +477,7 @@ def _init_fork_if_needed(
     # write: fork_thread would stamp is_initialized=true and this branch would
     # be permanently frozen as a blank slate. Leaving it uninitialized lets the
     # NEXT message retry inheritance once the parent actually has content.
-    if not buffer_messages and not (new_summary or "").strip():
+    if not buffer_messages and not (new_summary or "").strip() and not (lineage_summary or "").strip():
         logger.warning(
             "Fork inheritance EMPTY for %s (parent=%s): nothing to seed — "
             "leaving fork uninitialized so a later message can retry",
@@ -461,6 +504,7 @@ def _init_fork_if_needed(
         summary_embedding=new_summary_embedding,
         initial_messages=seed_messages,
         memory_facts=new_memory_facts,
+        lineage_summary=lineage_summary,
     )
     logger.info(
         f"Fork initialised: {parent_thread_id} → {chat_message.conversation_id} "

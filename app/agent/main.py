@@ -12,9 +12,11 @@ from app.agent.memory import extract_memory_facts
 from app.agent.utils.saver import postgres_saver, async_postgres_saver
 from app.agent.store.PostgresStore import PostgresConversationStore
 from app.agent.store.board_store import store as board_store
-from app.agent.board_context import (
-    build_board_context, has_meaningful_embedding, number_passages, trim_chunks_to_budget,
-)
+from app.agent.board_context import POOL_PER_SOURCE, build_board_context, has_meaningful_embedding
+from app.agent.context_compile import compile_board_context
+from app.agent.graph_card import build_graph_card
+from app.agent.helpers import jev
+from app.agent.store import trace_store
 from app.agent.citations import CITE_INSTRUCTION, extract_citations
 from app.agent.reads import Reads, _top_k as _default_top_k
 from app.agent.utils.embeddings import get_embedding
@@ -128,6 +130,57 @@ def _budget_history(current_state, initial_messages) -> list:
         return initial_messages
     values = getattr(current_state, "values", None) or {}
     return list(values.get("messages") or [])
+
+
+def _search_text(query: str, history) -> str:
+    """Step 3 of a V3 turn: the question plus the user's previous message, so a follow-up like
+    "and the second one?" still finds its topic. No model call."""
+    for m in reversed(history or []):
+        if isinstance(m, HumanMessage):
+            last = _content_to_text(m.content).strip()
+            if last and last != str(query).strip():
+                return f"{last}\n{query}"
+    return str(query)
+
+
+def _usage_of(message) -> Optional[dict]:
+    usage = getattr(message, "usage_metadata", None) or {}
+    if not usage:
+        return None
+    details = usage.get("input_token_details") or {}
+    return {"input": usage.get("input_tokens"), "output": usage.get("output_tokens"),
+            "cacheRead": details.get("cache_read"), "cacheWrite": details.get("cache_creation")}
+
+
+def _event_usage(event) -> Optional[dict]:
+    """The usage on a finished chat-model event, in whichever shape this LangChain sent it."""
+    output = (event.get("data") or {}).get("output")
+    if output is None:
+        return None
+    if getattr(output, "usage_metadata", None):
+        return _usage_of(output)
+    generations = output.get("generations") if isinstance(output, dict) else getattr(output, "generations", None)
+    for group in generations or []:
+        for gen in group if isinstance(group, list) else [group]:
+            message = gen.get("message") if isinstance(gen, dict) else getattr(gen, "message", None)
+            found = _usage_of(message) if message is not None else None
+            if found:
+                return found
+    return None
+
+
+def _v3_turn_parts(graph, query, thread_id, board_reads, user_email, history):
+    """(board map, inherited summary, search text, trace) for a V3 turn; empty on V2."""
+    if board_reads is None:
+        return "", "", None, None
+    graph_card = ""
+    try:
+        graph_card = build_graph_card(board_store, board_reads, user_email)
+    except Exception as e:  # the map helps the model; a failure must not cost the turn
+        logger.error("Board map failed for %s: %s", thread_id, type(e).__name__)
+    lineage = graph.mongo_store.get_thread_lineage_summary(thread_id)
+    search_text = _search_text(query, history)
+    return graph_card, lineage, search_text, {"searchText": search_text, "boardMap": bool(graph_card)}
 
 
 def _v3_web_query(query, config, current_state, initial_messages, web_search, byok_only,
@@ -277,6 +330,8 @@ class getGraphResponse():
             passages: Optional[dict] = {} if board_reads is not None else None
             web_query = _v3_web_query(query, config, current_state, initial_messages,
                                       web_search, byok_only, search_hint)
+            graph_card, lineage_summary, search_text, trace = _v3_turn_parts(
+                self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages))
             context_snippets, external_context_str, _web_hits, linked_answers = self._build_retrieved_context(
                 query, user_id, thread_id, context_node_ids=context_node_ids,
                 external_context_top_k=external_context_top_k,
@@ -285,8 +340,13 @@ class getGraphResponse():
                 board_reads=board_reads,
                 budget_tokens=budget_tokens,
                 user_email=user_email,
-                fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
+                fixed_chars=(len(query) + len(prompt_summary or "") + len(graph_card) + len(lineage_summary)
+                             + _history_chars(_budget_history(current_state, initial_messages))),
                 passages=passages,
+                search_text=search_text,
+                graph_card=graph_card,
+                trace=trace,
+                config=config,
             )
 
             prompt = get_formated_prompt(query, user_id)
@@ -350,6 +410,8 @@ class getGraphResponse():
                         "thread_id": thread_id,
                         "messages": messages_input,
                         "summary": prompt_summary,
+                        "lineage_summary": lineage_summary,
+                        "graph_card": graph_card,
                         "summarized_up_to_position": watermark,
                         "memory_facts": existing_memory_facts,
                         "context": context_snippets,
@@ -381,6 +443,8 @@ class getGraphResponse():
                     
                     # Get updated summary from result
                     updated_summary = result.get("summary", existing_summary)
+                    if trace is not None:
+                        trace["usage"] = _usage_of(AI_RESPONSE_[-1])
                 else:
                     logger.error(f"No AI Response Found In State")
                     raise HTTPException(
@@ -450,6 +514,7 @@ class getGraphResponse():
                 except Exception as e:
                     logger.error(f"getGraphResponse Convo save : {e}")
                     return False
+                self._save_trace(thread_id, user_email, msg_id, trace)
 
             return final_message
         except KeyRejectedError:
@@ -502,6 +567,8 @@ class getGraphResponse():
         passages: Optional[dict] = {} if board_reads is not None else None
         web_query = _v3_web_query(query, config, current_state, initial_messages,
                                   web_search, byok_only, search_hint)
+        graph_card, lineage_summary, search_text, trace = _v3_turn_parts(
+            self, query, thread_id, board_reads, user_email, _budget_history(current_state, initial_messages))
         context_snippets, external_context_str, web_hits, linked_answers = self._build_retrieved_context(
             query, user_id, thread_id, context_node_ids=context_node_ids,
             external_context_top_k=external_context_top_k,
@@ -510,8 +577,13 @@ class getGraphResponse():
             board_reads=board_reads,
             budget_tokens=budget_tokens,
             user_email=user_email,
-            fixed_chars=len(query) + len(prompt_summary or "") + _history_chars(_budget_history(current_state, initial_messages)),
+            fixed_chars=(len(query) + len(prompt_summary or "") + len(graph_card) + len(lineage_summary)
+                         + _history_chars(_budget_history(current_state, initial_messages))),
             passages=passages,
+            search_text=search_text,
+            graph_card=graph_card,
+            trace=trace,
+            config=config,
         )
 
         prompt = get_formated_prompt(query, user_id)
@@ -565,6 +637,8 @@ class getGraphResponse():
             "thread_id": thread_id,
             "messages": messages_input,
             "summary": prompt_summary,
+            "lineage_summary": lineage_summary,
+            "graph_card": graph_card,
             "summarized_up_to_position": watermark,
             "memory_facts": existing_memory_facts,
             "context": context_snippets,
@@ -584,7 +658,15 @@ class getGraphResponse():
         }
 
         return (graph_input, existing_summary, existing_memory_facts, is_duplicate, query, web_hits, passages,
-                web_query)
+                web_query, trace)
+
+    def _save_trace(self, thread_id, user_email, msg_id, trace) -> None:
+        if trace is None or not user_email:
+            return
+        try:
+            trace_store.save_trace(board_store, thread_id, user_email, msg_id, trace)
+        except Exception as e:  # the trace explains a turn; it is never worth failing one
+            logger.error("Context trace not saved for %s: %s", thread_id, type(e).__name__)
 
     def _hydrate_recent_messages(
         self,
@@ -633,9 +715,14 @@ class getGraphResponse():
         user_email: Optional[str] = None,
         passages: Optional[dict] = None,
         web_query: Optional[str] = None,
+        search_text: Optional[str] = None,
+        graph_card: str = "",
+        trace: Optional[dict] = None,
+        config: Optional[dict] = None,
     ):
         """`passages` (V3 only) is filled with n -> Citation for every numbered passage sent.
-        `web_query` (V3 only) is the standalone search query; V2 searches the raw message."""
+        `web_query` (V3 only) is the standalone search query; V2 searches the raw message.
+        `trace` (V3 only) is filled with what was sent, what was left out, and why."""
         context_snippets: list[str] = []
         external_context_snippets: list[str] = []
         web_hits: list[dict] = []
@@ -670,37 +757,51 @@ class getGraphResponse():
                         for p in pages
                     ]
 
-        query_embedding = get_embedding(query) or []
+        query_embedding = get_embedding(search_text or query) or []
+        embedded = _has_meaningful_embedding(query_embedding)
+        if trace is not None:
+            trace["embeddingFailed"] = not embedded
 
         # V3: the server read set decides what is read (contextNodeIds is ignored).
-        # Notes and linked answers need no embedding, so they go in before the early return.
+        # Notes, linked answers and keyword search need no embedding, so they go in either way.
         board_ctx = None
         linked_answers: Optional[str] = None
+        board_email = None
         if board_reads is not None:
             board_top_k = _default_top_k({})  # same default as the read-set token meter
             if external_context_top_k is not None:
                 board_top_k = max(0, min(10, int(external_context_top_k)))
             try:
+                board_email = user_email or board_store.resolve_user_email(user_id)
+                # With Jev on, gather more than can be sent: it picks the best of them.
+                pool = max(board_top_k, POOL_PER_SOURCE) if (jev.enabled() and board_top_k) else board_top_k
                 board_ctx = build_board_context(
-                    board_store, board_reads, user_email or board_store.resolve_user_email(user_id),
-                    query_embedding, board_top_k,
+                    board_store, board_reads, board_email, query_embedding, pool,
+                    search_text=search_text or query,
                 )
             except Exception as e:
                 logger.exception("Board context build failed for chat %s (thread %s)",
                                  board_reads.chat_id, thread_id)
 
-        def add_board_blocks(kept) -> Optional[str]:
+        def add_board_blocks() -> Optional[str]:
             """Numbered notes and kept chunks join EXTERNAL_CONTEXT; returns the LINKED_ANSWERS block.
             Numbers run in prompt order over what is actually sent (citations plan E2)."""
-            numbered = number_passages(board_ctx, kept)
+            fixed = (fixed_chars + sum(len(x) for x in external_context_snippets)
+                     + sum(len(x) for x in context_snippets))
+            # A budget the user set is hard. The default always leaves sources some room, so a
+            # branch that carried a whole chat still reads its desk.
+            budget = budget_tokens if budget_tokens is not None else max(
+                settings.CONTEXT_BUDGET_TOKENS, fixed // 4 + settings.CONTEXT_MIN_SOURCE_TOKENS)
+            numbered = compile_board_context(board_ctx, board_reads, query, graph_card, board_email,
+                                             board_top_k, budget, fixed, config, trace)
             external_context_snippets.extend(numbered.notes + numbered.sources)
             if passages is not None:
                 passages.update(numbered.passages)
             return numbered.linked_answers
 
-        if not _has_meaningful_embedding(query_embedding):
+        if not embedded:
             if board_ctx is not None:
-                linked_answers = add_board_blocks([])
+                linked_answers = add_board_blocks()
             joined = "\n\n".join(external_context_snippets) if external_context_snippets else None
             return [], joined, web_hits, linked_answers
 
@@ -727,13 +828,7 @@ class getGraphResponse():
 
         if board_reads is not None:
             if board_ctx is not None:
-                kept = []
-                if board_ctx.chunks:
-                    fixed = (fixed_chars + sum(len(x) for x in external_context_snippets)
-                             + sum(len(x) for x in board_ctx.notes)
-                             + sum(len(x) for x in context_snippets) + len(board_ctx.linked_answers or ""))
-                    kept = trim_chunks_to_budget(board_ctx.chunks, fixed, budget_tokens)
-                linked_answers = add_board_blocks(kept)
+                linked_answers = add_board_blocks()
         else:
             try:
                 file_context_limit = FILE_CONTEXT_LIMIT
@@ -787,7 +882,7 @@ class getGraphResponse():
             # fetches, the model call, the writes) runs in a worker thread, never on the event
             # loop: one slow turn must not stall every other request on the instance.
             (graph_input, existing_summary, existing_memory_facts, is_duplicate, raw_query, web_hits,
-             passages, web_query) = await asyncio.to_thread(
+             passages, web_query, trace) = await asyncio.to_thread(
                 self._prepare_stream_input,
                 query,
                 config,
@@ -820,6 +915,13 @@ class getGraphResponse():
                     web_frame = {'query': web_query, **web_frame}
                 yield f"data: {json.dumps({'web_search': web_frame})}\n\n"
 
+            # V3: only when there is something the user should know before the answer.
+            agent_steps = ((trace or {}).get("agent") or {}).get("steps") or []
+            if trace and (trace.get("embeddingFailed") or agent_steps):
+                context_frame = {"embeddingFailed": bool(trace.get("embeddingFailed")),
+                                 "agentSteps": [s["tool"] for s in agent_steps]}
+                yield f"data: {json.dumps({'context': context_frame})}\n\n"
+
             # Try async streaming with async graph first
             stream_graph = self.async_graph if self.async_graph else None
             if stream_graph:
@@ -830,6 +932,8 @@ class getGraphResponse():
                     in_think = False
                     async for event in stream_graph.astream_events(graph_input, config, version="v1"):
                         kind = event["event"]
+                        if kind == "on_chat_model_end" and trace is not None and not trace.get("usage"):
+                            trace["usage"] = _event_usage(event)  # the answer ends first; a summary may follow
                         if kind == "on_chat_model_stream":
                             reasoning, content = _split_reasoning(event["data"]["chunk"])
                             out = ""
@@ -869,6 +973,8 @@ class getGraphResponse():
                         f"<think>{reasoning}</think>" if reasoning else ""
                     ) + answer
                     yield f"data: {json.dumps({'message': full_response})}\n\n"
+                    if trace is not None:
+                        trace["usage"] = _usage_of(ai_responses[-1])
                 updated_summary = result.get("summary", existing_summary) if result else existing_summary
 
             if not full_response:
@@ -922,6 +1028,7 @@ class getGraphResponse():
                             embed_summary_fn=get_embedding, context_fn=[],
                             citations=citations,
                         )
+                    self._save_trace(thread_id, user_email, msg_id, trace)
 
             try:
                 await asyncio.to_thread(save_turn)

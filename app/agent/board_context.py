@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field, replace
-from math import ceil
 
 from app.agent.citations import QUOTE_MAX_CHARS, neutralise_markers, strip_markers
 from app.agent.reads import (
@@ -23,12 +22,14 @@ TYPE_LABEL = {"pdf": "PDF", "doc": "Document", "csv": "CSV", "web": "Web page", 
 DESC_HEADER_CHARS = 160
 LABEL_CHARS = 120
 IMAGE_SUMMARY_CHARS = 4000
+POOL_PER_SOURCE = 8  # how many passages per source Jev gets to choose from
 RRF_K = 60  # the standard reciprocal-rank constant: rank matters, raw scores don't have to compare
 # Without model scores, notes and linked answers may fill this share of the room while file
 # passages are waiting; the rest is theirs. Otherwise a note-heavy desk sends no documents at all.
 NON_CHUNK_SHARE = 0.6
 _DELIMS = re.compile(
-    r"<\s*/?\s*(EXTERNAL_CONTEXT|LINKED_ANSWERS|THREAD_SUMMARY|MEMORY_FACTS|RELEVANT_CONTEXT)\s*>", re.I)
+    r"<\s*/?\s*(EXTERNAL_CONTEXT|LINKED_ANSWERS|THREAD_SUMMARY|MEMORY_FACTS|RELEVANT_CONTEXT|"
+    r"BOARD_DATA|BOARD_MAP|LINEAGE_SUMMARY|BRANCH_PERSONA)\s*>", re.I)
 
 
 def _safe(text) -> str:
@@ -192,6 +193,27 @@ def keep_per_source(chunks: list[ScoredChunk], per_source: int) -> list[ScoredCh
         if seen[c.card_id] <= per_source:
             kept.append(c)
     return kept
+
+
+def load_outlines(cur, user_email: str, card_ids: list[str]) -> dict[str, list[str]]:
+    """{card: ["p. 3: first line", ...]}, each section's first line, read straight from the chunks.
+    No model and no ingest step, so every source that was ever ingested has one."""
+    if not card_ids:
+        return {}
+    cur.execute(
+        "SELECT DISTINCT ON (ef.node_id, fc.metadata->>'loc') ef.node_id, fc.metadata->>'loc' AS loc, "
+        "substring(fc.chunk_text, 1, 200) AS head, fc.chunk_index "
+        "FROM file_chunks fc JOIN external_files ef ON fc.file_id = ef.id "
+        "WHERE ef.node_id = ANY(%s) AND ef.user_email = %s AND fc.metadata->>'loc' IS NOT NULL "
+        "ORDER BY ef.node_id, fc.metadata->>'loc', fc.chunk_index",
+        (list(card_ids), user_email),
+    )
+    rows = sorted(cur.fetchall(), key=lambda r: (r["node_id"], r["chunk_index"]))
+    out: dict[str, list[str]] = {}
+    for r in rows:
+        first = next((line.strip() for line in str(r["head"] or "").splitlines() if line.strip()), "")
+        out.setdefault(r["node_id"], []).append(f"{r['loc']}: {clip_text(_safe(first), 70)}")
+    return out
 
 
 def _off_locs(data: dict) -> set[str]:
@@ -386,16 +408,3 @@ def fit_to_budget(ctx: BoardContext, chunks: list[ScoredChunk], fixed_chars: int
     return Fit(out, [c for i, c in enumerate(chunks) if ("chunk", i) in kept], dropped)
 
 
-def trim_chunks_to_budget(chunks: list[ScoredChunk], fixed_chars: int,
-                          budget_tokens: int | None) -> list[ScoredChunk]:
-    if budget_tokens is None:
-        return chunks
-    keep = list(range(len(chunks)))
-    by_score = sorted(keep, key=lambda i: (chunks[i].score, -i))  # lowest score drops first
-
-    def fits() -> bool:
-        return ceil((fixed_chars + sum(len(_rendered(chunks[i])) for i in keep)) / 4) <= budget_tokens
-
-    while keep and not fits():
-        keep.remove(by_score.pop(0))
-    return [chunks[i] for i in keep]

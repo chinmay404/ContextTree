@@ -299,9 +299,7 @@ def test_trimmed_chunks_get_no_number(board, monkeypatch):
     passages = {}
     _, ext, _, la = g._build_retrieved_context("hello", board["email"], board["q"], board_reads=reads,
                                                user_email=board["email"], budget_tokens=1, passages=passages)
-    assert "(p. 4)" not in ext and "(p. 9)" not in ext
-    assert [p["cardId"] for p in passages.values()] == [board["note"], board["side"]]
-    assert "[2] Side answer" in la
+    assert ext is None and la is None and passages == {}  # the budget covers notes and answers too
 
 
 @requires_db

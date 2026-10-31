@@ -4,8 +4,7 @@ import json
 import pytest
 
 from app.agent.board_context import (
-    BoardContext, ScoredChunk, build_board_context, render_source_blocks, source_header,
-    trim_chunks_to_budget,
+    BoardContext, ScoredChunk, build_board_context, fit_to_budget, render_source_blocks, source_header,
 )
 from app.agent.memory import build_memory_context_block
 from app.agent.reads import resolve_reads
@@ -137,16 +136,16 @@ def _cs():
 
 
 def test_budget_trims_lowest_score_first():
-    assert [c.card_id for c in trim_chunks_to_budget(_cs(), fixed_chars=400, budget_tokens=320)] == ["a", "c"]
+    assert [c.card_id for c in fit_to_budget(BoardContext(), _cs(), 400, 320).chunks] == ["a", "c"]
 
 
 def test_no_budget_no_trim():
     cs = _cs()
-    assert trim_chunks_to_budget(cs, 10**9, None) == cs
+    assert fit_to_budget(BoardContext(), cs, 10**9, None).chunks == cs
 
 
 def test_budget_smaller_than_fixed_drops_all():
-    assert trim_chunks_to_budget(_cs(), fixed_chars=4000, budget_tokens=100) == []
+    assert fit_to_budget(BoardContext(), _cs(), 4000, 100).chunks == []
 
 
 def test_source_header_fallbacks():
@@ -212,7 +211,7 @@ def test_build_retrieved_context_budget_trims_chunks(board, monkeypatch):
     reads = resolve_reads(store, board["email"], board["b"], board["q"])
     out = g._build_retrieved_context("hello", board["email"], board["q"], board_reads=reads,
                                      budget_tokens=1, fixed_chars=0)
-    assert "p. 3" not in (out[1] or "") and "[source | Note" in out[1]
+    assert out[1] is None and out[3] is None  # the budget counts every block now, not only file passages
 
 
 # ── fix round 1 ──────────────────────────────────────────────────────────────
@@ -275,8 +274,8 @@ def test_failed_and_processing_sources_contribute_nothing(board, db):
 
 def test_budget_keeps_high_score_chunk_until_fixed_costs_counted():
     cs = [ScoredChunk("a", "p. 1", "x" * 400, 0.9), ScoredChunk("b", "p. 2", "y" * 400, 0.2)]
-    assert [c.card_id for c in trim_chunks_to_budget(cs, fixed_chars=0, budget_tokens=110)] == ["a"]
-    assert trim_chunks_to_budget(cs, fixed_chars=40, budget_tokens=110) == []
+    assert [c.card_id for c in fit_to_budget(BoardContext(), cs, 0, 110).chunks] == ["a"]
+    assert fit_to_budget(BoardContext(), cs, 40, 110).chunks == []
 
 
 @requires_db
@@ -288,4 +287,4 @@ def test_default_top_k_is_five_and_fixed_chars_drop_chunks(board, monkeypatch):
     assert "(p. 3)" in keep[1] and "(p. 7)" in keep[1]
     drop = g._build_retrieved_context("hello", board["email"], board["q"], board_reads=reads,
                                       budget_tokens=10**6, fixed_chars=10**7)
-    assert "(p. 3)" not in drop[1] and "[source | Note" in drop[1]
+    assert drop[1] is None

@@ -2,7 +2,8 @@
 from fastapi import APIRouter, Depends, Request
 
 from app.agent.reads import resolve_reads
-from app.agent.store.board_store import store
+from app.agent.store import trace_store
+from app.agent.store.board_store import require_board, require_card, store
 from app.api.auth import get_current_user_id
 from app.api.limiter import BOARD_RATE, limiter, user_key
 
@@ -17,3 +18,17 @@ def api_get_reads(
 ):
     email = store.email_for(user_id)
     return resolve_reads(store, email, board_id, card_id).to_json()
+
+
+@router.get("/{board_id}/cards/{card_id}/context-trace")
+@limiter.limit(BOARD_RATE, key_func=user_key)
+def api_get_context_trace(
+    board_id: str, card_id: str, request: Request,
+    user_id: str = Depends(get_current_user_id),
+):
+    """What this chat's last turn sent, what it left out, and why."""
+    email = store.email_for(user_id)
+    with store.tx() as cur:
+        require_board(cur, board_id, email)
+        require_card(cur, board_id, card_id, email)
+    return {"trace": trace_store.latest_trace(store, card_id, email)}
