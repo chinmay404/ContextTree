@@ -125,12 +125,22 @@ def test_without_jev_the_first_name_stands(monkeypatch):
 
 
 @requires_db
-def test_unnamed_chat_gets_a_suggested_name(db, user):
+@pytest.mark.parametrize("name", [None, "A new question", "New question, same desk", "Untitled"])
+def test_a_chat_with_a_default_name_gets_a_suggestion(db, user, name):
     b = seed_board(db, user)
-    q = seed_card(db, user, b, kind="chat", data={})
+    q = seed_card(db, user, b, kind="chat", data={"name": name} if name else {})
     seed_message(db, user, q, "assistant", "a", 1)
     got = write_relations(store, user, q, Writer(_reply(names=["Launch price"])), "openai", "q", "a")
     assert got == {"name": "Launch price"}
+
+
+@requires_db
+def test_a_name_the_user_chose_is_left_alone(db, user):
+    b = seed_board(db, user)
+    q = seed_card(db, user, b, kind="chat", data={"name": "My pricing question"})
+    seed_message(db, user, q, "assistant", "a", 1)
+    llm = Writer(_reply(names=["Other"]))
+    assert write_relations(store, user, q, llm, "openai", "q", "a") is None and llm.prompts == []
 
 
 # ── Side question ────────────────────────────────────────────────────────────

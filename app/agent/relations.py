@@ -20,6 +20,8 @@ from app.core.logger import logger
 WHY_CHARS = 120
 NAME_CHARS = 60
 _EXCERPT_CHARS = 1500
+# What the board's branch sheet calls a chat until the user names it (components/board/store.ts).
+DEFAULT_NAMES = frozenset({"", "A new question", "New question, same desk", "Untitled"})
 _FENCE = re.compile(r"^```[a-z]*\s*|\s*```$", re.I)
 
 
@@ -89,7 +91,7 @@ def _write(store, user_email, chat_id, llm, provider, question, answer):
 
     data = chat["data"] or {}
     needs_branch = bool(chat["parent_node_id"]) and not data.get("branchWhy")
-    needs_name = not _label(data.get("name"))
+    needs_name = _label(data.get("name")) in DEFAULT_NAMES
     if not (edges or needs_branch or needs_name):
         return None
 
@@ -102,7 +104,8 @@ def _write(store, user_email, chat_id, llm, provider, question, answer):
         desc = _label(source.get("desc"))
         asks.append(f'"e{i}": why "{title}"{f" ({desc})" if desc else ""} is connected to this question')
     if needs_branch:
-        persona = _label(data.get("persona"), 200)
+        persona = _label(data.get("systemPrompt") or data.get("persona"), 200)
+        persona = "" if persona == "none" else persona
         asks.append(f'"branch": why this question branched from "{parent_name or "its parent"}"'
                     + (f', answering as {persona}' if persona else ""))
     if needs_name:
