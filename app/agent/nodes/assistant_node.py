@@ -15,8 +15,10 @@ from app.agent.helpers.v3_llm import (
     v3_route,
 )
 from app.agent.citations import strip_markers
+from app.agent.prompt_layout import build_v3_messages
 from app.agent.memory import (
     build_memory_context_block,
+    format_memory_facts_for_prompt,
     sanitize_chat_response_text,
     sanitize_summary_text,
 )
@@ -164,22 +166,39 @@ class AgentNodes:
                 linked_answers=state.get("linked_answers"),
             )
 
-            messages = [
-                SystemMessage(content=system_content),
-                SystemMessage(content=memory_context),
-            ]
-            if citation_note:
-                messages.append(SystemMessage(content=citation_note))
-            if custom_system_prompt:
-                messages.append(
-                    SystemMessage(
-                        content=(
-                            "Node-specific custom system prompt. Apply these instructions "
-                            f"for this node and its branch:\n{custom_system_prompt}"
+            if byok_only:
+                messages = build_v3_messages(
+                    instructions=load_prompt_from_yaml("SYSTEM_PROMPT_V3"),
+                    lineage_summary=state.get("lineage_summary"),
+                    persona=custom_system_prompt or None,
+                    citation_note=citation_note or None,
+                    graph_card=state.get("graph_card"),
+                    summary=sanitize_summary_text(prompt_summary),
+                    facts_text=format_memory_facts_for_prompt(memory_facts),
+                    history=prompt_history,
+                    context=prompt_context,
+                    external_context=external_context,
+                    linked_answers=state.get("linked_answers"),
+                    today=datetime.utcnow().strftime("%Y-%m-%d"),
+                    provider=v3_route(model).provider,
+                )
+            else:
+                messages = [
+                    SystemMessage(content=system_content),
+                    SystemMessage(content=memory_context),
+                ]
+                if citation_note:
+                    messages.append(SystemMessage(content=citation_note))
+                if custom_system_prompt:
+                    messages.append(
+                        SystemMessage(
+                            content=(
+                                "Node-specific custom system prompt. Apply these instructions "
+                                f"for this node and its branch:\n{custom_system_prompt}"
+                            )
                         )
                     )
-                )
-            messages += prompt_history
+                messages += prompt_history
 
             if byok_only:
                 # V3: the user's own key for the chat's model, resolved once for this turn.

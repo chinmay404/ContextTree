@@ -452,7 +452,7 @@ def test_v3_stream_without_passages_sends_empty_citations(api, db, user, fake_mo
 
 
 def _assistant_calls(llm_inputs):
-    return [s for s in llm_inputs if any(m.type == "system" and "<MEMORY_FACTS>" in str(m.content) for m in s)]
+    return [s for s in llm_inputs if any(m.type == "system" and "<BOARD_DATA>" in str(m.content) for m in s)]
 
 
 def _text(frames):
@@ -493,12 +493,12 @@ def test_v3_instruction_does_not_carry_over_to_a_turn_without_passages(api, db, 
                      data={"title": "N", "text": "The sky is green here."})
     first = _turn(api, q, boardId=b)
     assert [c["n"] for c in first[_kinds(first).index("citations")]["citations"]] == [1]
-    assert CITE_INSTRUCTION in [m.content for m in _assistant_calls(llm_inputs)[-1]]
+    assert CITE_INSTRUCTION in _assistant_calls(llm_inputs)[-1][0].content
     with db.cursor() as cur:
         cur.execute("UPDATE nodes SET deleted_at = now() WHERE id = %s", (note,))
     second = _turn(api, q, boardId=b)
     assert second[_kinds(second).index("citations")] == {"citations": []}
-    assert CITE_INSTRUCTION not in [m.content for m in _assistant_calls(llm_inputs)[-1]]
+    assert CITE_INSTRUCTION not in _assistant_calls(llm_inputs)[-1][0].content
     assert "[1]" not in _text(second)
 
 

@@ -14,7 +14,7 @@ QUOTE_MAX_CHARS = 1200
 # Sent as its own system message only when a turn numbered at least one passage.
 # The fake LLM keys on this exact text, so keep it a constant.
 CITE_INSTRUCTION = (
-    "The board passages above are numbered [1], [2], and so on. When a claim uses one, put its "
+    "The board passages you are given are numbered [1], [2], and so on. When a claim uses one, put its "
     "number right after that claim. Use only numbers that exist, write [2][3] rather than [2, 3], "
     "and add no list of references at the end."
 )

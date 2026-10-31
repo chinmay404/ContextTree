@@ -17,6 +17,10 @@ class State(TypedDict):
     # []    → external context explicitly disabled for this turn
     # [...] → exact set of context nodes to RAG over
     context_node_ids: Optional[List[str]]
+    # V3: the frozen summary of the parent lineage up to the fork, shared with siblings.
+    lineage_summary: Optional[str]
+    # V3: where this chat is on the board and why each thing it reads is connected.
+    graph_card: Optional[str]
     summary: Optional[str]
     # Highest `messages.position` value already folded into `summary`.
     # Used to skip re-hydrating already-summarized turns into LangGraph state

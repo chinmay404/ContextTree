@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     RESERVE_TOKENS: int = 1000
     # Minimum semantic similarity score for message-to-message retrieval.
     SIMILARITY_MIN_SCORE: float = 0.2
+    # Total prompt budget for a V3 chat that sets none of its own.
+    CONTEXT_BUDGET_TOKENS: int = 12000
+    # TypeSafe Jev scores what a chat reads. No key = off, and no board text leaves for TypeSafe.
+    TYPESAFE_API_KEY: Optional[str] = None
+    TYPESAFE_BASE_URL: str = "https://api.typesafe.ai"
+    JEV_MODEL: str = "jev-1.14.0"
+    JEV_TIMEOUT_SECONDS: float = 0.8
 
     # ── Local end-to-end runs ──────────────────────────────────────────────────
     # Deterministic fake LLM + embeddings (no network). Local only: refused

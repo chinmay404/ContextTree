@@ -535,6 +535,7 @@ def _fallback_to_groq_default(
 
 def _build_fake_llm():
     from typing import Any, Iterator
+    import re
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage
 
@@ -546,7 +547,8 @@ def _build_fake_llm():
                     c = " ".join(
                         p.get("text", "") if isinstance(p, dict) else str(p) for p in c
                     )
-                return str(c)
+                # A V3 turn's last message carries its sources and the date ahead of the question.
+                return re.split(r"(?:^|\n\n)Date: \d{4}-\d{2}-\d{2}\n\n", str(c))[-1]
         return ""
 
     def _passages_sent(messages) -> bool:
@@ -555,7 +557,6 @@ def _build_fake_llm():
                    for m in messages or [])
 
     def _cite_first_sentence(text: str) -> str:
-        import re
         m = re.search(r"[.!?](?=\s|$)", text)
         at = m.end() if m else len(text)
         return text[:at] + "[1]" + text[at:]
